@@ -3,7 +3,7 @@ use reqwest::RequestBuilder;
 use serde::de::DeserializeOwned;
 use std::path::PathBuf;
 use std::process::Command;
-use users::os::unix::UserExt;
+use uzers::os::unix::UserExt;
 
 #[async_trait::async_trait]
 pub trait RequestBuilderExt {
@@ -34,16 +34,19 @@ pub enum User {
 
 /// Get the username of the user who invoked `sudo`.
 pub fn original_user_name() -> User {
+    if let Ok(user) = std::env::var("SUDO_USER") {
+        return User::Normal(user);
+    }
+
+    if let Ok(user) = std::env::var("LOGNAME") {
+        return User::Normal(user);
+    }
+
     // `logname` command will return this directly if it is usable, which is in coreutils.
     // `logname` -> `me`
     // `sudo logname` -> `me`
     if let Ok(output) = Command::new("logname").output() {
         return User::Normal(String::from_utf8_lossy(&output.stdout).trim().to_string());
-    }
-
-    // Backup plan
-    if let Ok(user) = std::env::var("SUDO_USER") {
-        return User::Normal(user);
     }
 
     User::Root
@@ -60,7 +63,7 @@ pub fn original_user_config_path<'a>(
             let app_name = app_name.as_ref();
             let config_name = config_name.into().unwrap_or("default-config");
 
-            let user = users::get_user_by_name(&name)
+            let user = uzers::get_user_by_name(&name)
                 .with_context(|| format!("Failed to find user with name: {name}"))?;
             let home_dir = user.home_dir();
 
