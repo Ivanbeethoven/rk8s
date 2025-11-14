@@ -15,6 +15,10 @@ pub struct Config {
     /// Cache configuration (optional, uses backend-specific defaults if not specified)
     #[serde(default)]
     pub cache: CacheConfig,
+
+    /// Client behaviour configuration (session heartbeat, read-only, etc.)
+    #[serde(default)]
+    pub client: ClientOptions,
 }
 
 /// Database configuration
@@ -123,6 +127,23 @@ pub struct CacheConfig {
     /// Whether cache is enabled (default: true)
     #[serde(default = "default_cache_enabled")]
     pub enabled: bool,
+}
+
+/// Meta client behaviour configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientOptions {
+    /// If true, the meta client runs in read-only mode.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Disable background maintenance tasks such as cache watchers.
+    #[serde(default)]
+    pub no_background_jobs: bool,
+    /// Enable case-insensitive path resolution.
+    #[serde(default)]
+    pub case_insensitive: bool,
+    /// Optional override for the session heartbeat interval.
+    #[serde(default, with = "duration_option_serde")]
+    pub session_heartbeat: Option<Duration>,
 }
 
 /// Cache capacity configuration
@@ -247,6 +268,17 @@ impl CacheConfig {
     }
 }
 
+impl Default for ClientOptions {
+    fn default() -> Self {
+        Self {
+            read_only: false,
+            no_background_jobs: false,
+            case_insensitive: false,
+            session_heartbeat: None,
+        }
+    }
+}
+
 /// Custom serde module for Duration (supports seconds as float/int)
 mod duration_serde {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -266,5 +298,29 @@ mod duration_serde {
     {
         let value = f64::deserialize(deserializer)?;
         Ok(Duration::from_secs_f64(value))
+    }
+}
+
+/// Optional duration helper for serde (seconds as float/int)
+mod duration_option_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S>(value: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(duration) => serializer.serialize_some(&duration.as_secs_f64()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt = Option::<f64>::deserialize(deserializer)?;
+        Ok(opt.map(Duration::from_secs_f64))
     }
 }

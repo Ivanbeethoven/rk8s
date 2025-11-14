@@ -16,13 +16,15 @@ pub mod client;
 pub mod config;
 pub mod entities;
 pub mod factory;
+pub mod layer;
 pub mod migrations;
 pub mod permission;
 pub mod store;
 pub mod stores;
 
 // Primary exports
-pub use factory::create_meta_store_from_url;
+pub use factory::{MetaHandle, create_meta_store_from_url};
+pub use layer::MetaLayer;
 pub use permission::Permission;
 pub use store::MetaStore;
 

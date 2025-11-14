@@ -5,19 +5,37 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::meta::client::MetaClient;
+use crate::meta::client::{MetaClient, MetaClientOptions};
 use crate::meta::config::{CacheTtl, Config, DatabaseConfig, DatabaseType};
+use crate::meta::layer::MetaLayer;
 use crate::meta::store::{MetaError, MetaStore};
 use crate::meta::stores::DatabaseMetaStore;
 use crate::meta::stores::EtcdMetaStore;
 
-/// Factory for creating MetaStore instances
+/// Combined handles for raw stores and cached meta layers.
+#[derive(Clone)]
+pub struct MetaHandle {
+    store: Arc<dyn MetaStore>,
+    layer: Arc<dyn MetaLayer>,
+}
+
+impl MetaHandle {
+    pub fn store(&self) -> Arc<dyn MetaStore> {
+        Arc::clone(&self.store)
+    }
+
+    pub fn layer(&self) -> Arc<dyn MetaLayer> {
+        Arc::clone(&self.layer)
+    }
+}
+
+/// Factory for creating metadata handles (raw store + cached layer)
 pub struct MetaStoreFactory;
 
 impl MetaStoreFactory {
     /// Create MetaStore from path (with MetaClient caching)
     #[allow(dead_code)]
-    pub async fn create_from_path(backend_path: &Path) -> Result<Arc<dyn MetaStore>, MetaError> {
+    pub async fn create_from_path(backend_path: &Path) -> Result<MetaHandle, MetaError> {
         let config =
             Config::from_path(backend_path).map_err(|e| MetaError::Config(e.to_string()))?;
         Self::create_from_config(config).await
@@ -28,32 +46,18 @@ impl MetaStoreFactory {
     /// - SQLite: 10s TTL (configurable)
     /// - PostgreSQL: 500ms TTL (configurable)
     /// - Etcd: 100ms TTL (configurable)
-    pub async fn create_from_config(config: Config) -> Result<Arc<dyn MetaStore>, MetaError> {
+    pub async fn create_from_config(config: Config) -> Result<MetaHandle, MetaError> {
         // Validate cache configuration
         config
             .cache
             .validate()
             .map_err(|e| MetaError::Config(format!("Invalid cache config: {}", e)))?;
 
-        let (raw_store, backend_type) = match &config.database.db_config {
-            DatabaseType::Sqlite { .. } => {
-                let store = DatabaseMetaStore::from_config(config.clone()).await?;
-                (Arc::new(store) as Arc<dyn MetaStore>, "sqlite")
-            }
-            DatabaseType::Postgres { .. } => {
-                let store = DatabaseMetaStore::from_config(config.clone()).await?;
-                (Arc::new(store) as Arc<dyn MetaStore>, "postgres")
-            }
-            DatabaseType::Etcd { .. } => {
-                let store = EtcdMetaStore::from_config(config.clone()).await?;
-                (Arc::new(store) as Arc<dyn MetaStore>, "etcd")
-            }
+        let backend_type = match &config.database.db_config {
+            DatabaseType::Sqlite { .. } => "sqlite",
+            DatabaseType::Postgres { .. } => "postgres",
+            DatabaseType::Etcd { .. } => "etcd",
         };
-
-        // If cache is disabled, return raw store
-        if !config.cache.enabled {
-            return Ok(raw_store);
-        }
 
         // Use TTL from config, or backend-specific defaults if not specified
         let ttl = if config.cache.ttl.is_zero() {
@@ -63,9 +67,41 @@ impl MetaStoreFactory {
         };
 
         // Create MetaClient with configured capacity and TTL
-        let cached_store = MetaClient::new(raw_store, config.cache.capacity.clone(), ttl);
+        let mut client_options = MetaClientOptions::default();
+        client_options.read_only = config.client.read_only;
+        client_options.no_background_jobs = config.client.no_background_jobs;
+        client_options.case_insensitive = config.client.case_insensitive;
+        if let Some(interval) = config.client.session_heartbeat {
+            client_options.session_heartbeat = interval;
+        }
 
-        Ok(cached_store)
+        let capacity = config.cache.capacity.clone();
+
+        let (store, layer): (Arc<dyn MetaStore>, Arc<dyn MetaLayer>) =
+            match &config.database.db_config {
+                DatabaseType::Sqlite { .. } | DatabaseType::Postgres { .. } => {
+                    let store = Arc::new(DatabaseMetaStore::from_config(config.clone()).await?);
+                    let client = MetaClient::with_options(
+                        Arc::clone(&store),
+                        capacity.clone(),
+                        ttl.clone(),
+                        client_options.clone(),
+                    );
+                    let store_dyn: Arc<dyn MetaStore> = store;
+                    let layer_dyn: Arc<dyn MetaLayer> = client;
+                    (store_dyn, layer_dyn)
+                }
+                DatabaseType::Etcd { .. } => {
+                    let store = Arc::new(EtcdMetaStore::from_config(config.clone()).await?);
+                    let client =
+                        MetaClient::with_options(Arc::clone(&store), capacity, ttl, client_options);
+                    let store_dyn: Arc<dyn MetaStore> = store;
+                    let layer_dyn: Arc<dyn MetaLayer> = client;
+                    (store_dyn, layer_dyn)
+                }
+            };
+
+        Ok(MetaHandle { store, layer })
     }
 
     /// Create raw MetaStore without caching
@@ -83,7 +119,7 @@ impl MetaStoreFactory {
     }
 
     /// Create MetaStore from URL (simplified interface, with caching)
-    pub async fn create_from_url(url: &str) -> Result<Arc<dyn MetaStore>, MetaError> {
+    pub async fn create_from_url(url: &str) -> Result<MetaHandle, MetaError> {
         let config = Self::config_from_url(url)?;
         Self::create_from_config(config).await
     }
@@ -126,17 +162,18 @@ impl MetaStoreFactory {
         Ok(Config {
             database: DatabaseConfig { db_config },
             cache: Default::default(), // Use default cache configuration
+            client: Default::default(),
         })
     }
 }
 
 /// Convenience function to create MetaStore from path
 #[allow(dead_code)]
-pub async fn create_meta_store(backend_path: &Path) -> Result<Arc<dyn MetaStore>, MetaError> {
+pub async fn create_meta_store(backend_path: &Path) -> Result<MetaHandle, MetaError> {
     MetaStoreFactory::create_from_path(backend_path).await
 }
 
 /// Convenience function to create MetaStore from URL
-pub async fn create_meta_store_from_url(url: &str) -> Result<Arc<dyn MetaStore>, MetaError> {
+pub async fn create_meta_store_from_url(url: &str) -> Result<MetaHandle, MetaError> {
     MetaStoreFactory::create_from_url(url).await
 }

@@ -128,7 +128,7 @@ impl InodeCache {
     pub(crate) async fn ensure_node_in_cache(
         &self,
         ino: i64,
-        store: &Arc<dyn MetaStore + Send + Sync>,
+        store: &dyn MetaStore,
         parent: Option<i64>,
     ) -> Result<bool, MetaError> {
         if self.get_node(ino).await.is_some() {
@@ -182,13 +182,37 @@ impl InodeCache {
                 let mut map = (**children_map).clone();
                 let child_ino = map.remove(name);
 
-                if let Some(ino) = child_ino {
+                if let Some(_ino) = child_ino {
                     *children_lock = match &*children_lock {
                         ChildrenState::Complete(_) => ChildrenState::Complete(Arc::new(map)),
                         _ => ChildrenState::Partial(Arc::new(map)),
                     };
 
-                    self.ttl_manager.invalidate(&ino).await;
+                    self.ttl_manager.invalidate(&_ino).await;
+                }
+
+                return child_ino;
+            }
+        }
+        None
+    }
+
+    pub(crate) async fn remove_child_but_keep_inode(
+        &self,
+        parent_ino: i64,
+        name: &str,
+    ) -> Option<i64> {
+        if let Some(parent_node) = self.ttl_manager.get(&parent_ino).await {
+            let mut children_lock = parent_node.children.write().await;
+            if let Some(children_map) = children_lock.get_map() {
+                let mut map = (**children_map).clone();
+                let child_ino = map.remove(name);
+
+                if let Some(_ino) = child_ino {
+                    *children_lock = match &*children_lock {
+                        ChildrenState::Complete(_) => ChildrenState::Complete(Arc::new(map)),
+                        _ => ChildrenState::Partial(Arc::new(map)),
+                    };
                 }
 
                 return child_ino;

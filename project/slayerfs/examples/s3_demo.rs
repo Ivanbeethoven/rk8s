@@ -53,7 +53,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Create memory metadata store (for demo purposes)
     let meta_store = create_meta_store_from_url("sqlite::memory:")
         .await
-        .expect("create meta store");
+        .expect("create meta store")
+        .store();
 
     // Create VFS client
     let mut client = Client::new(layout, block_store, meta_store)
@@ -122,6 +123,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             match entry.kind {
                 slayerfs::vfs::fs::FileType::Dir => "directory",
                 slayerfs::vfs::fs::FileType::File => "file",
+                slayerfs::vfs::fs::FileType::Symlink => "symlink",
             }
         );
     }

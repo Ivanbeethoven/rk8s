@@ -24,7 +24,8 @@ pub async fn e2e_localfs_demo<P: AsRef<Path>>(root: P) -> Result<(), Box<dyn Err
     // 3) Build a lightweight metadata store (in-memory sqlite)
     let meta = create_meta_store_from_url("sqlite::memory:")
         .await
-        .map_err(|e| format!("failed to init meta store: {e}"))?;
+        .map_err(|e| format!("failed to init meta store: {e}"))?
+        .store();
 
     // 4) Prepare data that starts halfway through a block and spans 1.5 blocks
     let half = (layout.block_size / 2) as usize;

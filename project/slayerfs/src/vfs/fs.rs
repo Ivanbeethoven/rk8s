@@ -4,7 +4,10 @@ use crate::chuck::chunk::ChunkLayout;
 use crate::chuck::reader::ChunkReader;
 use crate::chuck::store::BlockStore;
 use crate::chuck::writer::ChunkWriter;
-use crate::meta::MetaStore;
+use crate::meta::client::{MetaClient, MetaClientOptions};
+use crate::meta::config::{CacheCapacity, CacheTtl};
+use crate::meta::store::MetaError;
+use crate::meta::{MetaLayer, MetaStore};
 use dashmap::{DashMap, Entry};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -151,7 +154,7 @@ where
 struct VfsState<S, M>
 where
     S: BlockStore,
-    M: MetaStore,
+    M: MetaStore + 'static,
 {
     handles: HandleRegistry,
     files: FileRegistry<S, M>,
@@ -161,7 +164,7 @@ where
 impl<S, M> VfsState<S, M>
 where
     S: BlockStore,
-    M: MetaStore,
+    M: MetaStore + 'static,
 {
     fn new() -> Self {
         Self {
@@ -176,10 +179,10 @@ where
 pub struct VfsCore<S, M>
 where
     S: BlockStore,
-    M: MetaStore,
+    M: MetaStore + 'static,
 {
     layout: ChunkLayout,
-    meta: Arc<M>,
+    meta_layer: Arc<dyn MetaLayer>,
     chunk_io: Arc<ChunkIoFactory<S, M>>,
     root: i64,
 }
@@ -187,20 +190,42 @@ where
 impl<S, M> VfsCore<S, M>
 where
     S: BlockStore,
-    M: MetaStore,
+    M: MetaStore + 'static,
 {
-    fn new(layout: ChunkLayout, store: Arc<S>, meta: Arc<M>, root: i64) -> Self {
+    fn new(
+        layout: ChunkLayout,
+        store: Arc<S>,
+        meta_store: Arc<M>,
+        meta_layer: Arc<dyn MetaLayer>,
+        root: i64,
+    ) -> Self {
         let chunk_io = Arc::new(ChunkIoFactory::new(
             layout,
             Arc::clone(&store),
-            Arc::clone(&meta),
+            Arc::clone(&meta_store),
         ));
-
         Self {
             layout,
-            meta,
+            meta_layer,
             chunk_io,
             root,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MetaClientConfig {
+    pub capacity: CacheCapacity,
+    pub ttl: CacheTtl,
+    pub options: MetaClientOptions,
+}
+
+impl Default for MetaClientConfig {
+    fn default() -> Self {
+        Self {
+            capacity: CacheCapacity::default(),
+            ttl: CacheTtl::for_sqlite(),
+            options: MetaClientOptions::default(),
         }
     }
 }
@@ -211,7 +236,7 @@ where
 pub struct VFS<S, M>
 where
     S: BlockStore,
-    M: MetaStore,
+    M: MetaStore + 'static,
 {
     core: Arc<VfsCore<S, M>>,
     state: Arc<VfsState<S, M>>,
@@ -221,20 +246,44 @@ where
 impl<S, M> VFS<S, M>
 where
     S: BlockStore,
-    M: MetaStore,
+    M: MetaStore + 'static,
 {
     pub async fn new(layout: ChunkLayout, store: S, meta: M) -> Result<Self, String> {
+        Self::with_meta_client_config(layout, store, meta, MetaClientConfig::default()).await
+    }
+
+    pub async fn with_meta_client_config(
+        layout: ChunkLayout,
+        store: S,
+        meta: M,
+        config: MetaClientConfig,
+    ) -> Result<Self, String> {
         let store = Arc::new(store);
         let meta = Arc::new(meta);
 
-        meta.initialize().await.map_err(|e| e.to_string())?;
+        let ttl = if config.ttl.is_zero() {
+            CacheTtl::for_sqlite()
+        } else {
+            config.ttl.clone()
+        };
 
-        let root_ino = meta.root_ino();
+        let meta_client = MetaClient::with_options(
+            Arc::clone(&meta),
+            config.capacity.clone(),
+            ttl,
+            config.options.clone(),
+        );
+
+        meta_client.initialize().await.map_err(|e| e.to_string())?;
+
+        let root_ino = meta_client.root_ino();
+        let meta_layer: Arc<dyn MetaLayer> = meta_client.clone();
 
         let core = Arc::new(VfsCore::new(
             layout,
             Arc::clone(&store),
             Arc::clone(&meta),
+            meta_layer,
             root_ino,
         ));
         let state = Arc::new(VfsState::new());
@@ -248,26 +297,31 @@ where
 
     /// get the node's parent inode.
     pub async fn parent_of(&self, ino: i64) -> Option<i64> {
-        self.core.meta.get_parent(ino).await.ok().flatten()
+        self.core.meta_layer.get_parent(ino).await.ok().flatten()
     }
 
     /// get the node's fullpath.
     pub async fn path_of(&self, ino: i64) -> Option<String> {
-        self.core.meta.get_path(ino).await.ok().flatten()
+        self.core.meta_layer.get_path(ino).await.ok().flatten()
     }
 
     /// get the node's child inode by name.
     pub async fn child_of(&self, parent: i64, name: &str) -> Option<i64> {
-        self.core.meta.lookup(parent, name).await.ok().flatten()
+        self.core
+            .meta_layer
+            .lookup(parent, name)
+            .await
+            .ok()
+            .flatten()
     }
 
     pub async fn stat_ino(&self, ino: i64) -> Option<FileAttr> {
-        self.core.meta.stat(ino).await.ok().flatten()
+        self.core.meta_layer.stat(ino).await.ok().flatten()
     }
 
     /// List directory entries by inode
     pub async fn readdir_ino(&self, ino: i64) -> Option<Vec<DirEntry>> {
-        let meta_entries = self.core.meta.readdir(ino).await.ok()?;
+        let meta_entries = self.core.meta_layer.readdir(ino).await.ok()?;
 
         let entries: Vec<DirEntry> = meta_entries
             .into_iter()
@@ -311,7 +365,7 @@ where
         if &path == "/" {
             return Ok(self.core.root);
         }
-        if let Ok(Some((ino, _attr))) = self.core.meta.lookup_path(&path).await {
+        if let Ok(Some((ino, _attr))) = self.core.meta_layer.lookup_path(&path).await {
             return Ok(ino);
         }
         let mut cur_ino = self.core.root;
@@ -319,9 +373,9 @@ where
             if part.is_empty() {
                 continue;
             }
-            match self.core.meta.lookup(cur_ino, part).await {
+            match self.core.meta_layer.lookup(cur_ino, part).await {
                 Ok(Some(ino)) => {
-                    if let Ok(Some(attr)) = self.core.meta.stat(ino).await
+                    if let Ok(Some(attr)) = self.core.meta_layer.stat(ino).await
                         && attr.kind != FileType::Dir
                     {
                         return Err("not a directory".into());
@@ -331,7 +385,7 @@ where
                 _ => {
                     let ino = self
                         .core
-                        .meta
+                        .meta_layer
                         .mkdir(cur_ino, part.to_string())
                         .await
                         .map_err(|e| e.to_string())?;
@@ -353,8 +407,8 @@ where
         let dir_ino = self.mkdir_p(&dir).await?;
 
         // check the file exists and then return.
-        if let Ok(Some(ino)) = self.core.meta.lookup(dir_ino, &name).await
-            && let Ok(Some(attr)) = self.core.meta.stat(ino).await
+        if let Ok(Some(ino)) = self.core.meta_layer.lookup(dir_ino, &name).await
+            && let Ok(Some(attr)) = self.core.meta_layer.stat(ino).await
         {
             return if attr.kind == FileType::Dir {
                 Err("is a directory".into())
@@ -365,7 +419,7 @@ where
 
         let ino = self
             .core
-            .meta
+            .meta_layer
             .create_file(dir_ino, name.clone())
             .await
             .map_err(|e| e.to_string())?;
@@ -374,21 +428,215 @@ where
         Ok(ino)
     }
 
+    /// Create a hard link at `link_path` that references `existing_path`.
+    pub async fn link(&self, existing_path: &str, link_path: &str) -> Result<FileAttr, String> {
+        let existing_path = Self::norm_path(existing_path);
+        let link_path = Self::norm_path(link_path);
+
+        if existing_path == "/" {
+            return Err("is a directory".into());
+        }
+        if link_path == "/" {
+            return Err("invalid path".into());
+        }
+
+        let (src_ino, src_kind) = self
+            .core
+            .meta_layer
+            .lookup_path(&existing_path)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "not found".to_string())?;
+
+        if src_kind == FileType::Dir {
+            return Err("is a directory".into());
+        }
+
+        let (parent_path, name) = Self::split_dir_file(&link_path);
+        if name.is_empty() {
+            return Err("invalid name".into());
+        }
+
+        let parent_ino = if &parent_path == "/" {
+            self.core.root
+        } else {
+            self.core
+                .meta_layer
+                .lookup_path(&parent_path)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "parent not found".to_string())?
+                .0
+        };
+
+        let parent_attr = self
+            .core
+            .meta_layer
+            .stat(parent_ino)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "parent not found".to_string())?;
+        if parent_attr.kind != FileType::Dir {
+            return Err("not a directory".into());
+        }
+
+        if self
+            .core
+            .meta_layer
+            .lookup(parent_ino, &name)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return Err("already exists".into());
+        }
+
+        let attr = self
+            .core
+            .meta_layer
+            .link(src_ino, parent_ino, &name)
+            .await
+            .map_err(|e| match e {
+                MetaError::AlreadyExists { .. } => "already exists".to_string(),
+                MetaError::ParentNotFound(_) => "parent not found".to_string(),
+                MetaError::NotDirectory(_) => "not a directory".to_string(),
+                MetaError::NotFound(_) => "not found".to_string(),
+                MetaError::NotSupported(_) | MetaError::NotImplemented => {
+                    "not supported".to_string()
+                }
+                _ => e.to_string(),
+            })?;
+
+        self.state.modified.touch(parent_ino).await;
+        self.state.modified.touch(src_ino).await;
+
+        Ok(attr)
+    }
+
+    /// Create a symbolic link at `link_path` pointing to `target`.
+    pub async fn create_symlink(
+        &self,
+        link_path: &str,
+        target: &str,
+    ) -> Result<(i64, FileAttr), String> {
+        let link_path = Self::norm_path(link_path);
+        if link_path == "/" {
+            return Err("invalid path".into());
+        }
+        let (dir, name) = Self::split_dir_file(&link_path);
+        if name.is_empty() {
+            return Err("invalid name".into());
+        }
+
+        let parent_ino = if &dir == "/" {
+            self.core.root
+        } else {
+            self.core
+                .meta_layer
+                .lookup_path(&dir)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "parent not found".to_string())?
+                .0
+        };
+
+        let parent_attr = self
+            .core
+            .meta_layer
+            .stat(parent_ino)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "parent not found".to_string())?;
+        if parent_attr.kind != FileType::Dir {
+            return Err("not a directory".into());
+        }
+
+        if self
+            .core
+            .meta_layer
+            .lookup(parent_ino, &name)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return Err("already exists".into());
+        }
+
+        let (ino, attr) = self
+            .core
+            .meta_layer
+            .symlink(parent_ino, &name, target)
+            .await
+            .map_err(|e| match e {
+                MetaError::NotSupported(_) | MetaError::NotImplemented => {
+                    "not supported".to_string()
+                }
+                _ => e.to_string(),
+            })?;
+
+        self.state.modified.touch(parent_ino).await;
+        self.state.modified.touch(ino).await;
+
+        Ok((ino, attr))
+    }
+
     /// Fetch a file's attributes (kind/size come from the MetaStore); returns None when missing.
     pub async fn stat(&self, path: &str) -> Option<FileAttr> {
         let path = Self::norm_path(path);
-        let (ino, _) = self.core.meta.lookup_path(&path).await.ok()??;
-        let meta_attr = self.core.meta.stat(ino).await.ok().flatten()?;
+        let (ino, _) = self.core.meta_layer.lookup_path(&path).await.ok()??;
+        let meta_attr = self.core.meta_layer.stat(ino).await.ok().flatten()?;
         Some(meta_attr)
+    }
+
+    /// Read a symlink target by inode.
+    pub async fn readlink_ino(&self, ino: i64) -> Result<String, String> {
+        let attr = self
+            .core
+            .meta_layer
+            .stat(ino)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "not found".to_string())?;
+        if attr.kind != FileType::Symlink {
+            return Err("not a symlink".into());
+        }
+
+        self.core
+            .meta_layer
+            .read_symlink(ino)
+            .await
+            .map_err(|e| match e {
+                MetaError::NotSupported(_) | MetaError::NotImplemented => {
+                    "not supported".to_string()
+                }
+                _ => e.to_string(),
+            })
+    }
+
+    /// Read a symlink target by path.
+    pub async fn readlink(&self, path: &str) -> Result<String, String> {
+        let path = Self::norm_path(path);
+        let (ino, kind) = self
+            .core
+            .meta_layer
+            .lookup_path(&path)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "not found".to_string())?;
+        if kind != FileType::Symlink {
+            return Err("not a symlink".into());
+        }
+
+        self.readlink_ino(ino).await
     }
 
     /// List directory entries; returns None if the path is missing or not a directory.
     /// `.` and `..` are not included.
     pub async fn readdir(&self, path: &str) -> Option<Vec<DirEntry>> {
         let path = Self::norm_path(path);
-        let (ino, _) = self.core.meta.lookup_path(&path).await.ok()??;
+        let (ino, _) = self.core.meta_layer.lookup_path(&path).await.ok()??;
 
-        let meta_entries = self.core.meta.readdir(ino).await.ok()?;
+        let meta_entries = self.core.meta_layer.readdir(ino).await.ok()?;
 
         let entries: Vec<DirEntry> = meta_entries
             .into_iter()
@@ -404,10 +652,10 @@ where
     /// Check whether a path exists.
     pub async fn exists(&self, path: &str) -> bool {
         let path = Self::norm_path(path);
-        matches!(self.core.meta.lookup_path(&path).await, Ok(Some(_)))
+        matches!(self.core.meta_layer.lookup_path(&path).await, Ok(Some(_)))
     }
 
-    /// Remove a regular file (directories are not supported here).
+    /// Remove a regular file or symlink (directories are not supported here).
     pub async fn unlink(&self, path: &str) -> Result<(), String> {
         let path = Self::norm_path(path);
         let (dir, name) = Self::split_dir_file(&path);
@@ -416,7 +664,7 @@ where
             self.core.root
         } else {
             self.core
-                .meta
+                .meta_layer
                 .lookup_path(&dir)
                 .await
                 .map_err(|e| e.to_string())?
@@ -426,7 +674,7 @@ where
 
         let ino = self
             .core
-            .meta
+            .meta_layer
             .lookup(parent_ino, &name)
             .await
             .map_err(|e| e.to_string())?
@@ -434,18 +682,18 @@ where
 
         let attr = self
             .core
-            .meta
+            .meta_layer
             .stat(ino)
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "not found".to_string())?;
 
-        if attr.kind != FileType::File {
+        if attr.kind == FileType::Dir {
             return Err("is a directory".into());
         }
 
         self.core
-            .meta
+            .meta_layer
             .unlink(parent_ino, &name)
             .await
             .map_err(|e| e.to_string())?;
@@ -468,7 +716,7 @@ where
             self.core.root
         } else {
             self.core
-                .meta
+                .meta_layer
                 .lookup_path(&dir)
                 .await
                 .map_err(|e| e.to_string())?
@@ -478,7 +726,7 @@ where
 
         let ino = self
             .core
-            .meta
+            .meta_layer
             .lookup(parent_ino, &name)
             .await
             .map_err(|e| e.to_string())?
@@ -486,7 +734,7 @@ where
 
         let attr = self
             .core
-            .meta
+            .meta_layer
             .stat(ino)
             .await
             .map_err(|e| e.to_string())?
@@ -498,7 +746,7 @@ where
 
         let children = self
             .core
-            .meta
+            .meta_layer
             .readdir(ino)
             .await
             .map_err(|e| e.to_string())?;
@@ -507,7 +755,7 @@ where
         }
 
         self.core
-            .meta
+            .meta_layer
             .rmdir(parent_ino, &name)
             .await
             .map_err(|e| e.to_string())?;
@@ -526,7 +774,7 @@ where
 
         if self
             .core
-            .meta
+            .meta_layer
             .lookup_path(&new)
             .await
             .ok()
@@ -540,7 +788,7 @@ where
             self.core.root
         } else {
             self.core
-                .meta
+                .meta_layer
                 .lookup_path(&old_dir)
                 .await
                 .map_err(|e| e.to_string())?
@@ -551,7 +799,7 @@ where
         let new_dir_ino = self.mkdir_p(&new_dir).await?;
 
         self.core
-            .meta
+            .meta_layer
             .rename(old_parent_ino, &old_name, new_dir_ino, new_name)
             .await
             .map_err(|e| e.to_string())?;
@@ -568,7 +816,7 @@ where
         let path = Self::norm_path(path);
         let (ino, _) = self
             .core
-            .meta
+            .meta_layer
             .lookup_path(&path)
             .await
             .map_err(|e| e.to_string())?
@@ -577,7 +825,7 @@ where
             inode.update_size(size);
         }
         self.core
-            .meta
+            .meta_layer
             .set_file_size(ino, size)
             .await
             .map_err(|e| e.to_string())?;
@@ -591,7 +839,7 @@ where
         let path = Self::norm_path(path);
         let (ino, kind) = self
             .core
-            .meta
+            .meta_layer
             .lookup_path(&path)
             .await
             .map_err(|e| e.to_string())?
@@ -614,7 +862,7 @@ where
         if target_size > inode.file_size() {
             inode.update_size(target_size);
             self.core
-                .meta
+                .meta_layer
                 .set_file_size(ino, target_size)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -643,7 +891,7 @@ where
         let path = Self::norm_path(path);
         let (ino, _) = self
             .core
-            .meta
+            .meta_layer
             .lookup_path(&path)
             .await
             .map_err(|e| e.to_string())?
@@ -706,7 +954,7 @@ where
             Entry::Vacant(entry) => {
                 let attr = self
                     .core
-                    .meta
+                    .meta_layer
                     .stat(ino)
                     .await
                     .map_err(|e| e.to_string())?
@@ -748,7 +996,7 @@ mod tests {
         let store = ObjectBlockStore::new(client);
 
         let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let fs = VFS::new(layout, store, meta).await.unwrap();
+        let fs = VFS::new(layout, store, meta.store()).await.unwrap();
 
         fs.mkdir_p("/a/b").await.expect("mkdir_p");
         fs.create_file("/a/b/hello.txt").await.expect("create");
@@ -786,7 +1034,7 @@ mod tests {
         let store = ObjectBlockStore::new(client);
 
         let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let fs = VFS::new(layout, store, meta).await.unwrap();
+        let fs = VFS::new(layout, store, meta.store()).await.unwrap();
 
         fs.mkdir_p("/a/b").await.unwrap();
         fs.create_file("/a/b/t.txt").await.unwrap();
@@ -819,7 +1067,7 @@ mod tests {
         let layout = ChunkLayout::default();
         let store = BarrierBlockStore::new();
         let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let fs = VFS::new(layout, store, meta).await.unwrap();
+        let fs = VFS::new(layout, store, meta.store()).await.unwrap();
 
         fs.create_file("/alpha").await.unwrap();
         fs.create_file("/beta").await.unwrap();
@@ -856,7 +1104,7 @@ mod tests {
         let layout = ChunkLayout::default();
         let (store, controller) = BlockingBlockStore::new();
         let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let fs = VFS::new(layout, store, meta).await.unwrap();
+        let fs = VFS::new(layout, store, meta.store()).await.unwrap();
         fs.create_file("/shared").await.unwrap();
         let payload = vec![3u8; 32];
         let expected = payload.clone();

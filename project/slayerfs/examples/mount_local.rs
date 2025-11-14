@@ -44,7 +44,8 @@ async fn main() {
         // Create meta store using memory SQLite
         let meta = create_meta_store_from_url("sqlite::memory:")
             .await
-            .expect("create meta store");
+            .expect("create meta store")
+            .store();
         let fs = VFS::new(layout, store, meta).await.expect("create VFS");
 
         // Ensure mount point exists
