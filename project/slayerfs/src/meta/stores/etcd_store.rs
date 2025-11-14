@@ -1241,12 +1241,8 @@ impl MetaStore for EtcdMetaStore {
             (reverse_key.as_str(), reverse_json.as_str()),
         ];
 
-        if let Err(e) = self
-            .create_entry(&forward_key, &operations, parent, name)
-            .await
-        {
-            return Err(e);
-        }
+        self.create_entry(&forward_key, &operations, parent, name)
+            .await?;
 
         let name_for_closure = name.to_string();
         let inode_for_closure = inode;

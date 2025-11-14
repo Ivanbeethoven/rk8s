@@ -14,6 +14,7 @@ use crate::meta::store::{
 /// the raw [`MetaStore`] directly. Implementations may return
 /// `MetaError::NotImplemented` for operations that have not landed yet, but the
 /// signatures are provided up front to ease future parity work.
+#[allow(dead_code)]
 #[async_trait]
 pub trait MetaLayer: Send + Sync {
     /// Optional human readable backend name.

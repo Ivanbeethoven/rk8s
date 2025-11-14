@@ -225,10 +225,6 @@ impl<T: MetaStore + 'static> MetaClient<T> {
     }
 
     /// Returns a clone of the underlying raw `MetaStore` handle.
-    pub fn raw_store(&self) -> Arc<T> {
-        Arc::clone(&self.store)
-    }
-
     /// Update the logical root inode. All subsequent metadata lookups treat
     /// `ROOT_INODE` as an alias for `inode`.
     #[allow(dead_code)]

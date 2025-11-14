@@ -22,6 +22,10 @@ impl<S: BlockStore, M: MetaStore + 'static> Client<S, M> {
         Ok(Self { fs })
     }
 
+    pub fn from_vfs(fs: VFS<S, M>) -> Self {
+        Self { fs }
+    }
+
     pub async fn mkdir_p(&self, path: &str) -> Result<(), String> {
         let _ = self.fs.mkdir_p(path).await?;
         Ok(())
@@ -103,16 +107,15 @@ impl LocalClient {
     #[allow(dead_code)]
     pub async fn new_local<P: AsRef<Path>>(root: P, layout: ChunkLayout) -> Self {
         let client = ObjectClient::new(LocalFsBackend::new(root));
-        let store = ObjectBlockStore::new(client);
-
         let meta = create_meta_store_from_url("sqlite::memory:")
             .await
             .expect("Failed to create meta store");
+        let store = ObjectBlockStore::new(client);
 
-        let fs = VFS::new(layout, store, meta.store())
+        let vfs = VFS::with_meta_layer(layout, store, meta.store(), meta.layer())
             .await
             .expect("Failed to create VFS");
-        Client { fs }
+        Client { fs: vfs }
     }
 }
 

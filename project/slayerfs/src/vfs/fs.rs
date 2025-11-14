@@ -252,6 +252,36 @@ where
         Self::with_meta_client_config(layout, store, meta, MetaClientConfig::default()).await
     }
 
+    pub async fn with_meta_layer(
+        layout: ChunkLayout,
+        store: S,
+        meta: M,
+        meta_layer: Arc<dyn MetaLayer>,
+    ) -> Result<Self, String> {
+        let store = Arc::new(store);
+        let meta = Arc::new(meta);
+        Self::from_components(layout, store, meta, meta_layer)
+    }
+
+    fn from_components(
+        layout: ChunkLayout,
+        store: Arc<S>,
+        meta: Arc<M>,
+        meta_layer: Arc<dyn MetaLayer>,
+    ) -> Result<Self, String> {
+        let root_ino = meta_layer.root_ino();
+        let core = Arc::new(VfsCore::new(
+            layout,
+            Arc::clone(&store),
+            Arc::clone(&meta),
+            meta_layer,
+            root_ino,
+        ));
+        let state = Arc::new(VfsState::new());
+
+        Ok(Self { core, state })
+    }
+
     pub async fn with_meta_client_config(
         layout: ChunkLayout,
         store: S,
@@ -276,19 +306,9 @@ where
 
         meta_client.initialize().await.map_err(|e| e.to_string())?;
 
-        let root_ino = meta_client.root_ino();
         let meta_layer: Arc<dyn MetaLayer> = meta_client.clone();
 
-        let core = Arc::new(VfsCore::new(
-            layout,
-            Arc::clone(&store),
-            Arc::clone(&meta),
-            meta_layer,
-            root_ino,
-        ));
-        let state = Arc::new(VfsState::new());
-
-        Ok(Self { core, state })
+        Self::from_components(layout, store, meta, meta_layer)
     }
 
     pub fn root_ino(&self) -> i64 {
@@ -996,7 +1016,9 @@ mod tests {
         let store = ObjectBlockStore::new(client);
 
         let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let fs = VFS::new(layout, store, meta.store()).await.unwrap();
+        let fs = VFS::with_meta_layer(layout, store, meta.store(), meta.layer())
+            .await
+            .unwrap();
 
         fs.mkdir_p("/a/b").await.expect("mkdir_p");
         fs.create_file("/a/b/hello.txt").await.expect("create");
@@ -1034,7 +1056,9 @@ mod tests {
         let store = ObjectBlockStore::new(client);
 
         let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let fs = VFS::new(layout, store, meta.store()).await.unwrap();
+        let fs = VFS::with_meta_layer(layout, store, meta.store(), meta.layer())
+            .await
+            .unwrap();
 
         fs.mkdir_p("/a/b").await.unwrap();
         fs.create_file("/a/b/t.txt").await.unwrap();
@@ -1067,7 +1091,9 @@ mod tests {
         let layout = ChunkLayout::default();
         let store = BarrierBlockStore::new();
         let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let fs = VFS::new(layout, store, meta.store()).await.unwrap();
+        let fs = VFS::with_meta_layer(layout, store, meta.store(), meta.layer())
+            .await
+            .unwrap();
 
         fs.create_file("/alpha").await.unwrap();
         fs.create_file("/beta").await.unwrap();
@@ -1104,7 +1130,9 @@ mod tests {
         let layout = ChunkLayout::default();
         let (store, controller) = BlockingBlockStore::new();
         let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let fs = VFS::new(layout, store, meta.store()).await.unwrap();
+        let fs = VFS::with_meta_layer(layout, store, meta.store(), meta.layer())
+            .await
+            .unwrap();
         fs.create_file("/shared").await.unwrap();
         let payload = vec![3u8; 32];
         let expected = payload.clone();

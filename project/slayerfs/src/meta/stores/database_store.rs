@@ -1035,11 +1035,9 @@ impl MetaStore for DatabaseMetaStore {
                 ctime_update = true;
             }
 
-            if req.uid.is_none() {
-                if let Some(gid) = req.gid {
-                    permission.chown(permission.uid, gid);
-                    ctime_update = true;
-                }
+            if req.uid.is_none() && let Some(gid) = req.gid {
+                permission.chown(permission.uid, gid);
+                ctime_update = true;
             }
 
             if flags.contains(SetAttrFlags::CLEAR_SUID) {
@@ -1109,11 +1107,9 @@ impl MetaStore for DatabaseMetaStore {
                 ctime_update = true;
             }
 
-            if req.uid.is_none() {
-                if let Some(gid) = req.gid {
-                    permission.chown(permission.uid, gid);
-                    ctime_update = true;
-                }
+            if req.uid.is_none() && let Some(gid) = req.gid {
+                permission.chown(permission.uid, gid);
+                ctime_update = true;
             }
 
             if flags.contains(SetAttrFlags::CLEAR_SUID) {

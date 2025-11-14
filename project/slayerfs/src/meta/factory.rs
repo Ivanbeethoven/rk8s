@@ -67,13 +67,17 @@ impl MetaStoreFactory {
         };
 
         // Create MetaClient with configured capacity and TTL
-        let mut client_options = MetaClientOptions::default();
-        client_options.read_only = config.client.read_only;
-        client_options.no_background_jobs = config.client.no_background_jobs;
-        client_options.case_insensitive = config.client.case_insensitive;
-        if let Some(interval) = config.client.session_heartbeat {
-            client_options.session_heartbeat = interval;
-        }
+        let default_options = MetaClientOptions::default();
+        let client_options = MetaClientOptions {
+            read_only: config.client.read_only,
+            no_background_jobs: config.client.no_background_jobs,
+            case_insensitive: config.client.case_insensitive,
+            session_heartbeat: config
+                .client
+                .session_heartbeat
+                .unwrap_or(default_options.session_heartbeat),
+            ..default_options
+        };
 
         let capacity = config.cache.capacity.clone();
 
@@ -100,6 +104,8 @@ impl MetaStoreFactory {
                     (store_dyn, layer_dyn)
                 }
             };
+
+        layer.initialize().await?;
 
         Ok(MetaHandle { store, layer })
     }

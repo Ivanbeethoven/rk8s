@@ -130,7 +130,7 @@ pub struct CacheConfig {
 }
 
 /// Meta client behaviour configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClientOptions {
     /// If true, the meta client runs in read-only mode.
     #[serde(default)]
@@ -265,17 +265,6 @@ impl CacheConfig {
             }
         }
         Ok(())
-    }
-}
-
-impl Default for ClientOptions {
-    fn default() -> Self {
-        Self {
-            read_only: false,
-            no_background_jobs: false,
-            case_insensitive: false,
-            session_heartbeat: None,
-        }
     }
 }
 
