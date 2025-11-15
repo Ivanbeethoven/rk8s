@@ -255,6 +255,7 @@ impl Default for CacheConfig {
 
 impl CacheConfig {
     /// Validate cache configuration
+    #[allow(dead_code)]
     pub fn validate(&self) -> Result<(), String> {
         if self.enabled {
             if self.capacity.inode == 0 {
@@ -311,5 +312,16 @@ mod duration_option_serde {
     {
         let opt = Option::<f64>::deserialize(deserializer)?;
         Ok(opt.map(Duration::from_secs_f64))
+    }
+}
+
+// Added missing `backend_type` method to `DatabaseType` enum
+impl DatabaseType {
+    pub fn backend_type(&self) -> &str {
+        match self {
+            DatabaseType::Sqlite { .. } => "sqlite",
+            DatabaseType::Postgres { .. } => "postgres",
+            DatabaseType::Etcd { .. } => "etcd",
+        }
     }
 }

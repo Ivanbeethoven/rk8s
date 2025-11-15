@@ -1035,7 +1035,9 @@ impl MetaStore for DatabaseMetaStore {
                 ctime_update = true;
             }
 
-            if req.uid.is_none() && let Some(gid) = req.gid {
+            if req.uid.is_none()
+                && let Some(gid) = req.gid
+            {
                 permission.chown(permission.uid, gid);
                 ctime_update = true;
             }
@@ -1107,7 +1109,9 @@ impl MetaStore for DatabaseMetaStore {
                 ctime_update = true;
             }
 
-            if req.uid.is_none() && let Some(gid) = req.gid {
+            if req.uid.is_none()
+                && let Some(gid) = req.gid
+            {
                 permission.chown(permission.uid, gid);
                 ctime_update = true;
             }

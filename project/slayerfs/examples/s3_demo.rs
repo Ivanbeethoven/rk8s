@@ -55,7 +55,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Create VFS client
     let store = ObjectBlockStore::new(object_client);
-    let vfs = VFS::with_meta_layer(layout, store, meta_handle.store(), meta_handle.layer())
+    let meta_store = meta_handle.store();
+    let vfs = VFS::new(layout, store, meta_store)
         .await
         .expect("create vfs fail.");
     let mut client = Client::from_vfs(vfs);

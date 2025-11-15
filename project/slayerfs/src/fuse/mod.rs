@@ -62,7 +62,7 @@ mod mount_tests {
             .expect("create meta store");
         let store = ObjectBlockStore::new(client);
 
-        let fs = VFS::with_meta_layer(layout, store, meta.store(), meta.layer())
+        let fs = VFS::new(layout, store, meta.store().clone())
             .await
             .expect("create VFS");
 

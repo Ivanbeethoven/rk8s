@@ -41,11 +41,12 @@ async fn main() {
         let client = ObjectClient::new(LocalFsBackend::new(std::path::Path::new(&data_dir)));
 
         // Create meta store using memory SQLite
-        let meta = create_meta_store_from_url("sqlite::memory:")
+        let meta_handle = create_meta_store_from_url("sqlite::memory:")
             .await
             .expect("create meta store");
+        let meta_store = meta_handle.store();
         let store = ObjectBlockStore::new(client);
-        let fs = VFS::with_meta_layer(layout, store, meta.store(), meta.layer())
+        let fs = VFS::new(layout, store, meta_store)
             .await
             .expect("create VFS");
 

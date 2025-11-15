@@ -182,7 +182,7 @@ where
     M: MetaStore + 'static,
 {
     layout: ChunkLayout,
-    meta_layer: Arc<dyn MetaLayer>,
+    meta_layer: Arc<MetaClient<M>>,
     chunk_io: Arc<ChunkIoFactory<S, M>>,
     root: i64,
 }
@@ -196,7 +196,7 @@ where
         layout: ChunkLayout,
         store: Arc<S>,
         meta_store: Arc<M>,
-        meta_layer: Arc<dyn MetaLayer>,
+        meta_layer: Arc<MetaClient<M>>,
         root: i64,
     ) -> Self {
         let chunk_io = Arc::new(ChunkIoFactory::new(
@@ -256,7 +256,7 @@ where
         layout: ChunkLayout,
         store: S,
         meta: M,
-        meta_layer: Arc<dyn MetaLayer>,
+        meta_layer: Arc<MetaClient<M>>,
     ) -> Result<Self, String> {
         let store = Arc::new(store);
         let meta = Arc::new(meta);
@@ -267,7 +267,7 @@ where
         layout: ChunkLayout,
         store: Arc<S>,
         meta: Arc<M>,
-        meta_layer: Arc<dyn MetaLayer>,
+        meta_layer: Arc<MetaClient<M>>,
     ) -> Result<Self, String> {
         let root_ino = meta_layer.root_ino();
         let core = Arc::new(VfsCore::new(
@@ -306,7 +306,7 @@ where
 
         meta_client.initialize().await.map_err(|e| e.to_string())?;
 
-        let meta_layer: Arc<dyn MetaLayer> = meta_client.clone();
+        let meta_layer: Arc<MetaClient<M>> = meta_client.clone();
 
         Self::from_components(layout, store, meta, meta_layer)
     }
@@ -1015,10 +1015,9 @@ mod tests {
         let client = ObjectClient::new(LocalFsBackend::new(tmp.path()));
         let store = ObjectBlockStore::new(client);
 
-        let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let fs = VFS::with_meta_layer(layout, store, meta.store(), meta.layer())
-            .await
-            .unwrap();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let fs = VFS::new(layout, store, meta_store).await.unwrap();
 
         fs.mkdir_p("/a/b").await.expect("mkdir_p");
         fs.create_file("/a/b/hello.txt").await.expect("create");
@@ -1055,10 +1054,9 @@ mod tests {
         let client = ObjectClient::new(LocalFsBackend::new(tmp.path()));
         let store = ObjectBlockStore::new(client);
 
-        let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let fs = VFS::with_meta_layer(layout, store, meta.store(), meta.layer())
-            .await
-            .unwrap();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let fs = VFS::new(layout, store, meta_store).await.unwrap();
 
         fs.mkdir_p("/a/b").await.unwrap();
         fs.create_file("/a/b/t.txt").await.unwrap();
@@ -1090,10 +1088,9 @@ mod tests {
     async fn test_fs_parallel_writes_to_distinct_files() {
         let layout = ChunkLayout::default();
         let store = BarrierBlockStore::new();
-        let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let fs = VFS::with_meta_layer(layout, store, meta.store(), meta.layer())
-            .await
-            .unwrap();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let fs = VFS::new(layout, store, meta_store).await.unwrap();
 
         fs.create_file("/alpha").await.unwrap();
         fs.create_file("/beta").await.unwrap();
@@ -1129,10 +1126,9 @@ mod tests {
     async fn test_fs_same_file_read_waits_for_active_write() {
         let layout = ChunkLayout::default();
         let (store, controller) = BlockingBlockStore::new();
-        let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let fs = VFS::with_meta_layer(layout, store, meta.store(), meta.layer())
-            .await
-            .unwrap();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let fs = VFS::new(layout, store, meta_store).await.unwrap();
         fs.create_file("/shared").await.unwrap();
         let payload = vec![3u8; 32];
         let expected = payload.clone();

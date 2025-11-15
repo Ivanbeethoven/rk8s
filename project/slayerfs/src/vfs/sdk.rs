@@ -7,8 +7,11 @@
 
 use crate::chuck::chunk::ChunkLayout;
 use crate::chuck::store::BlockStore;
-use crate::meta::{MetaStore, create_meta_store_from_url};
+use crate::meta::MetaStore;
+use crate::meta::factory::create_meta_store_from_url;
+use crate::meta::store::MetaError;
 use crate::vfs::fs::{DirEntry, FileAttr, VFS};
+use std::path::Path;
 
 /// SDK client parametrized by its backend.
 pub struct Client<S: BlockStore, M: MetaStore + 'static> {
@@ -96,7 +99,6 @@ impl<S: BlockStore, M: MetaStore + 'static> Client<S, M> {
 use crate::cadapter::client::ObjectClient;
 use crate::cadapter::localfs::LocalFsBackend;
 use crate::chuck::store::ObjectBlockStore;
-use std::path::Path;
 use std::sync::Arc;
 
 #[allow(dead_code)]
@@ -105,17 +107,18 @@ pub type LocalClient = Client<ObjectBlockStore<LocalFsBackend>, Arc<dyn MetaStor
 #[allow(dead_code)]
 impl LocalClient {
     #[allow(dead_code)]
-    pub async fn new_local<P: AsRef<Path>>(root: P, layout: ChunkLayout) -> Self {
+    pub async fn new_local<P: AsRef<Path>>(
+        root: P,
+        layout: ChunkLayout,
+    ) -> Result<Self, MetaError> {
         let client = ObjectClient::new(LocalFsBackend::new(root));
-        let meta = create_meta_store_from_url("sqlite::memory:")
-            .await
-            .expect("Failed to create meta store");
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await?;
+        let metadata: Arc<dyn MetaStore> = meta_handle.store();
         let store = ObjectBlockStore::new(client);
-
-        let vfs = VFS::with_meta_layer(layout, store, meta.store(), meta.layer())
+        let fs = VFS::new(layout, store, metadata)
             .await
-            .expect("Failed to create VFS");
-        Client { fs: vfs }
+            .map_err(MetaError::Internal)?;
+        Ok(Client { fs })
     }
 }
 
@@ -129,7 +132,9 @@ mod tests {
     async fn test_sdk_local_basic() {
         let layout = ChunkLayout::default();
         let tmp = tempdir().unwrap();
-        let mut cli = LocalClient::new_local(tmp.path(), layout).await;
+        let mut cli = LocalClient::new_local(tmp.path(), layout)
+            .await
+            .expect("init LocalClient");
 
         cli.mkdir_p("/a/b").await.unwrap();
         cli.create("/a/b/hello.txt").await.unwrap();
@@ -161,7 +166,9 @@ mod tests {
     async fn test_sdk_local_ops_extras() {
         let layout = ChunkLayout::default();
         let tmp = tempdir().unwrap();
-        let cli = LocalClient::new_local(tmp.path(), layout).await;
+        let cli = LocalClient::new_local(tmp.path(), layout)
+            .await
+            .expect("init LocalClient");
 
         cli.mkdir_p("/x/y").await.unwrap();
         cli.create("/x/y/a.txt").await.unwrap();
@@ -180,7 +187,9 @@ mod tests {
     async fn test_sdk_local_links() {
         let layout = ChunkLayout::default();
         let tmp = tempdir().unwrap();
-        let mut cli = LocalClient::new_local(tmp.path(), layout).await;
+        let mut cli = LocalClient::new_local(tmp.path(), layout)
+            .await
+            .expect("init LocalClient");
 
         cli.mkdir_p("/links").await.unwrap();
         cli.create("/links/original.txt").await.unwrap();
