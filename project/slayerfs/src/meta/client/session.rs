@@ -32,15 +32,12 @@ impl SessionManager {
     }
 
     #[allow(dead_code)]
-    pub(crate) async fn start<T>(
+    pub(crate) async fn start(
         &self,
-        store: Arc<T>,
+        store: Arc<dyn MetaStore + Send + Sync>,
         payload: Vec<u8>,
         update_existing: bool,
-    ) -> Result<(), MetaError>
-    where
-        T: MetaStore + Send + Sync + 'static,
-    {
+    ) -> Result<(), MetaError> {
         // Prevent concurrent starts: set `running` to true if and only if
         // there is no active session. We keep the flag set for the whole
         // lifetime of the session and clear it on failure or shutdown. This

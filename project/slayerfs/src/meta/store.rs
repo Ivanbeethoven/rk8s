@@ -322,38 +322,11 @@ pub enum MetaError {
 ///   different hosts should ensure reasonable clock synchronization if they
 ///   participate in shared state.
 ///
-/// The trait uses `async_trait` to allow async method implementations and
-/// `auto_impl` to conveniently implement the trait for shared references and
-/// `Arc<T>` wrappers.
 #[async_trait]
 #[auto_impl::auto_impl(&, std::sync::Arc)]
-/// Metadata store abstract interface.
-///
-/// `MetaStore` defines the contract required from a metadata backend that
-/// stores filesystem namespace information and file layout metadata. The
-/// trait is intentionally broad so different concrete backends (for
-/// example an embedded SQLite store, a distributed KV-backed store, or a
-/// mocked in-memory store) can be used interchangeably by higher-level
-/// components.
-///
-/// Implementers should honor the following conventions:
-/// - Methods returning `Result<T, MetaError>` should map backend-specific
-///   failures into the `MetaError` variants defined in this module. Network
-///   or IO errors must be wrapped in `MetaError::Io` or `MetaError::Database`
-///   as appropriate.
-/// - Methods that have default `NotImplemented` implementations are
-///   optional; callers must tolerate `MetaError::NotImplemented` where
-///   documented. Core filesystem operations (lookup/stat/read/write-related)
-///   should be implemented by production backends.
-/// - Date/time semantics: timestamps passed or returned (for example
-///   `SystemTime` fields) are wall-clock times; backends running on
-///   different hosts should ensure reasonable clock synchronization if they
-///   participate in shared state.
-///
 /// The trait uses `async_trait` to allow async method implementations and
 /// `auto_impl` to conveniently implement the trait for shared references and
 /// `Arc<T>` wrappers.
-#[async_trait]
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub trait MetaStore: Send + Sync {
@@ -514,7 +487,6 @@ pub trait MetaStore: Send + Sync {
     async fn stat_fs(&self) -> Result<StatFsSnapshot, MetaError> {
         Err(MetaError::NotImplemented)
     }
-
     // ---------- Garbage collection helpers ----------
 
     async fn delete_sustained_inode(&self, session_id: u64, inode: i64) -> Result<(), MetaError> {

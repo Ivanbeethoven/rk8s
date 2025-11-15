@@ -74,7 +74,6 @@ impl Default for MetaClientOptions {
         }
     }
 }
-
 const DEFAULT_SESSION_HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// Metadata client with intelligent caching
@@ -271,7 +270,6 @@ impl<T: MetaStore + 'static> MetaClient<T> {
     fn is_umounting(&self) -> bool {
         self.umounting.load(Ordering::SeqCst)
     }
-
     /// Starts a background heartbeat session with the underlying store.
     ///
     /// Callers provide an opaque payload understood by the backend; the client
@@ -369,7 +367,6 @@ impl<T: MetaStore + 'static> MetaClient<T> {
         addrs.sort();
         Ok(addrs)
     }
-
     /// Handle cache invalidation events from Watch Worker
     ///
     /// This runs in a background task and processes events from etcd Watch Worker

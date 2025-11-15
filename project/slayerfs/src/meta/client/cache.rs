@@ -180,18 +180,15 @@ impl InodeCache {
             let mut children_lock = parent_node.children.write().await;
             if let Some(children_map) = children_lock.get_map() {
                 let mut map = (**children_map).clone();
-                let child_ino = map.remove(name);
-
-                if let Some(_ino) = child_ino {
+                if let Some(child_ino) = map.remove(name) {
                     *children_lock = match &*children_lock {
                         ChildrenState::Complete(_) => ChildrenState::Complete(Arc::new(map)),
                         _ => ChildrenState::Partial(Arc::new(map)),
                     };
 
-                    self.ttl_manager.invalidate(&_ino).await;
+                    self.ttl_manager.invalidate(&child_ino).await;
+                    return Some(child_ino);
                 }
-
-                return child_ino;
             }
         }
         None
@@ -206,16 +203,13 @@ impl InodeCache {
             let mut children_lock = parent_node.children.write().await;
             if let Some(children_map) = children_lock.get_map() {
                 let mut map = (**children_map).clone();
-                let child_ino = map.remove(name);
-
-                if let Some(_ino) = child_ino {
+                if let Some(child_ino) = map.remove(name) {
                     *children_lock = match &*children_lock {
                         ChildrenState::Complete(_) => ChildrenState::Complete(Arc::new(map)),
                         _ => ChildrenState::Partial(Arc::new(map)),
                     };
+                    return Some(child_ino);
                 }
-
-                return child_ino;
             }
         }
         None
