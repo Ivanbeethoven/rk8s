@@ -1,6 +1,5 @@
 //! reply structures.
 use std::ffi::OsString;
-use std::num::NonZeroU32;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -83,12 +82,9 @@ impl From<FileAttr> for fuse_attr {
     }
 }
 
-#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
-/// init reply
-pub struct ReplyInit {
-    /// the max write size
-    pub max_write: NonZeroU32,
-}
+#[derive(Debug, Copy, Clone, Default, Ord, PartialOrd, Eq, PartialEq, Hash)]
+/// init reply. Currently empty as configuration is done via MountOptions.
+pub struct ReplyInit;
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 /// entry reply.

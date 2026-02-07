@@ -60,6 +60,7 @@ use crate::find_fusermount3;
 use crate::helper::*;
 use crate::notify::Notify;
 use crate::raw::abi::*;
+use crate::raw::buffer_pool::AlignedBuffer;
 #[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
 use crate::raw::connection::FuseConnection;
 use crate::raw::filesystem::Filesystem;
@@ -263,8 +264,8 @@ pub(crate) struct WorkItem {
     pub(crate) unique: u64,
     opcode: u32,
     pub(crate) in_header: InHeaderLite,
-    /// Body data (excludes fixed-size fuse_in_header)
-    data: Vec<u8>,
+    /// Body data (excludes fixed-size fuse_in_header) - uses Bytes for zero-copy sharing
+    data: Bytes,
     _inflight_guard: InflightGuard,
 }
 
@@ -735,7 +736,8 @@ async fn worker_write<FS: Filesystem + Send + Sync + 'static>(
         let _ = ctx.resp.unbounded_send(Either::Left(data));
         return;
     }
-    let data_vec = payload.to_vec();
+    // Use Bytes::slice for zero-copy - creates a new Bytes sharing the same underlying data
+    let payload_bytes = item.data.slice(FUSE_WRITE_IN_SIZE..);
     let fs = ctx.fs.clone();
     let resp = ctx.resp.clone();
     spawn(debug_span!("fuse_write_worker"), async move {
@@ -752,7 +754,7 @@ async fn worker_write<FS: Filesystem + Send + Sync + 'static>(
                 item.in_header.nodeid,
                 write_in.fh,
                 write_in.offset,
-                &data_vec,
+                &payload_bytes,
                 write_in.write_flags,
                 write_in.flags,
             )
@@ -2935,7 +2937,7 @@ enum ReadResult {
     Request {
         in_header: IoResult<fuse_in_header>,
         header_buffer: Vec<u8>,
-        data_buffer: Vec<u8>,
+        data_buffer: AlignedBuffer,
     },
 }
 
@@ -3249,10 +3251,34 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         mut response_receiver: UnboundedReceiver<FuseData>,
     ) -> IoResult<()> {
         while let Some(response) = response_receiver.next().await {
-            let (data, extend_data) = match response {
+            let (mut data, extend_data) = match response {
                 Either::Left(data) => (data, None),
                 Either::Right((data, extend_data)) => (data, Some(extend_data)),
             };
+            let extend_len = extend_data.as_ref().map(|v| v.len()).unwrap_or(0);
+            if data.len() >= FUSE_OUT_HEADER_SIZE {
+                let actual_len = data.len() + extend_len;
+                let header_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                if header_len != actual_len {
+                    let len_bytes = (actual_len as u32).to_le_bytes();
+                    data[0..4].copy_from_slice(&len_bytes);
+                    warn!(
+                        header_len,
+                        actual_len, "adjusted fuse reply length to match payload"
+                    );
+                }
+            }
+            let reply_header = if data.len() >= FUSE_OUT_HEADER_SIZE {
+                let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                let err_code = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                let unique = u64::from_le_bytes([
+                    data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
+                ]);
+                Some((len, err_code, unique))
+            } else {
+                None
+            };
+
             if let Err(err) = fuse_connection.write_vectored(data, extend_data).await.1 {
                 use std::io::ErrorKind;
                 if err.kind() == ErrorKind::NotFound {
@@ -3264,7 +3290,17 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     continue;
                 }
 
-                error!("reply fuse failed {}", err);
+                if let Some((len, err_code, unique)) = reply_header {
+                    error!(
+                        error = %err,
+                        reply_len = len,
+                        reply_error = err_code,
+                        unique,
+                        "reply fuse failed"
+                    );
+                } else {
+                    error!("reply fuse failed {}", err);
+                }
 
                 return Err(err);
             }
@@ -3282,7 +3318,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         use std::io::ErrorKind;
 
         let header_buffer = vec![0; FUSE_IN_HEADER_SIZE];
-        let data_buffer = vec![0; FUSE_MIN_READ_BUFFER_SIZE];
+        let data_buffer = AlignedBuffer::new(FUSE_MIN_READ_BUFFER_SIZE);
 
         let (data_buffer, in_header) = match self
             .read_fuse_request(fuse_connection, header_buffer, data_buffer)
@@ -3339,7 +3375,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         &mut self,
         fuse_connection: &FuseConnection,
         mut header_buffer: Vec<u8>,
-        mut data_buffer: Vec<u8>,
+        mut data_buffer: AlignedBuffer,
     ) -> ReadResult {
         let res = match fuse_connection
             .read_vectored(header_buffer, data_buffer)
@@ -3425,9 +3461,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             self.ensure_workers(fs.clone());
         }
         let buffer_size = (max_write + FUSE_WRITE_IN_SIZE).max(FUSE_MIN_READ_BUFFER_SIZE);
+        debug!(buffer_size, "buffer size calculated");
 
+        // Create buffers for main loop (reused each iteration)
         let mut header_buffer = vec![0; FUSE_IN_HEADER_SIZE];
-        let mut data_buffer = vec![0; buffer_size];
+        let mut data_buffer = AlignedBuffer::new(buffer_size);
 
         loop {
             if workers_active {
@@ -3481,7 +3519,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 Ok(opcode) => opcode,
             };
 
-            debug!("receive opcode {}", opcode);
+            debug!(unique = request.unique, opcode = %opcode, "receive opcode");
 
             let data_size = in_header.len as usize - FUSE_IN_HEADER_SIZE;
             let data_ref = &data_buffer[..data_size];
@@ -3489,7 +3527,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             if let Some(workers) = &self.workers {
                 let unique = request.unique;
                 let opcode_raw = in_header.opcode;
-                let body_vec = data_ref.to_vec();
+                // Keep the shared read buffer for reuse; copy only request payload
+                let body_bytes = Bytes::copy_from_slice(data_ref);
+
                 let lite = InHeaderLite {
                     nodeid: in_header.nodeid,
                     uid: in_header.uid,
@@ -3503,7 +3543,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         unique,
                         opcode: opcode_raw,
                         in_header: lite,
-                        data: body_vec,
+                        data: body_bytes,
                         _inflight_guard,
                     })
                     .await;
@@ -3981,41 +4021,42 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             reply_flags |= FUSE_XTIMES;
         }
 
-        // TODO: pass init_in to init, so the file system will know which flags are in use.
-        let reply = match fs.init(request).await {
-            Err(err) => {
-                let init_out_header = fuse_out_header {
-                    len: FUSE_OUT_HEADER_SIZE as u32,
-                    error: err.into(),
-                    unique: request.unique,
-                };
+        if let Err(err) = fs.init(request).await {
+            let init_out_header = fuse_out_header {
+                len: FUSE_OUT_HEADER_SIZE as u32,
+                error: err.into(),
+                unique: request.unique,
+            };
 
-                let init_out_header_data = get_bincode_config()
-                    .serialize(&init_out_header)
-                    .expect("won't happened");
+            let init_out_header_data = get_bincode_config()
+                .serialize(&init_out_header)
+                .expect("won't happened");
 
-                if let Err(err) = fuse_connection
-                    .write_vectored::<_, Vec<u8>>(init_out_header_data, None)
-                    .await
-                    .1
-                {
-                    error!("write error init out data to /dev/fuse failed {}", err);
-                }
-
-                return Err(err.into());
+            if let Err(err) = fuse_connection
+                .write_vectored::<_, Vec<u8>>(init_out_header_data, None)
+                .await
+                .1
+            {
+                error!("write error init out data to /dev/fuse failed {}", err);
             }
 
-            Ok(reply) => reply,
-        };
+            return Err(err.into());
+        }
+
+        // Use max_readahead from mount_options if set, otherwise use kernel's value
+        let max_readahead = self
+            .mount_options
+            .max_readahead
+            .unwrap_or(init_in.max_readahead);
 
         let init_out = fuse_init_out {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_KERNEL_MINOR_VERSION,
-            max_readahead: init_in.max_readahead,
+            max_readahead,
             flags: reply_flags,
             max_background: DEFAULT_MAX_BACKGROUND,
             congestion_threshold: DEFAULT_CONGESTION_THRESHOLD,
-            max_write: reply.max_write.get(),
+            max_write: self.mount_options.max_write.get(),
             time_gran: DEFAULT_TIME_GRAN,
             max_pages: DEFAULT_MAX_PAGES,
             map_alignment: DEFAULT_MAP_ALIGNMENT,
@@ -4051,7 +4092,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         debug!("fuse init done");
 
-        Ok(reply.max_write)
+        Ok(self.mount_options.max_write)
     }
 
     #[instrument(skip(self, data, fs))]

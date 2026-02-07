@@ -1,0 +1,16 @@
+# Changelog
+
+## 2026-02-07
+
+### Added
+- rfuse3: buffer pool feature flag (buffer-pool).
+- rfuse3: mount options for max_write and max_readahead.
+- rfuse3: benchmark filesystem example and fio helper script.
+- rfuse3: performance report (report.md).
+- slayerfs: performance report (slayerfs/report.md).
+
+### Changed
+- rfuse3: init reply is now empty; size tuning is via mount options.
+- rfuse3: session uses aligned buffers and zero-copy request bodies for worker dispatch.
+- rfuse3: inode name manager uses DashMap for concurrent access.
+- rfuse3: cached bincode config uses OnceLock for MSRV compatibility.
