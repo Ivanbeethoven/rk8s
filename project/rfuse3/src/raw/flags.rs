@@ -10,3 +10,6 @@ pub use crate::raw::abi::FUSE_POLL_SCHEDULE_NOTIFY;
 pub use crate::raw::abi::FUSE_READ_LOCKOWNER;
 pub use crate::raw::abi::FUSE_WRITE_CACHE;
 pub use crate::raw::abi::FUSE_WRITE_LOCKOWNER;
+pub use crate::raw::abi::FOPEN_DIRECT_IO;
+pub use crate::raw::abi::FOPEN_KEEP_CACHE;
+pub use crate::raw::abi::FOPEN_NONSEEKABLE;
