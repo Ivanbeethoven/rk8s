@@ -123,11 +123,12 @@ impl BlockStore for InMemoryBlockStore {
 }
 
 /// BlockStore backed by cadapter::client (key space `chunks/{chunk_id}/{block_index}`).
-pub struct ObjectBlockStore<B: ObjectBackend> {
+pub struct ObjectBlockStore<B: ObjectBackend + Clone> {
     client: ObjectClient<B>,
     #[allow(dead_code)]
     block_cache: ChunksCache,
     /// SingleFlight controller for coalescing concurrent reads to the same block
+    /// Thread-safe and shared across the store lifetime so concurrent requests can coalesce.
     read_flight: SingleFlight<BlockKey, Bytes>,
     /// Configuration for read strategy
     config: BlockStoreConfig,
@@ -152,7 +153,23 @@ impl Default for BlockStoreConfig {
     }
 }
 
-impl<B: ObjectBackend> ObjectBlockStore<B> {
+impl BlockStoreConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.block_size == 0 {
+            anyhow::bail!("block_size must be greater than 0");
+        }
+        if !(0.0..=1.0).contains(&self.range_read_threshold) {
+            anyhow::bail!("range_read_threshold must be between 0.0 and 1.0");
+        }
+        Ok(())
+    }
+
+    fn range_size_threshold(&self) -> usize {
+        (self.block_size as f32 * self.range_read_threshold) as usize
+    }
+}
+
+impl<B: ObjectBackend + Clone> ObjectBlockStore<B> {
     pub fn new(client: ObjectClient<B>) -> Self {
         let cache_dir = dirs::cache_dir().unwrap().join("slayerfs");
 
@@ -161,11 +178,13 @@ impl<B: ObjectBackend> ObjectBlockStore<B> {
         let block_cache = block_on(ChunksCache::new_with_config(ChunksCacheConfig::default()))
             .map_err(|e| anyhow::anyhow!("Failed to create cache: {}", e))
             .unwrap();
+        let config = BlockStoreConfig::default();
+        config.validate().expect("default config must be valid");
         Self {
             client,
             block_cache,
             read_flight: SingleFlight::new(),
-            config: BlockStoreConfig::default(),
+            config,
         }
     }
     /// Creates a new ObjectBlockStore with custom cache configuration
@@ -184,6 +203,7 @@ impl<B: ObjectBackend> ObjectBlockStore<B> {
         cache_config: ChunksCacheConfig,
         store_config: BlockStoreConfig,
     ) -> anyhow::Result<Self> {
+        store_config.validate()?;
         let cache_dir = dirs::cache_dir().unwrap().join("slayerfs");
         let _ = fs::create_dir_all(cache_dir.clone());
 
@@ -204,7 +224,7 @@ impl<B: ObjectBackend> ObjectBlockStore<B> {
 }
 
 #[async_trait]
-impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
+impl<B: ObjectBackend + Clone + Send + Sync> BlockStore for ObjectBlockStore<B> {
     async fn write_range(&self, key: BlockKey, offset: u64, data: &[u8]) -> anyhow::Result<u64> {
         let key_str = Self::key_for(key);
         let mut buf = self
@@ -291,13 +311,14 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
     // Caller is responsible for zero-filling buf; this method only overwrites existing bytes.
     async fn read_range(&self, key: BlockKey, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         let len = buf.len();
-        let range_size_threshold =
-            (self.config.block_size as f32 * self.config.range_read_threshold) as usize;
+        let range_size_threshold = self.config.range_size_threshold();
+
+        // Boundary: len == threshold still uses direct range read; threshold is floor-casted usize.
 
         // Smart strategy selection:
         // 1. If the requested range is small (< threshold), use direct range read
         // 2. If the range is large, use SingleFlight to potentially coalesce with other requests
-        if len < range_size_threshold {
+        if len <= range_size_threshold {
             // Strategy 1: Direct range read for small ranges (efficient for random access)
             tracing::Span::current().record("strategy", "direct_range");
 
@@ -317,7 +338,7 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
 
         // Use SingleFlight to coalesce concurrent reads to the same block.
         // We read the entire block and then extract the requested range.
-        let client = &self.client;
+        let client: ObjectClient<B> = self.client.clone();
         let block_data =
             self.read_flight
                 .execute(key, || async move {
@@ -336,14 +357,13 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
         let offset_usize = offset as usize;
         let end = offset_usize + len;
 
+        let mut copy_len = 0;
         if offset_usize < block_data.len() {
             let copy_end = end.min(block_data.len());
-            let copy_len = copy_end - offset_usize;
+            copy_len = copy_end - offset_usize;
             buf[..copy_len].copy_from_slice(&block_data.as_ref()[offset_usize..copy_end]);
-            tracing::Span::current().record("read_len", copy_len);
-        } else {
-            tracing::Span::current().record("read_len", 0_usize);
         }
+        tracing::Span::current().record("read_len", copy_len);
 
         Ok(())
     }
@@ -431,10 +451,12 @@ mod tests {
     async fn test_intelligent_read_strategy() -> Result<(), Box<dyn std::error::Error>> {
         use crate::cadapter::client::{ObjectBackend, ObjectClient};
         use async_trait::async_trait;
+        use futures::future;
         use std::{
             collections::HashMap,
             sync::{Arc, Mutex},
         };
+        use tokio::time::{Duration, sleep};
 
         #[derive(Debug, Clone)]
         struct MockStats {
@@ -486,6 +508,8 @@ mod tests {
             }
 
             async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                // Simulate some latency so SingleFlight can coalesce concurrent requests
+                sleep(Duration::from_millis(10)).await;
                 self.stats.lock().unwrap().get_object_calls += 1;
                 Ok(self.data.lock().unwrap().get(key).cloned())
             }
@@ -529,8 +553,11 @@ mod tests {
             block_size: 4 * 1024 * 1024,
             range_read_threshold: 0.25, // 1MB threshold
         };
-        let store =
-            ObjectBlockStore::new_with_configs(client, ChunksCacheConfig::default(), config)?;
+        let store = Arc::new(ObjectBlockStore::new_with_configs(
+            client,
+            ChunksCacheConfig::default(),
+            config,
+        )?);
 
         backend.reset_stats();
 
@@ -561,9 +588,34 @@ mod tests {
             "Large read should not use range read"
         );
 
+        // Concurrent large reads should coalesce to a single backend call
+        backend.reset_stats();
+        let handles: Vec<_> = (0..5)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 2 * 1024 * 1024];
+                    store.read_range((42, 3), 0, &mut buf).await
+                })
+            })
+            .collect();
+
+        future::try_join_all(handles).await?;
+
+        let stats = backend.get_stats();
+        assert_eq!(
+            stats.get_object_calls, 1,
+            "Concurrent reads should coalesce to 1 call"
+        );
+        assert_eq!(
+            stats.get_object_range_calls, 0,
+            "Coalesced path should not fall back to range reads",
+        );
+
         println!("✅ 智能读取策略测试通过:");
         println!("   - 小范围读取 (512KB) → 使用 get_object_range");
         println!("   - 大范围读取 (2MB) → 使用 get_object + SingleFlight");
+        println!("   - 并发大范围读取 → SingleFlight 合并");
 
         Ok(())
     }

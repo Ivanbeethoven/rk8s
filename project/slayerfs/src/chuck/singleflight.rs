@@ -38,6 +38,10 @@ struct InFlight<V> {
 
 /// SingleFlight controller that coalesces concurrent requests for the same key.
 ///
+/// Thread-safe: internally synchronized with `std::sync::Mutex` and safe to share across
+/// tasks/threads. Intended to live as long as the store/client instance so all calls with
+/// the same key can be coalesced.
+///
 /// Type parameters:
 /// - `K`: The key type (must be `Hash + Eq + Clone`)
 /// - `V`: The value type. The result is shared as `Arc<V>` to avoid copying.
@@ -48,7 +52,7 @@ pub struct SingleFlight<K, V> {
 
 impl<K, V> Default for SingleFlight<K, V>
 where
-    K: Hash + Eq + Clone,
+    K: Hash + Eq + Clone + std::fmt::Debug,
 {
     fn default() -> Self {
         Self::new()
@@ -57,7 +61,7 @@ where
 
 impl<K, V> SingleFlight<K, V>
 where
-    K: Hash + Eq + Clone,
+    K: Hash + Eq + Clone + std::fmt::Debug,
 {
     /// Create a new SingleFlight controller.
     pub fn new() -> Self {
@@ -109,11 +113,16 @@ where
             }
         };
 
-        // If we're a waiter, wait for the result
+        // If we're a waiter, wait for the result. Safe from races: subscription is created
+        // while holding the mutex so even if the executor finishes immediately after unlock,
+        // the broadcasted value will still be delivered to this receiver.
         if let Some(ref mut rx) = rx {
             return match rx.recv().await {
                 Ok(result) => result,
-                Err(_) => Err(Arc::new(anyhow::anyhow!("SingleFlight: channel closed"))),
+                Err(_) => Err(Arc::new(anyhow::anyhow!(
+                    "SingleFlight: channel closed for key: {:?}",
+                    key,
+                ))),
             };
         }
 
@@ -252,6 +261,49 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("test error"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_requests_executor_fails() {
+        let sf = Arc::new(SingleFlight::<String, String>::new());
+
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let sf_clone = sf.clone();
+            handles.push(tokio::spawn(async move {
+                sf_clone
+                    .execute("key".to_string(), || async {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Err::<String, _>(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "intentional failure",
+                        ))
+                    })
+                    .await
+            }));
+        }
+
+        let results: Vec<_> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        for result in results {
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("intentional failure")
+            );
+        }
+
+        assert_eq!(
+            sf.in_flight_count(),
+            0,
+            "in-flight map should be cleaned up"
+        );
     }
 
     #[tokio::test]
