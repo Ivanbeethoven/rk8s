@@ -18,7 +18,15 @@ pub(crate) struct CacheSlice {
     config: Arc<WriteConfig>,
     len: u64,
     alloc_bytes: u64,
-    pages: Vec<Vec<Page>>,
+    pages: Vec<Option<Page>>, // 优化为单层Vec
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CacheSliceStats {
+    pub len: u64,
+    pub alloc_bytes: u64,
+    pub pages_total: usize,
+    pub pages_used: usize,
 }
 
 impl CacheSlice {
@@ -28,12 +36,13 @@ impl CacheSlice {
             0,
             "The block size must be a multiple of the page size"
         );
-
-        let blocks = config
-            .layout
-            .chunk_size
-            .div_ceil(config.layout.block_size as u64) as usize;
-        let pages = vec![Vec::new(); blocks];
+        let chunk_size = config.layout.chunk_size;
+        let block_size = config.layout.block_size as u64;
+        let page_size = config.page_size as u64;
+        let blocks = chunk_size.div_ceil(block_size) as usize;
+        let pages_per_block = block_size.div_ceil(page_size) as usize;
+        let total_pages = blocks * pages_per_block;
+        let pages = vec![None; total_pages];
         Self {
             config,
             len: 0,
@@ -77,17 +86,18 @@ impl CacheSlice {
         let mut cursor = Cursor::new(buf);
 
         let chunk_size = self.config.layout.chunk_size;
-        let block_size = self.config.layout.block_size;
-        let page_size = self.config.page_size;
-
+        let block_size = self.config.layout.block_size as u64;
+        let page_size = self.config.page_size as u64;
+        let pages_per_block = self.pages_per_block();
         let span = ChunkSpan::new(0, offset, buf.len() as u64);
-        for block_span in span.split_into::<BlockTag>(chunk_size, block_size as u64, true) {
-            let span = block_span.split_into::<PageTag>(block_size as u64, page_size as u64, true);
-
-            for page_span in span {
-                let page = &mut self.pages[block_span.index.as_usize()][page_span.index.as_usize()];
+        for block_span in span.split_into::<BlockTag>(chunk_size, block_size, true) {
+            let page_spans = block_span.split_into::<PageTag>(block_size, page_size, true);
+            for page_span in page_spans {
+                let block_idx = block_span.index.as_usize();
+                let page_idx = page_span.index.as_usize();
+                let flat_idx = self.flat_index(block_idx, page_idx, pages_per_block);
+                let page = self.ensure_page_mut_by_flat(flat_idx, page_size as usize);
                 let end = (page_span.offset + page_span.len).as_usize();
-
                 let slice = page.write_slice(page_span.offset.as_usize(), end)?;
                 cursor.read_exact(slice)?;
             }
@@ -108,15 +118,13 @@ impl CacheSlice {
         let mut cursor = Cursor::new(buf);
 
         while position < buf.len() {
-            let (block_index, page_index, within_page) = self.next_write_slot();
-            let page = &mut self.pages[block_index][page_index];
+            let (flat_idx, within_page) = self.next_write_slot_flat();
+            let page = self.ensure_page_mut_by_flat(flat_idx, page_size);
             let next_page = page.write_slice(within_page, page_size)?;
             let read = cursor.read(next_page)?;
-
             if read == 0 {
                 break;
             }
-
             position += read;
             self.len += read as u64;
         }
@@ -135,43 +143,53 @@ impl CacheSlice {
         self.len == offset
     }
 
+    pub(crate) fn stats(&self) -> CacheSliceStats {
+        let pages_used = self.pages.iter().filter(|p| p.is_some()).count();
+        CacheSliceStats {
+            len: self.len,
+            alloc_bytes: self.alloc_bytes,
+            pages_total: self.pages.len(),
+            pages_used,
+        }
+    }
+
     pub(crate) fn freeze(&mut self) {
-        for block in &mut self.pages {
-            for page in block {
-                page.freeze();
-            }
+        for page in self.pages.iter_mut().flatten() {
+            page.freeze();
         }
     }
 
     pub(crate) fn freeze_blocks(&mut self, start: usize, end: usize) {
-        for block in self.pages[start..end].iter_mut() {
-            for page in block.iter_mut() {
-                page.freeze();
-            }
+        let pages_per_block = self.pages_per_block();
+        let start_idx = start * pages_per_block;
+        let end_idx = end * pages_per_block;
+        for page in self.pages[start_idx..end_idx].iter_mut().flatten() {
+            page.freeze();
         }
     }
 
     pub fn release_block(&mut self, idx: Vec<usize>) -> u64 {
         let page_size = self.config.page_size as u64;
+        let pages_per_block = self.pages_per_block();
         let mut freed = 0;
-
-        for index in idx {
-            let pages = self.pages[index].len() as u64;
-            freed += pages * page_size;
-            self.pages[index].clear();
+        for block_idx in idx {
+            let range = self.block_page_range(block_idx, pages_per_block);
+            for page in self.pages[range].iter_mut() {
+                if page.is_some() {
+                    *page = None;
+                    freed += page_size;
+                }
+            }
         }
-
         self.alloc_bytes = self.alloc_bytes.saturating_sub(freed);
         freed
     }
 
     pub(crate) fn release_all(&mut self) -> u64 {
         let freed = self.alloc_bytes;
-
-        for block in &mut self.pages {
-            block.clear();
+        for page in &mut self.pages {
+            *page = None;
         }
-
         self.alloc_bytes = 0;
         freed
     }
@@ -183,7 +201,7 @@ impl CacheSlice {
     ) -> anyhow::Result<Vec<(usize, Vec<Bytes>)>> {
         let page_size = self.config.page_size as usize;
         let block_size = self.config.layout.block_size as usize;
-        let pages_per_block = block_size / page_size;
+        let pages_per_block = self.pages_per_block();
 
         let mut remaining = self.len.as_usize();
         let skip = start * block_size;
@@ -195,50 +213,90 @@ impl CacheSlice {
 
         let mut out = Vec::new();
 
-        for idx in start..end {
-            let block = &self.pages[idx];
+        for block_idx in start..end {
             let mut pages = Vec::new();
-
             for page_idx in 0..pages_per_block {
                 if remaining == 0 {
                     break;
                 }
-
                 let take = remaining.min(page_size);
-                if let Some(page) = block.get(page_idx) {
+                let flat_idx = self.flat_index(block_idx, page_idx, pages_per_block);
+                if let Some(page) = self.pages[flat_idx].as_ref() {
                     let bytes = page.bytes()?;
                     pages.push(bytes.slice(0..take));
                 } else {
                     pages.extend(make_zero_bytes(take));
                 }
-
                 remaining -= take;
             }
-
-            out.push((idx, pages));
+            out.push((block_idx, pages));
         }
 
         Ok(out)
     }
 
-    /// Acquire the next writable slot (block, page, offset).
-    /// The returned slot belongs to a single page and never overlaps existing writes.
-    fn next_write_slot(&mut self) -> (usize, usize, usize) {
+    /// 获取下一个可写slot（扁平索引，页内偏移）
+    fn next_write_slot_flat(&mut self) -> (usize, usize) {
         let page_size = self.config.page_size as usize;
         let block_size = self.config.layout.block_size as usize;
-
+        let pages_per_block = self.pages_per_block();
         let total = self.len.as_usize();
         let block_index = total / block_size;
         let within_block = total % block_size;
         let page_index = within_block / page_size;
         let within_page = within_block % page_size;
+        let flat_idx = self.flat_index(block_index, page_index, pages_per_block);
+        (flat_idx, within_page)
+    }
 
-        // Allocate a complete page
-        if self.pages[block_index].len() <= page_index {
-            self.pages[block_index].push(Page::new(page_size));
+    fn pages_per_block(&self) -> usize {
+        let page_size = self.config.page_size as usize;
+        let block_size = self.config.layout.block_size as usize;
+        block_size.div_ceil(page_size)
+    }
+
+    fn flat_index(&self, block_idx: usize, page_idx: usize, pages_per_block: usize) -> usize {
+        block_idx * pages_per_block + page_idx
+    }
+
+    fn flat_index_checked(
+        &self,
+        block_idx: usize,
+        page_idx: usize,
+        pages_per_block: usize,
+    ) -> Option<usize> {
+        let flat_idx = self.flat_index(block_idx, page_idx, pages_per_block);
+        if flat_idx < self.pages.len() {
+            Some(flat_idx)
+        } else {
+            None
+        }
+    }
+
+    fn block_page_range(&self, block_idx: usize, pages_per_block: usize) -> std::ops::Range<usize> {
+        let start = block_idx * pages_per_block;
+        let end = start + pages_per_block;
+        start..end
+    }
+
+    pub(crate) fn page(&self, block_idx: usize, page_idx: usize) -> Option<&Page> {
+        let pages_per_block = self.pages_per_block();
+        let flat_idx = self.flat_index_checked(block_idx, page_idx, pages_per_block)?;
+        self.pages[flat_idx].as_ref()
+    }
+
+    pub(crate) fn page_mut(&mut self, block_idx: usize, page_idx: usize) -> Option<&mut Page> {
+        let pages_per_block = self.pages_per_block();
+        let flat_idx = self.flat_index_checked(block_idx, page_idx, pages_per_block)?;
+        self.pages[flat_idx].as_mut()
+    }
+
+    fn ensure_page_mut_by_flat(&mut self, flat_idx: usize, page_size: usize) -> &mut Page {
+        if self.pages[flat_idx].is_none() {
+            self.pages[flat_idx] = Some(Page::new(page_size));
             self.alloc_bytes += page_size as u64;
         }
-        (block_index, page_index, within_page)
+        self.pages[flat_idx].as_mut().unwrap()
     }
 
     pub(crate) fn alloc_bytes(&self) -> u64 {
@@ -352,7 +410,7 @@ mod tests {
         slice.freeze();
 
         assert_eq!(slice.len, data.len() as u64);
-        assert_eq!(slice.pages[0].len(), 1);
+        assert_eq!(slice.pages.iter().filter(|p| p.is_some()).count(), 1);
         assert_eq!(collect_all(&mut slice), data);
     }
 
@@ -364,7 +422,7 @@ mod tests {
         slice.freeze();
 
         assert_eq!(slice.len, data.len() as u64);
-        assert_eq!(slice.pages[0].len(), 2);
+        assert_eq!(slice.pages.iter().filter(|p| p.is_some()).count(), 2);
         assert_eq!(collect_all(&mut slice), data);
     }
 
@@ -375,9 +433,13 @@ mod tests {
         slice.append(&data).unwrap();
         slice.freeze();
 
-        let pages_per_block = 4;
-        assert_eq!(slice.pages[0].len(), pages_per_block);
-        assert_eq!(slice.pages[1].len(), 1);
+        let block_size = slice.config.layout.block_size as usize;
+        let page_size = slice.config.page_size as usize;
+        let pages_per_block = block_size.div_ceil(page_size as usize) as usize;
+        assert_eq!(
+            slice.pages.iter().filter(|p| p.is_some()).count(),
+            pages_per_block + 1
+        );
         assert_eq!(collect_all(&mut slice), data);
     }
 
