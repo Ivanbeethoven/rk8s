@@ -26,6 +26,8 @@ rust_library(
     features = [
         "crypto_adaptor_openssl",
         "default",
+        "etcd-client",
+        "storage_xline",
     ],
     rustc_flags = [
         "@$(location :libvault-build-script-run[rustc_flags])",
@@ -114,6 +116,8 @@ rust_binary(
     features = [
         "crypto_adaptor_openssl",
         "default",
+        "etcd-client",
+        "storage_xline",
     ],
     rustc_flags = ["@$(location :libvault-manifest[env_flags])"],
     visibility = [],
@@ -131,6 +135,8 @@ buildscript_run(
     features = [
         "crypto_adaptor_openssl",
         "default",
+        "etcd-client",
+        "storage_xline",
     ],
     version = "0.1.0",
     manifest_dir = ":libvault-vendor",

@@ -56,7 +56,7 @@ lockfile = { workspace = true }
 arc-swap = { workspace = true }
 blake3 = { workspace = true }
 itertools = { workspace = true }
-etcd-client = { workspace = true, features = ["tls"] }
+etcd-client = { workspace = true, features = ["tls"], optional = true }
 tracing = { workspace = true }
 builder-pattern = { workspace = true }
 x509-parser = { workspace = true }
@@ -68,6 +68,7 @@ rand_chacha = { workspace = true }
 tonic = { workspace = true }
 openssl = { workspace = true, optional = true }
 openssl-sys = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
 qlean = { workspace = true }
 tempfile = { workspace = true }
 
@@ -76,6 +77,9 @@ toml = { workspace = true }
 
 [features]
 default = ["crypto_adaptor_openssl"]
+storage_xline = ["etcd-client"]
+storage_sqlite = ["sqlx/sqlite"]
+storage_pg = ["sqlx/postgres"]
 crypto_adaptor_openssl = ["dep:openssl", "dep:openssl-sys"]
 crypto_adaptor_tongsuo = ["dep:openssl", "dep:openssl-sys"]
 

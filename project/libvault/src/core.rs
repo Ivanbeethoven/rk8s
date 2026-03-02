@@ -62,6 +62,9 @@ impl SealConfig {
     }
 }
 
+/// Result returned by a successful `init` operation.
+///
+/// Contains zeroizing secret shares and the generated root token.
 #[derive(Debug, Clone, PartialEq, Zeroize)]
 #[zeroize(drop)]
 pub struct InitResult {
@@ -69,6 +72,8 @@ pub struct InitResult {
     pub root_token: String,
 }
 
+/// Internal, serializable state for `Core`.
+/// Fields containing secret material will be zeroized on drop.
 #[allow(unused_assignments)]
 #[derive(Clone, Zeroize)]
 #[zeroize(drop)]

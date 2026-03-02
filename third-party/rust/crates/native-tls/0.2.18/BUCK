@@ -64,7 +64,10 @@ buildscript_run(
     name = "native-tls-build-script-run",
     package_name = "native-tls",
     buildscript_rule = ":native-tls-build-script-build",
-    env_srcs = [":native-tls-manifest[env_dict]"],
+    env_srcs = [
+        "//third-party/rust/crates/openssl-sys/0.9.111:openssl-sys-build-script-main-run[metadata]",
+        ":native-tls-manifest[env_dict]",
+    ],
     features = ["default"],
     version = "0.2.18",
     manifest_dir = ":native-tls-vendor",
