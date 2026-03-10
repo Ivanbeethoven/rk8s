@@ -34,11 +34,11 @@ pub trait ObjectBackend: Send + Sync {
 }
 
 #[derive(Clone)]
-pub struct ObjectClient<B: ObjectBackend + Clone> {
+pub struct ObjectClient<B: ObjectBackend> {
     backend: B,
 }
 
-impl<B: ObjectBackend + Clone> ObjectClient<B> {
+impl<B: ObjectBackend> ObjectClient<B> {
     pub fn new(backend: B) -> Self {
         Self { backend }
     }

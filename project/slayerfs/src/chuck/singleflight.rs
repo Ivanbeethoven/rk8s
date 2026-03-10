@@ -22,24 +22,107 @@
 //! }).await;
 //! ```
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::hash::Hash;
-use std::sync::{Arc, Mutex};
-use tokio::sync::broadcast;
+use std::sync::Arc;
+
+use dashmap::{DashMap, Entry};
+use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 pub type SharedError = Arc<anyhow::Error>;
 
-/// A request in flight, tracking the broadcast channel for result sharing.
-struct InFlight<V> {
-    /// Sender for broadcasting the result to all waiters
-    tx: broadcast::Sender<Result<Arc<V>, SharedError>>,
+type SharedResult<V> = Result<Arc<V>, SharedError>;
+
+enum EntryState<V> {
+    Running,
+    Ready(SharedResult<V>),
+}
+
+struct FlightEntry<V> {
+    state: Mutex<EntryState<V>>,
+    notify: Notify,
+}
+
+impl<V> FlightEntry<V> {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(EntryState::Running),
+            notify: Notify::new(),
+        }
+    }
+
+    fn result(&self) -> Option<SharedResult<V>> {
+        let state = self.state.lock();
+
+        match &*state {
+            EntryState::Running => None,
+            EntryState::Ready(result) => Some(result.clone()),
+        }
+    }
+
+    fn finish(&self, result: SharedResult<V>) {
+        let mut state = self.state.lock();
+
+        if let EntryState::Running = &*state {
+            *state = EntryState::Ready(result);
+
+            drop(state);
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+struct LeaderGuard<'a, K, V>
+where
+    K: Hash + Eq + Clone,
+{
+    parent: &'a SingleFlight<K, V>,
+    key: K,
+    entry: Arc<FlightEntry<V>>,
+    completed: bool,
+}
+
+impl<'a, K, V> LeaderGuard<'a, K, V>
+where
+    K: Hash + Eq + Clone,
+{
+    fn new(parent: &'a SingleFlight<K, V>, key: K, entry: Arc<FlightEntry<V>>) -> Self {
+        Self {
+            parent,
+            key,
+            entry,
+            completed: false,
+        }
+    }
+
+    fn mark_completed(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl<K, V> Drop for LeaderGuard<'_, K, V>
+where
+    K: Hash + Eq + Clone,
+{
+    fn drop(&mut self) {
+        if !self.completed {
+            let err = Arc::new(anyhow::anyhow!(
+                "SingleFlight executor dropped before completing",
+            ));
+
+            self.entry.finish(Err(err));
+        }
+
+        self.parent.remove_entry(&self.key, &self.entry);
+    }
 }
 
 /// SingleFlight controller that coalesces concurrent requests for the same key.
 ///
-/// Thread-safe: internally synchronized with `std::sync::Mutex` and safe to share across
-/// tasks/threads. Intended to live as long as the store/client instance so all calls with
+/// Thread-safe: internally synchronized with `DashMap` and `parking_lot::Mutex`, and safe
+/// to share across tasks/threads. Intended to live as long as the store/client instance so
+/// all calls with
 /// the same key can be coalesced.
 ///
 /// Type parameters:
@@ -47,12 +130,12 @@ struct InFlight<V> {
 /// - `V`: The value type. The result is shared as `Arc<V>` to avoid copying.
 pub struct SingleFlight<K, V> {
     /// Map of keys to in-flight requests
-    in_flight: Mutex<HashMap<K, InFlight<V>>>,
+    in_flight: DashMap<K, Arc<FlightEntry<V>>>,
 }
 
 impl<K, V> Default for SingleFlight<K, V>
 where
-    K: Hash + Eq + Clone + std::fmt::Debug,
+    K: Hash + Eq + Clone,
 {
     fn default() -> Self {
         Self::new()
@@ -61,12 +144,12 @@ where
 
 impl<K, V> SingleFlight<K, V>
 where
-    K: Hash + Eq + Clone + std::fmt::Debug,
+    K: Hash + Eq + Clone,
 {
     /// Create a new SingleFlight controller.
     pub fn new() -> Self {
         Self {
-            in_flight: Mutex::new(HashMap::new()),
+            in_flight: DashMap::new(),
         }
     }
 
@@ -85,65 +168,64 @@ where
     ///
     /// Returns `Ok(Arc<V>)` with the shared result on success. The result is wrapped
     /// in `Arc` to enable zero-copy sharing across all concurrent waiters.
-    /// Returns `Err(Arc<String>)` if the operation fails.
+    /// Returns `Err(Arc<anyhow::Error>)` if the operation fails.
     ///
     /// # Performance Note
     ///
-    /// Uses `std::sync::Mutex` for the in-flight map since lock hold time is minimal
-    /// (only HashMap operations). This provides better performance than `tokio::sync::Mutex`
-    /// for this use case (10-20ns vs 100-200ns per lock operation).
-    pub async fn execute<F, Fut, E>(&self, key: K, f: F) -> Result<Arc<V>, SharedError>
+    /// Uses `DashMap` for per-key in-flight coordination and `parking_lot::Mutex` for
+    /// per-entry state transitions, keeping lock scope small without async-aware mutex overhead.
+    pub async fn execute<F, Fut, E>(&self, key: K, f: F) -> SharedResult<V>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<V, E>>,
         E: Into<anyhow::Error>,
     {
-        // Check if there's already an in-flight request
-        let mut rx = {
-            let mut guard = self.in_flight.lock().unwrap();
-            if let Some(in_flight) = guard.get(&key) {
-                // Subscribe to the existing request's result
-                Some(in_flight.tx.subscribe())
-            } else {
-                // Create a new in-flight entry
-                // Use a channel capacity of 1 since we only send one result
-                let (tx, _) = broadcast::channel(1);
-                guard.insert(key.clone(), InFlight { tx });
-                None
+        let (entry, is_leader) = match self.in_flight.entry(key.clone()) {
+            Entry::Occupied(entry) => (entry.get().clone(), false),
+            Entry::Vacant(entry) => {
+                let flight = Arc::new(FlightEntry::new());
+                entry.insert(flight.clone());
+                (flight, true)
             }
         };
 
-        // If we're a waiter, wait for the result. Safe from races: subscription is created
-        // while holding the mutex so even if the executor finishes immediately after unlock,
-        // the broadcasted value will still be delivered to this receiver.
-        if let Some(ref mut rx) = rx {
-            return match rx.recv().await {
-                Ok(result) => result,
-                Err(_) => Err(Arc::new(anyhow::anyhow!(
-                    "SingleFlight: channel closed for key: {:?}",
-                    key,
-                ))),
-            };
+        if !is_leader {
+            return Self::wait_for_result(&entry).await;
         }
 
-        // We're the executor - run the actual operation.
-        // IMPORTANT: do not clone `V` here. For large values (e.g. `Vec<u8>`) cloning would
-        // duplicate the entire buffer. Instead, wrap the result once in `Arc` and share it.
-        let shared_result: Result<Arc<V>, SharedError> = match f().await {
+        let mut leader = LeaderGuard::new(self, key, entry.clone());
+
+        let shared_result = match f().await {
             Ok(v) => Ok(Arc::new(v)),
             Err(e) => Err(Arc::new(e.into())),
         };
 
-        // Remove from in-flight and broadcast result
-        {
-            let mut guard = self.in_flight.lock().unwrap();
-            if let Some(in_flight) = guard.remove(&key) {
-                // Ignore send errors - no receivers means no one is waiting
-                let _ = in_flight.tx.send(shared_result.clone());
-            }
-        }
-
+        entry.finish(shared_result.clone());
+        leader.mark_completed();
         shared_result
+    }
+
+    async fn wait_for_result(entry: &Arc<FlightEntry<V>>) -> SharedResult<V> {
+        loop {
+            let notified = entry.notify.notified();
+
+            if let Some(result) = entry.result() {
+                return result;
+            }
+
+            notified.await;
+        }
+    }
+
+    fn remove_entry(&self, key: &K, entry: &Arc<FlightEntry<V>>) {
+        let should_remove = self
+            .in_flight
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current.value(), entry));
+
+        if should_remove {
+            self.in_flight.remove(key);
+        }
     }
 
     /// Check the number of currently in-flight requests.
@@ -151,7 +233,7 @@ where
     /// Useful for metrics and debugging.
     #[allow(dead_code)]
     pub fn in_flight_count(&self) -> usize {
-        self.in_flight.lock().unwrap().len()
+        self.in_flight.len()
     }
 }
 
@@ -335,5 +417,40 @@ mod tests {
 
         // Both should execute since they're sequential
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_executor_cancellation_cleans_up_and_allows_retry() {
+        let sf = Arc::new(SingleFlight::<String, String>::new());
+        let started = Arc::new(Notify::new());
+
+        let sf_clone = sf.clone();
+        let started_clone = started.clone();
+
+        let leader = tokio::spawn(async move {
+            sf_clone
+                .execute("key".to_string(), || async move {
+                    started_clone.notify_one();
+                    futures::future::pending::<()>().await;
+                    #[allow(unreachable_code)]
+                    Ok::<_, std::io::Error>("never".to_string())
+                })
+                .await
+        });
+
+        started.notified().await;
+        leader.abort();
+        tokio::task::yield_now().await;
+
+        assert_eq!(sf.in_flight_count(), 0);
+
+        let retry = sf
+            .execute("key".to_string(), || async move {
+                Ok::<_, std::io::Error>("retry".to_string())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(&*retry, "retry");
     }
 }
