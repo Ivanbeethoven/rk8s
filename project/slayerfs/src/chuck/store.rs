@@ -614,11 +614,6 @@ mod tests {
             "Coalesced path should not fall back to range reads",
         );
 
-        println!("✅ 智能读取策略测试通过:");
-        println!("   - 小范围读取 (512KB) → 使用 get_object_range");
-        println!("   - 大范围读取 (2MB) → 使用 get_object + SingleFlight");
-        println!("   - 并发大范围读取 → SingleFlight 合并");
-
         Ok(())
     }
 }
