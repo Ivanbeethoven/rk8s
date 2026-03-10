@@ -123,7 +123,7 @@ impl BlockStore for InMemoryBlockStore {
 }
 
 /// BlockStore backed by cadapter::client (key space `chunks/{chunk_id}/{block_index}`).
-pub struct ObjectBlockStore<B: ObjectBackend + Clone> {
+pub struct ObjectBlockStore<B: ObjectBackend> {
     client: ObjectClient<B>,
     #[allow(dead_code)]
     block_cache: ChunksCache,
@@ -169,7 +169,7 @@ impl BlockStoreConfig {
     }
 }
 
-impl<B: ObjectBackend + Clone> ObjectBlockStore<B> {
+impl<B: ObjectBackend> ObjectBlockStore<B> {
     pub fn new(client: ObjectClient<B>) -> Self {
         let cache_dir = dirs::cache_dir().unwrap().join("slayerfs");
 
@@ -224,7 +224,7 @@ impl<B: ObjectBackend + Clone> ObjectBlockStore<B> {
 }
 
 #[async_trait]
-impl<B: ObjectBackend + Clone + Send + Sync> BlockStore for ObjectBlockStore<B> {
+impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
     async fn write_range(&self, key: BlockKey, offset: u64, data: &[u8]) -> anyhow::Result<u64> {
         let key_str = Self::key_for(key);
         let mut buf = self
@@ -338,12 +338,14 @@ impl<B: ObjectBackend + Clone + Send + Sync> BlockStore for ObjectBlockStore<B> 
 
         // Use SingleFlight to coalesce concurrent reads to the same block.
         // We read the entire block and then extract the requested range.
-        let client: ObjectClient<B> = self.client.clone();
+        let client = &self.client;
+
         let block_data =
             self.read_flight
                 .execute(key, || async move {
                     // Read the entire block
                     let key_str = Self::key_for(key);
+
                     let data = client.get_object(&key_str).await.map_err(|e| {
                         anyhow::anyhow!("object store get failed: {key_str}, {e:?}")
                     })?;
