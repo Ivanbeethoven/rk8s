@@ -4,6 +4,12 @@
 //! actually executes the underlying operation. All subsequent requests wait for
 //! the first to complete and share its result.
 //!
+//! A single flight only covers callers that join while the key is still present in
+//! the in-flight map. Once the leader finishes, the key is removed from the map
+//! before the result is published to existing waiters. This means callers that were
+//! already attached to the current flight share the same result, while later callers
+//! start a new flight and execute their own closure.
+//!
 //! This is particularly useful for:
 //! - Avoiding thundering herd effects on cache misses
 //! - Reducing redundant object storage requests
@@ -96,8 +102,11 @@ where
         }
     }
 
-    fn mark_completed(&mut self) {
+    fn complete(&mut self, result: SharedResult<V>) -> SharedResult<V> {
+        self.parent.remove_entry(&self.key, &self.entry);
+        self.entry.finish(result.clone());
         self.completed = true;
+        result
     }
 }
 
@@ -111,10 +120,9 @@ where
                 "SingleFlight executor dropped before completing",
             ));
 
+            self.parent.remove_entry(&self.key, &self.entry);
             self.entry.finish(Err(err));
         }
-
-        self.parent.remove_entry(&self.key, &self.entry);
     }
 }
 
@@ -159,6 +167,12 @@ where
     /// Otherwise, execute the provided function and share its result with any
     /// concurrent waiters.
     ///
+    /// Flight semantics:
+    /// - callers that observe the key in `in_flight` join the current flight
+    /// - the leader removes the key from `in_flight` before publishing the result
+    /// - existing waiters still receive that published result through their shared entry
+    /// - callers arriving after removal start a new flight instead of replaying the old result
+    ///
     /// # Arguments
     ///
     /// * `key` - The key identifying this request
@@ -200,9 +214,7 @@ where
             Err(e) => Err(Arc::new(e.into())),
         };
 
-        entry.finish(shared_result.clone());
-        leader.mark_completed();
-        shared_result
+        leader.complete(shared_result)
     }
 
     async fn wait_for_result(entry: &Arc<FlightEntry<V>>) -> SharedResult<V> {
@@ -386,6 +398,65 @@ mod tests {
             0,
             "in-flight map should be cleaned up"
         );
+    }
+
+    #[tokio::test]
+    async fn test_late_caller_starts_new_flight() {
+        let sf = Arc::new(SingleFlight::<String, String>::new());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+
+        let sf_clone = sf.clone();
+        let counter_clone = counter.clone();
+        let started_clone = started.clone();
+        let release_clone = release.clone();
+
+        let leader = tokio::spawn(async move {
+            sf_clone
+                .execute("key".to_string(), || async move {
+                    started_clone.notify_one();
+                    release_clone.notified().await;
+
+                    counter_clone.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, std::io::Error>("first".to_string())
+                })
+                .await
+        });
+
+        started.notified().await;
+
+        let waiter_sf = sf.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_sf
+                .execute("key".to_string(), || async move {
+                    panic!("late waiter should join the existing flight");
+                    #[allow(unreachable_code)]
+                    Ok::<_, std::io::Error>("unexpected".to_string())
+                })
+                .await
+        });
+
+        release.notify_one();
+
+        let leader_result = leader.await.unwrap().unwrap();
+        let waiter_result = waiter.await.unwrap().unwrap();
+
+        assert_eq!(&*leader_result, "first");
+        assert_eq!(&*waiter_result, "first");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let counter_clone = counter.clone();
+        let next = sf
+            .execute("key".to_string(), || async move {
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, std::io::Error>("second".to_string())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(&*next, "second");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
