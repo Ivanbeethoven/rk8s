@@ -168,7 +168,14 @@ async fn create_s3_client(args: &MountConfig) -> anyhow::Result<ObjectClient<S3B
     let bucket = args
         .s3_bucket
         .clone()
-        .ok_or_else(|| anyhow::anyhow!("--s3-bucket must be set when --data-backend s3"))?;
+        .ok_or_else(|| anyhow::anyhow!("s3 bucket must be set when data backend is s3"))?;
+
+    if args.s3_part_size == 0 {
+        anyhow::bail!("--s3-part-size must be greater than 0");
+    }
+    if args.s3_max_concurrency == 0 {
+        anyhow::bail!("--s3-max-concurrency must be greater than 0");
+    }
 
     let config = S3Config {
         bucket,
@@ -266,7 +273,7 @@ async fn create_meta_store(args: &MountConfig) -> anyhow::Result<Arc<dyn MetaSto
         }
         MetaBackendKind::Etcd => {
             if args.meta_etcd_urls.is_empty() {
-                anyhow::bail!("--meta-etcd-urls must be set when --meta-backend etcd");
+                anyhow::bail!("etcd urls must be set when meta backend is etcd");
             }
 
             let client = ClientOptions::default();
