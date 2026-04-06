@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+# 用途:
+#   封装分布式测试过程中对远端节点的 SSH 和 SCP 操作。
+#   统一处理 SSH 端口、密钥、附加参数以及 sudo 执行方式，供其他脚本复用。
+
 ssh_exec() {
   local node="$1"
   shift

@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# 用途:
+#   启动 etcd、Redis、PostgreSQL 测试容器，并执行 SlayerFS 元数据存储相关检查。
+#   脚本负责环境准备、健康检查、测试统计以及收尾清理，便于本地快速验证不同元数据后端。
+
 # 设置变量
 NETWORK_NAME="slayerfs-network"
 ETCD_IMAGE="quay.io/coreos/etcd:v3.6.0"

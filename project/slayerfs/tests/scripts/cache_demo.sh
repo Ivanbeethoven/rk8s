@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# 用途:
+#   演示 SlayerFS 挂载后的缓存命中行为。
+#   脚本会启动 persistence_demo、创建测试文件、重复读取数据，并从日志中提取缓存相关输出。
+
 # Simple script to demonstrate SlayerFS cache hits
 set -e
 

@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# 用途:
+#   为本地 SlayerFS FUSE 挂载准备 xfstests 运行环境，并执行指定的 xfstests 用例。
+#   脚本会安装依赖、构建并安装 xfstests、生成 mount helper，同时将 exclude 列表应用到测试执行中。
+
 set -euo pipefail
 
 current_dir=$(dirname "$(realpath "$0")")

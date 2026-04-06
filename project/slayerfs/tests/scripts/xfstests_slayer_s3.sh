@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# 用途:
+#   使用 S3 后端的 SlayerFS 示例程序挂载文件系统，并运行 xfstests 进行基础验证。
+#   脚本会准备依赖、生成带 S3 环境变量的 mount helper，并在本地执行预设测试用例。
+
 set -euo pipefail
 
 current_dir=$(dirname "$(realpath "$0")")

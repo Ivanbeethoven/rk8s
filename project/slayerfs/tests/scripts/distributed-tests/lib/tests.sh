@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+# 用途:
+#   封装分布式测试中的各类工作负载执行逻辑。
+#   包括 fio、mdtest、iozone、xfstests 的运行入口、进度输出以及结果目录组织。
+
 remote_results_root() {
   local fs_name="$1"
   printf '%s/%s/%s' "${REMOTE_RESULTS_DIR}" "${RUN_ID}" "$fs_name"

@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+# 用途:
+#   作为分布式测试入口脚本，统一编排环境准备、SlayerFS 部署、负载执行、结果收集和清理流程。
+#   脚本依赖 lib/ 下的公共函数，通过 cluster.env 配置集群节点、远端目录和测试开关。
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

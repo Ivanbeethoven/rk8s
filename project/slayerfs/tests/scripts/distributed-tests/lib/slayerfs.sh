@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+# 用途:
+#   提供分布式场景下 SlayerFS 部署与生命周期管理函数。
+#   涵盖本地构建、配置渲染、远端节点准备、二进制分发、启动、挂载检查和卸载清理。
+
 slayerfs_local_binary() {
   local repo_root="$1"
   if [[ -n "${SLAYERFS_BIN_LOCAL:-}" ]]; then
