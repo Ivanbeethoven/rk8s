@@ -12,6 +12,13 @@ const SLAYERFS_MOUNTPOINT: &str = "/mnt/slayerfs";
 const SLAYERFS_DATA_DIR: &str = "/tmp/slayerfs-data";
 const SLAYERFS_LOG_PATH: &str = "/var/log/slayerfs.log";
 const SLAYERFS_META_DIR: &str = "/tmp/slayerfs-meta";
+const XFSTESTS_STAGE_DIR: &str = "/opt/slayerfs-xfstests";
+const XFSTESTS_SCRIPT_IN_VM: &str = "/opt/slayerfs-xfstests/xfstests_slayer.sh";
+const XFSTESTS_CONFIG_IN_VM: &str = "/opt/slayerfs-xfstests/slayerfs-sqlite.yml";
+const XFSTESTS_BIN_IN_VM: &str = "/opt/slayerfs-xfstests/persistence_demo";
+const XFSTESTS_EXCLUDE_IN_VM: &str = "/opt/slayerfs-xfstests/xfstests_slayer.exclude";
+const XFSTESTS_REMOTE_DIR: &str = "/tmp/xfstests-dev";
+const XFSTESTS_HOST_ARTIFACT_ROOT: &str = "/tmp/slayerfs-kvm-xfstests";
 
 // NOTE: These tests use qlean for QEMU-based VM testing.
 // qlean 0.2.1+ supports TCG fallback when KVM is unavailable.
@@ -26,6 +33,26 @@ fn tracing_subscriber_init() {
 
 async fn exec_check(vm: &mut Machine, cmd: &str) -> Result<String> {
     let result = vm.exec(cmd).await?;
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        anyhow::bail!(
+            "Command '{}' failed with exit code {:?}\nstdout: {}\nstderr: {}",
+            cmd,
+            result.status.code(),
+            stdout,
+            stderr
+        );
+    }
+    Ok(String::from_utf8_lossy(&result.stdout).to_string())
+}
+
+async fn exec_check_timed(vm: &mut Machine, cmd: &str, timeout: Duration) -> Result<String> {
+    let result = tokio::time::timeout(timeout, vm.exec(cmd)).await;
+    let result = match result {
+        Ok(res) => res?,
+        Err(_) => anyhow::bail!("command timed out after {:?}: {}", timeout, cmd),
+    };
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
         let stdout = String::from_utf8_lossy(&result.stdout);
@@ -120,6 +147,61 @@ fn get_slayerfs_binary_path() -> Result<PathBuf> {
         debug_path,
         release_path
     );
+}
+
+fn get_persistence_demo_path() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_persistence_demo") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").context("CARGO_MANIFEST_DIR not set")?;
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(&manifest_dir)
+                .parent()
+                .unwrap()
+                .join("target")
+        });
+
+    for rel in [
+        "release/examples/persistence_demo",
+        "debug/examples/persistence_demo",
+        "release/persistence_demo",
+        "debug/persistence_demo",
+    ] {
+        let path = target_dir.join(rel);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    anyhow::bail!(
+        "persistence_demo binary not found under {:?}. Build it first, e.g. `cargo build -p slayerfs --example persistence_demo --release`.",
+        target_dir
+    );
+}
+
+fn shell_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\"'\"'"))
+}
+
+fn xfstests_host_artifact_dir() -> PathBuf {
+    let root = std::env::var("SLAYERFS_XFSTESTS_HOST_ARTIFACT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(XFSTESTS_HOST_ARTIFACT_ROOT));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    root.join(format!(
+        "{}-{}-pid{}",
+        now.as_secs(),
+        now.subsec_nanos(),
+        std::process::id()
+    ))
 }
 
 async fn install_deps(vm: &mut Machine) -> Result<()> {
@@ -525,6 +607,33 @@ async fn start_vm_and_run(slayerfs_bin: PathBuf) -> Result<()> {
     Ok(())
 }
 
+async fn start_vm_and_run_xfstests(persistence_bin: PathBuf) -> Result<()> {
+    tracing_subscriber_init();
+
+    tracing::info!("using persistence_demo binary at {:?}", persistence_bin);
+
+    let image = create_image(Distro::Debian, "debian-13-generic-amd64").await?;
+    let config = MachineConfig {
+        core: 2,
+        mem: 8192,
+        disk: Some(30),
+        clear: true,
+    };
+
+    let persistence_bin = std::sync::Arc::new(persistence_bin);
+    with_machine(&image, &config, move |vm| {
+        let persistence_bin = std::sync::Arc::clone(&persistence_bin);
+        Box::pin(async move {
+            let artifact_dir = run_xfstests_in_vm(vm, persistence_bin.as_ref()).await?;
+            tracing::info!("xfstests artifacts stored at {}", artifact_dir.display());
+            Ok(())
+        })
+    })
+    .await?;
+
+    Ok(())
+}
+
 async fn run_full(vm: &mut Machine, slayerfs_bin: &Path) -> Result<()> {
     install_deps(vm).await?;
     setup_unprivileged_user(vm, "tester").await?;
@@ -596,9 +705,187 @@ async fn upload_slayerfs(vm: &mut Machine, slayerfs_bin: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn upload_xfstests_assets(vm: &mut Machine, persistence_bin: &Path) -> Result<()> {
+    let manifest_dir =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").context("CARGO_MANIFEST_DIR not set")?);
+    let script = manifest_dir.join("tests/scripts/xfstests_slayer.sh");
+    let exclude = manifest_dir.join("tests/scripts/xfstests_slayer.exclude");
+    let config = manifest_dir.join("slayerfs-sqlite.yml");
+    // Prebuilt xfstests tarballs checked into the repo via git lfs.
+    // The shell script (xfstests_slayer.sh) expects them at:
+    //   <script_dir>/xfstests-prebuilt/*.tar.gz
+    // and will extract + use them directly, skipping clone+build entirely.
+    let prebuilt_dir = manifest_dir.join("tests/scripts/xfstests-prebuilt");
+
+    exec_check(
+        vm,
+        &format!("mkdir -p {XFSTESTS_STAGE_DIR}/xfstests-prebuilt"),
+    )
+    .await?;
+
+    vm.upload(persistence_bin, Path::new(XFSTESTS_STAGE_DIR))
+        .await
+        .context("upload persistence_demo for xfstests")?;
+    vm.upload(&script, Path::new(XFSTESTS_STAGE_DIR))
+        .await
+        .context("upload xfstests runner script")?;
+    vm.upload(&exclude, Path::new(XFSTESTS_STAGE_DIR))
+        .await
+        .context("upload xfstests exclude list")?;
+    vm.upload(&config, Path::new(XFSTESTS_STAGE_DIR))
+        .await
+        .context("upload slayerfs sqlite config")?;
+
+    // Upload all prebuilt tarballs found in the repo directory.
+    if prebuilt_dir.is_dir() {
+        let mut rd = tokio::fs::read_dir(&prebuilt_dir).await.with_context(|| {
+            format!("read prebuilt dir {:?}", prebuilt_dir)
+        })?;
+        while let Some(entry) = rd.next_entry().await? {
+            let p = entry.path();
+            if p.extension().map(|e| e == "gz").unwrap_or(false) {
+                vm.upload(&p, Path::new(&format!("{XFSTESTS_STAGE_DIR}/xfstests-prebuilt")))
+                    .await
+                    .with_context(|| format!("upload prebuilt tarball {:?}", p))?;
+                tracing::info!("uploaded prebuilt xfstests tarball: {:?}", p);
+            }
+        }
+    } else {
+        tracing::warn!(
+            "prebuilt xfstests directory not found at {:?}; script will fall back to clone+build",
+            prebuilt_dir
+        );
+    }
+
+    exec_check(
+        vm,
+        &format!(
+            "chmod +x {bin} {script} && test -f {exclude} && test -f {cfg}",
+            bin = XFSTESTS_BIN_IN_VM,
+            script = XFSTESTS_SCRIPT_IN_VM,
+            exclude = XFSTESTS_EXCLUDE_IN_VM,
+            cfg = XFSTESTS_CONFIG_IN_VM
+        ),
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn dump_xfstests_debug_info(vm: &mut Machine) -> Result<String> {
+    let mut s = dump_debug_info(vm).await?;
+
+    s.push_str("\n=== xfstests local.config ===\n");
+    s.push_str(&exec_check(vm, "cat /tmp/xfstests-dev/local.config 2>/dev/null || true").await?);
+
+    s.push_str("\n=== xfstests results dir ===\n");
+    s.push_str(
+        &exec_check(
+            vm,
+            "find /tmp/xfstests-dev/results -maxdepth 2 -type f 2>/dev/null | sort || true",
+        )
+        .await?,
+    );
+
+    s.push_str("\n=== xfstests check.log (tail) ===\n");
+    s.push_str(&get_file_tail(vm, "/tmp/xfstests-dev/results/check.log", 200).await?);
+
+    s.push_str("\n=== xfstests full output (tail) ===\n");
+    s.push_str(&get_file_tail(vm, "/tmp/xfstests-dev/results/check.out", 200).await?);
+
+    Ok(s)
+}
+
+async fn collect_xfstests_artifacts(vm: &mut Machine, host_dir: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(host_dir).await?;
+
+    let artifacts = [
+        (SLAYERFS_LOG_PATH, host_dir.join("slayerfs.log")),
+        (
+            "/tmp/xfstests-dev/local.config",
+            host_dir.join("local.config"),
+        ),
+        ("/tmp/xfstests-dev/results", host_dir.join("results")),
+    ];
+
+    for (remote, local) in artifacts {
+        if let Err(err) = vm.download(Path::new(remote), &local).await {
+            tracing::warn!(remote, local = %local.display(), error = %err, "failed to download xfstests artifact");
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_xfstests_in_vm(vm: &mut Machine, persistence_bin: &Path) -> Result<PathBuf> {
+    // Prepare the VM environment BEFORE uploading assets or running the script:
+    // Kill unattended-upgrades aggressively and wait for apt locks to clear;
+    // this prevents apt lock conflicts later.  We ignore errors because the VM
+    // may not have all these services and because OOM may kill our pkill too —
+    // the important thing is we try.
+    upload_xfstests_assets(vm, persistence_bin).await?;
+
+    let host_artifact_dir = xfstests_host_artifact_dir();
+    let xfstests_cases =
+        std::env::var("SLAYERFS_XFSTESTS_CASES").unwrap_or_else(|_| "generic/001".to_string());
+    // Fallback repo/branch only used when the prebuilt tarball is absent and
+    // XFSTESTS_FORCE_RECLONE=1 is set explicitly by the caller.
+    let xfstests_repo = std::env::var("SLAYERFS_XFSTESTS_REPO")
+        .unwrap_or_else(|_| "https://gitee.com/anolis/xfstests-dev.git".to_string());
+    let xfstests_branch =
+        std::env::var("SLAYERFS_XFSTESTS_BRANCH").unwrap_or_else(|_| "v2023.12.10".to_string());
+    let timeout_secs = std::env::var("SLAYERFS_XFSTESTS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(90 * 60);
+    // Default: use prebuilt tarball (XFSTESTS_PREBUILT_TAR=1 in the shell script).
+    // The VM disk is always clean (clear: true), so FORCE_RECLONE defaults to 0.
+    let force_reclone = std::env::var("SLAYERFS_XFSTESTS_FORCE_RECLONE")
+        .unwrap_or_else(|_| "0".to_string());
+
+    let cmd = format!(
+        "env SLAYERFS_BIN_PATH={bin} SLAYERFS_CONFIG_PATH={cfg} SLAYERFS_LOG_FILE={log} \
+XFSTESTS_REPO={repo} XFSTESTS_BRANCH={branch} XFSTESTS_DIR={dir} XFSTESTS_CASES={cases} \
+XFSTESTS_FORCE_RECLONE={force_reclone} XFSTESTS_INSTALL_DEPS=1 {script}",
+        bin = shell_quote(XFSTESTS_BIN_IN_VM),
+        cfg = shell_quote(XFSTESTS_CONFIG_IN_VM),
+        log = shell_quote(SLAYERFS_LOG_PATH),
+        repo = shell_quote(&xfstests_repo),
+        branch = shell_quote(&xfstests_branch),
+        dir = shell_quote(XFSTESTS_REMOTE_DIR),
+        cases = shell_quote(&xfstests_cases),
+        force_reclone = shell_quote(&force_reclone),
+        script = shell_quote(XFSTESTS_SCRIPT_IN_VM),
+    );
+
+    let run_result = exec_check_timed(vm, &cmd, Duration::from_secs(timeout_secs)).await;
+    let _ = collect_xfstests_artifacts(vm, &host_artifact_dir).await;
+
+    if let Err(err) = run_result {
+        let dbg = dump_xfstests_debug_info(vm)
+            .await
+            .unwrap_or_else(|e| e.to_string());
+        anyhow::bail!(
+            "{}\n\nartifacts: {}\n\n{}",
+            err,
+            host_artifact_dir.display(),
+            dbg
+        );
+    }
+
+    Ok(host_artifact_dir)
+}
+
 #[tokio::test]
 #[ignore]
 async fn test_slayerfs_kvm() -> Result<()> {
     let slayerfs_bin = get_slayerfs_binary_path()?;
     start_vm_and_run(slayerfs_bin).await
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_slayerfs_kvm_xfstests() -> Result<()> {
+    let persistence_bin = get_persistence_demo_path()?;
+    start_vm_and_run_xfstests(persistence_bin).await
 }

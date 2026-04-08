@@ -128,6 +128,8 @@ run_iozone() {
 run_xfstests() {
   local fs_name="$1"
   local mount_dir="$2"
+  local xfstests_repo="${XFSTESTS_REPO:-https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git}"
+  local xfstests_branch="${XFSTESTS_BRANCH:-v2023.12.10}"
 
   if [[ -z "${XFSTESTS_DIR:-}" ]]; then
     log_warn "XFSTESTS_DIR not set; skipping"
@@ -139,10 +141,10 @@ run_xfstests() {
     log_info "xfstests not found, installing on ${PRIMARY_CLIENT}..."
 
     log_info "  Installing xfstests dependencies..."
-    ssh_exec_sudo "$PRIMARY_CLIENT" "apt-get update && apt-get install -y acl attr automake bc dbench dump e2fsprogs fio gawk gcc git libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool libtool-bin liburing-dev libuuid1 lvm2 make psmisc python3 quota sed uuid-dev uuid-runtime xfsprogs linux-headers-$(uname -r) sqlite3 fuse3" || return 1
+    ssh_exec_sudo "$PRIMARY_CLIENT" "apt-get update && apt-get install -y acl attr automake bc dbench dump e2fsprogs fio gawk ca-certificates gcc git libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool libtool-bin liburing-dev libuuid1 lvm2 make psmisc python3 quota sed uuid-dev uuid-runtime xfsprogs linux-headers-$(uname -r) sqlite3 fuse3" || return 1
 
     log_info "  Cloning xfstests..."
-    ssh_exec_sudo "$PRIMARY_CLIENT" "rm -rf /tmp/xfstests-dev && git clone -b v2023.12.10 git://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git /tmp/xfstests-dev" || return 1
+    ssh_exec_sudo "$PRIMARY_CLIENT" "rm -rf /tmp/xfstests-dev && git clone --depth=1 -b '${xfstests_branch}' '${xfstests_repo}' /tmp/xfstests-dev" || return 1
 
     log_info "  Building xfstests..."
     ssh_exec_sudo "$PRIMARY_CLIENT" "cd /tmp/xfstests-dev && make && sudo make install" || return 1

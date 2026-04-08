@@ -13,8 +13,10 @@ backend_dir=/tmp/data
 mount_dir=/tmp/mount
 log_file=/tmp/slayerfs.log
 persistence_bin="$workspace_dir/target/release/examples/persistence_s3_demo"
+xfstests_repo="${XFSTESTS_REPO:-https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git}"
+xfstests_branch="${XFSTESTS_BRANCH:-v2023.12.10}"
 
-if [[ -z "$persistence_bin" ]]; then
+if [[ ! -f "$persistence_bin" ]]; then
     echo "Cannot find slayerfs persistence_s3_demo binary."
     echo "Please run: cargo build -p slayerfs --example persistence_s3_demo --release"
     exit 1
@@ -31,7 +33,7 @@ sudo rm -f "$log_file"
 
 sudo apt-get update
 sudo apt-get install acl attr automake bc dbench dump e2fsprogs fio gawk \
-    gcc git indent libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool \
+    ca-certificates gcc git indent libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool \
     libtool-bin liburing-dev libuuid1 lvm2 make psmisc python3 quota sed \
     uuid-dev uuid-runtime xfsprogs linux-headers-$(uname -r) sqlite3 \
     fuse3
@@ -40,7 +42,7 @@ sudo apt-get install exfatprogs f2fs-tools ocfs2-tools udftools xfsdump \
 
 # clone xfstests and install.
 cd /tmp/
-git clone -b v2023.12.10 git://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git
+git clone --depth=1 -b "$xfstests_branch" "$xfstests_repo"
 cd xfstests-dev
 make
 sudo make install

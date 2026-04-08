@@ -96,9 +96,13 @@ jobs:
 
   xfstests:
     name: xfstests
-    if: false
     runs-on: [self-hosted]
     timeout-minutes: 240
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTUP_TOOLCHAIN: stable
+      SLAYERFS_XFSTESTS_CASES: generic/001
+      SLAYERFS_XFSTESTS_HOST_ARTIFACT_ROOT: /tmp/slayerfs-kvm-xfstests/${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -116,17 +120,27 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y pkg-config libfuse3-dev fuse3 sqlite3 protobuf-compiler
+          sudo apt-get install -y --no-install-recommends \
+            fuse3 \
+            libfuse3-dev \
+            pkg-config \
+            libssl-dev \
+            sqlite3 \
+            protobuf-compiler \
+            qemu-system-x86 \
+            qemu-utils \
+            libvirt-clients \
+            guestfish \
+            xorriso
           protoc --version
 
       - name: Build slayerfs persistence demo
         working-directory: project
         run: cargo build -p slayerfs --example persistence_demo --release
 
-      - name: Run xfstests
-        run: |
-          chmod +x project/slayerfs/tests/scripts/xfstests_slayer.sh
-          project/slayerfs/tests/scripts/xfstests_slayer.sh
+      - name: Run xfstests in KVM VM
+        working-directory: project
+        run: cargo test -p slayerfs --test test_slayerfs_kvm_integration test_slayerfs_kvm_xfstests -- --ignored --nocapture
 
       - name: Upload xfstests artifacts (always)
         if: always()
@@ -134,7 +148,5 @@ jobs:
         with:
           name: slayerfs-xfstests-logs
           path: |
-            /tmp/slayerfs.log
-            /tmp/xfstests-dev/results
-            /tmp/xfstests-dev/local.config
+            /tmp/slayerfs-kvm-xfstests/${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
