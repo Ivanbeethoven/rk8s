@@ -391,6 +391,7 @@ where
             .set_attr(ino as i64, &meta_req, meta_flags)
             .await
             .map_err(Into::<Errno>::into)?;
+        self.invalidate_inode_cache(ino).await;
 
         let attr = vfs_to_fuse_attr(&vattr, &req);
         Ok(ReplyAttr {
@@ -671,6 +672,7 @@ where
         else {
             return Err(libc::ENOENT.into());
         };
+        self.invalidate_entry_cache(parent, name.as_ref()).await;
 
         let attr = vfs_to_fuse_attr(&vattr, &req);
         Ok(ReplyEntry {
@@ -726,6 +728,7 @@ where
         else {
             return Err(libc::ENOENT.into());
         };
+        self.invalidate_entry_cache(parent, name.as_ref()).await;
         let attr = vfs_to_fuse_attr(&vattr, &req);
         Ok(ReplyEntry {
             ttl: Duration::from_secs(1),
@@ -773,6 +776,7 @@ where
         else {
             return Err(libc::ENOENT.into());
         };
+        self.invalidate_entry_cache(parent, name.as_ref()).await;
         let attr = vfs_to_fuse_attr(&vattr, &req);
 
         let accmode = flags & (libc::O_ACCMODE as u32);
@@ -848,6 +852,8 @@ where
         let attr = VFS::link(self, &existing_path, &parent_path)
             .await
             .map_err(Errno::from)?;
+        self.invalidate_entry_cache(new_parent, new_name_str.as_ref())
+            .await;
 
         let fuse_attr = vfs_to_fuse_attr(&attr, &req);
         Ok(ReplyEntry {
@@ -906,6 +912,7 @@ where
             .apply_new_entry_attrs(ino, req.uid, req.gid, None)
             .await
             .unwrap_or(vattr);
+        self.invalidate_entry_cache(parent, name.as_ref()).await;
 
         Ok(ReplyEntry {
             ttl: Duration::from_secs(1),
@@ -942,7 +949,9 @@ where
             p.push('/');
         }
         p.push_str(&name);
-        self.unlink(&p).await.map_err(Errno::from)
+        self.unlink(&p).await.map_err(Errno::from)?;
+        self.invalidate_entry_cache(parent, name.as_ref()).await;
+        Ok(())
     }
 
     // Remove an empty directory
@@ -972,7 +981,9 @@ where
             p.push('/');
         }
         p.push_str(&name);
-        self.rmdir(&p).await.map_err(Errno::from)
+        self.rmdir(&p).await.map_err(Errno::from)?;
+        self.invalidate_entry_cache(parent, name.as_ref()).await;
+        Ok(())
     }
 
     // Rename (files or directories)
@@ -1054,7 +1065,7 @@ where
         }
 
         VFS::rename(self, &oldp, &newp).await.map_err(|e| {
-            match e {
+            Errno::from(match e {
                 VfsError::NotFound { .. } => libc::ENOENT,
                 VfsError::AlreadyExists { .. } => libc::EEXIST,
                 VfsError::NotADirectory { .. } => libc::ENOTDIR,
@@ -1065,9 +1076,13 @@ where
                 VfsError::InvalidRenameTarget { .. } => libc::EINVAL,
                 VfsError::CrossesDevices => libc::EXDEV,
                 _ => libc::EIO,
-            }
-            .into()
-        })
+            })
+        })?;
+
+        self.invalidate_entry_cache(parent, name.as_ref()).await;
+        self.invalidate_entry_cache(new_parent, new_name.as_ref())
+            .await;
+        Ok(())
     }
 
     // ===== Resource release & sync: stateless implementation, return success =====

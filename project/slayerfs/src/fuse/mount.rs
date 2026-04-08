@@ -55,13 +55,15 @@ where
     // Prefer unprivileged mount on Linux (requires fusermount3 in PATH)
     if fuse_op_log_enabled() {
         info!("SLAYERFS_FUSE_OP_LOG enabled, mounting with FUSE operation log wrapper");
-        rfuse3::raw::Session::new(default_mount_options())
+        let session = rfuse3::raw::Session::new(default_mount_options());
+        fs.set_fuse_notify(session.notify()).await;
+        session
             .mount_with_unprivileged(LoggingFileSystem::new(fs), mount_point)
             .await
     } else {
-        rfuse3::raw::Session::new(default_mount_options())
-            .mount_with_unprivileged(fs, mount_point)
-            .await
+        let session = rfuse3::raw::Session::new(default_mount_options());
+        fs.set_fuse_notify(session.notify()).await;
+        session.mount_with_unprivileged(fs, mount_point).await
     }
 }
 
