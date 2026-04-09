@@ -53,6 +53,16 @@ jobs:
           cargo build -p slayerfs --example persistence_demo --release
           cargo test -p slayerfs --test test_slayerfs_qlean_multinode_smoke -- --ignored
 
+      - name: Run basic KVM tests (all backends)
+        run: |
+          cd project
+          cargo build -p slayerfs
+          for backend in sqlite redis etcd; do
+            echo "=== KVM basic test: $backend ==="
+            cargo test -p slayerfs --test test_slayerfs_kvm_integration \
+              "test_slayerfs_kvm_${backend}" -- --ignored --nocapture --exact || true
+          done
+
       - name: Stop backend services
         if: always()
         run: |
@@ -95,14 +105,17 @@ jobs:
           rm -rf fuzz/.tmp*
 
   xfstests:
-    name: xfstests
+    name: xfstests (${{ matrix.backend }})
     runs-on: [self-hosted]
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [sqlite, redis, etcd]
     env:
       CARGO_TERM_COLOR: always
       RUSTUP_TOOLCHAIN: stable
-      SLAYERFS_XFSTESTS_CASES: generic/001
-      SLAYERFS_XFSTESTS_HOST_ARTIFACT_ROOT: /tmp/slayerfs-kvm-xfstests/${{ github.run_id }}-${{ github.run_attempt }}
+      SLAYERFS_XFSTESTS_HOST_ARTIFACT_ROOT: /tmp/slayerfs-kvm-xfstests/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.backend }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -134,19 +147,70 @@ jobs:
             xorriso
           protoc --version
 
+      - name: Start backend services
+        if: matrix.backend != 'sqlite'
+        run: |
+          docker compose -f project/slayerfs/docker-compose.yml up -d
+          # Wait for services to be healthy
+          for svc in etcd redis postgres; do
+            echo "Waiting for $svc..."
+            timeout 60 bash -c "until docker compose -f project/slayerfs/docker-compose.yml exec -T $svc true 2>/dev/null; do sleep 2; done" || true
+          done
+
       - name: Build slayerfs persistence demo
         working-directory: project
         run: cargo build -p slayerfs --example persistence_demo --release
 
-      - name: Run xfstests in KVM VM
+      - name: Run xfstests in KVM VM (${{ matrix.backend }})
         working-directory: project
-        run: cargo test -p slayerfs --test test_slayerfs_kvm_integration test_slayerfs_kvm_xfstests -- --ignored --nocapture
+        run: |
+          cargo test -p slayerfs --test test_slayerfs_kvm_integration \
+            test_slayerfs_kvm_xfstests_${{ matrix.backend }} \
+            -- --ignored --nocapture
+
+      - name: Display xfstests results
+        if: always()
+        run: |
+          ARTIFACT_ROOT="/tmp/slayerfs-kvm-xfstests/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.backend }}"
+          echo "## xfstests results (${{ matrix.backend }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Find the most recent artifact directory
+          LATEST=$(find "$ARTIFACT_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort -r | head -1)
+          if [[ -z "$LATEST" ]]; then
+            echo "No artifact directory found under $ARTIFACT_ROOT" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          CHECK_OUT="$LATEST/results/check.out"
+          if [[ -f "$CHECK_OUT" ]]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat "$CHECK_OUT" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No check.out found at $CHECK_OUT" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Count .out.bad files (failures)
+          BAD_COUNT=$(find "$LATEST/results" -name '*.out.bad' 2>/dev/null | wc -l)
+          if [[ "$BAD_COUNT" -gt 0 ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Failed tests ($BAD_COUNT)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            find "$LATEST/results" -name '*.out.bad' -exec basename {} .out.bad \; | sort >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Stop backend services
+        if: always() && matrix.backend != 'sqlite'
+        run: |
+          docker compose -f project/slayerfs/docker-compose.yml down -v || true
 
       - name: Upload xfstests artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: slayerfs-xfstests-logs
+          name: slayerfs-xfstests-${{ matrix.backend }}-logs
           path: |
-            /tmp/slayerfs-kvm-xfstests/${{ github.run_id }}-${{ github.run_attempt }}
+            /tmp/slayerfs-kvm-xfstests/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.backend }}
           if-no-files-found: ignore

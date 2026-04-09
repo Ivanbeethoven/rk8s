@@ -6,6 +6,10 @@
 
 set -euo pipefail
 
+# Redirect all output (stdout+stderr) to a log file for post-mortem debugging.
+_LOG=/tmp/xfstests-script.log
+exec > >(tee -a "$_LOG") 2>&1
+
 current_dir=$(dirname "$(realpath "$0")")
 workspace_dir="${SLAYERFS_WORKSPACE_DIR:-$(realpath "$current_dir/../../..")}"
 config_path="${SLAYERFS_CONFIG_PATH:-$workspace_dir/slayerfs/slayerfs-sqlite.yml}"
@@ -48,54 +52,31 @@ cleanup() {
 install_xfstests_deps() {
     export DEBIAN_FRONTEND=noninteractive
 
-    # Ensure swap exists so apt-get is not OOM-killed.
-    # fallocate is instant; swapon verifies the blocks are usable.
-    if ! swapon --show | grep -q .; then
-        fallocate -l 4G /swapfile 2>/dev/null \
-            || dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
-        chmod 600 /swapfile
-        mkswap /swapfile >/dev/null
-        swapon /swapfile
-        echo "[xfstests] Swap enabled: $(free -h | awk '/^Swap/{print $2}')"
-    fi
-
-    # Stop background apt/unattended-upgrades so it doesn't hold the apt lock
-    # or leave corrupted partial downloads (which cause "Transaction already aborted").
-    sudo systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service \
-        apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
-    sudo pkill -9 -x apt-get 2>/dev/null || true
-    sleep 2
-
-    # Remove stale locks and partial download files left by killed apt processes.
-    sudo rm -f  /var/lib/apt/lists/lock \
-                /var/cache/apt/archives/lock \
-                /var/lib/dpkg/lock \
-                /var/lib/dpkg/lock-frontend
-    sudo rm -rf /var/lib/apt/lists/partial \
-                /var/cache/apt/archives/partial
+    # Stale partial downloads cause "Transaction already aborted" errors.
+    # Main kill/swap setup already done in the script body; just clean leftovers.
+    sudo rm -rf /var/lib/apt/lists/partial /var/cache/apt/archives/partial 2>/dev/null || true
     sudo dpkg --configure -a 2>/dev/null || true
 
-    # Disable deb-src to avoid downloading huge Sources indices (which can use
-    # several GB of memory during decompression).
+    # Disable deb-src to avoid fetching large Sources indices.
     sudo sed -i 's/^deb-src /#deb-src /' /etc/apt/sources.list 2>/dev/null || true
 
-    # apt-get update with retry: unattended-upgrades may still race; retry once.
-    if ! sudo apt-get update -qq 2>&1; then
+    # apt-get update with retry.
+    if ! sudo bash -c 'export MALLOC_ARENA_MAX=1; apt-get update -qq' 2>&1; then
         echo "[xfstests] apt-get update failed, cleaning and retrying..."
         sudo rm -rf /var/lib/apt/lists/partial /var/cache/apt/archives/partial
         sudo rm -f  /var/lib/apt/lists/lock /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend
-        sudo apt-get update -qq
+        sudo bash -c 'export MALLOC_ARENA_MAX=1; apt-get update -qq'
     fi
 
     # Runtime deps: always required when running xfstests against a FUSE mount.
-    sudo apt-get install -y -qq --no-install-recommends \
+    sudo bash -c 'export MALLOC_ARENA_MAX=1 DEBIAN_FRONTEND=noninteractive; \
+        apt-get install -y -qq --no-install-recommends \
         acl attr bc dbench dump e2fsprogs fio gawk \
         ca-certificates libuuid1 lvm2 make psmisc python3 quota sed \
         uuid-runtime xfsprogs sqlite3 fuse3 \
-        exfatprogs f2fs-tools udftools xfsdump || true
+        exfatprogs f2fs-tools udftools xfsdump' || true
 
     # Build deps: only needed when compiling xfstests from source.
-    # Skip them when a prebuilt tarball is available to save memory and time.
     local use_prebuilt="${XFSTESTS_PREBUILT_TAR:-1}"
     local script_dir
     script_dir="$(dirname "$(realpath "$0")")"
@@ -141,16 +122,40 @@ prepare_xfstests_tree() {
         echo "[xfstests] Using prebuilt tarball: $prebuilt_tar"
         sudo rm -rf "$xfstests_dir"
         sudo mkdir -p "$(dirname "$xfstests_dir")"
-        # The tarball has a single top-level directory; strip it and extract
-        # directly into $xfstests_dir.
-        local top_dir
-        top_dir="$(tar -tzf "$prebuilt_tar" | head -1 | cut -d/ -f1)"
+        # The top-level directory inside our prebuilt tarball is always
+        # 'xfstests' (it was built that way).  We hardcode it here to avoid
+        # `tar | head` which triggers SIGPIPE and kills the script under
+        # `set -o pipefail`.
+        local top_dir="xfstests"
         sudo mkdir -p "$xfstests_dir"
         sudo tar -xzf "$prebuilt_tar" -C "$(dirname "$xfstests_dir")" \
             --transform "s|^${top_dir}|$(basename "$xfstests_dir")|"
         # Ensure check and helpers are executable.
         sudo chmod +x "$xfstests_dir/check" "$xfstests_dir/src/"* 2>/dev/null || true
         echo "[xfstests] Extracted to $xfstests_dir"
+
+        # Install bundled tools (xfs_io, fusermount3, bc) and their libs
+        # into system-wide paths so they're accessible without LD_LIBRARY_PATH.
+        local bundled_dir="$xfstests_dir/bundled"
+        if [[ -d "$bundled_dir" ]]; then
+            echo "[xfstests] Installing bundled tools from $bundled_dir..."
+            # Libs first so ldconfig covers them
+            if [[ -d "$bundled_dir/lib" ]]; then
+                sudo cp -n "$bundled_dir/lib/"* /usr/local/lib/ 2>/dev/null || true
+                sudo ldconfig 2>/dev/null || true
+            fi
+            # Binaries
+            for b in "$bundled_dir/bin/"*; do
+                [[ -f "$b" ]] || continue
+                local dest_dir
+                case "$(basename "$b")" in
+                    fusermount3) dest_dir=/usr/local/bin ;;
+                    *)           dest_dir=/usr/local/sbin ;;
+                esac
+                sudo install -m 755 "$b" "$dest_dir/$(basename "$b")"
+            done
+            echo "[xfstests] Bundled tools installed: $(ls $bundled_dir/bin/ 2>/dev/null | tr '\n' ' ')"
+        fi
         return 0
     fi
 
@@ -222,14 +227,26 @@ run_xfstests() {
         read -r -a check_args <<<"${XFSTESTS_CHECK_ARGS}"
     elif [[ -n "${XFSTESTS_CASES:-}" ]]; then
         read -r -a check_args <<<"${XFSTESTS_CASES}"
-        check_args=(-fuse "${check_args[@]}")
+        if [[ -f "$xfstests_dir/xfstests_slayer.exclude" ]]; then
+            check_args=(-fuse -E xfstests_slayer.exclude "${check_args[@]}")
+        else
+            check_args=(-fuse "${check_args[@]}")
+        fi
     else
         check_args=(-fuse -E xfstests_slayer.exclude)
     fi
 
     (
         cd "$xfstests_dir"
-        sudo LC_ALL=C ./check "${check_args[@]}"
+        # Add xfstests dir to PATH so bundled tools (bc→busybox, etc.) are found
+        # even when the system image doesn't have them installed.
+        export PATH="$xfstests_dir:$PATH"
+        # sudo resets PATH via secure_path in /etc/sudoers, so the export above
+        # won't take effect inside the sudo-rooted check process.
+        # Solve this by linking our bundled bc into /usr/local/bin which is always
+        # in sudo's default secure_path.
+        sudo ln -sf "$xfstests_dir/bc" /usr/local/bin/bc 2>/dev/null || true
+        sudo -E LC_ALL=C ./check "${check_args[@]}"
     )
 }
 
@@ -246,8 +263,60 @@ sudo chmod 755 "$mount_dir"
 sudo chown root:root "$mount_dir"
 sudo grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf >/dev/null
 
+# Prevent unattended-upgrades from consuming all VM RAM.
+# We AVOID systemctl (which uses D-Bus) because D-Bus can block under OOM,
+# causing the SSH connection to be lost and the test to fail.
+# Instead: directly SIGKILL the processes and create mask symlinks on the
+# filesystem (which is what systemctl-mask does under the hood, without D-Bus).
+sudo mkdir -p /etc/systemd/system
+for svc in unattended-upgrades apt-daily.service apt-daily-upgrade.service \
+           apt-daily.timer apt-daily-upgrade.timer; do
+    sudo ln -sf /dev/null "/etc/systemd/system/${svc}" 2>/dev/null || true
+done
+sudo pkill -9 -f 'unattended' 2>/dev/null || true
+sudo pkill -9 -x apt-get 2>/dev/null || true
+sleep 3
+
+# Wait for apt-get to actually disappear (max 60 seconds).
+# Even with SIGKILL, the kernel may take a moment to reclaim memory.
+# Proceeding while apt-get still holds 7-8 GB can cause OOM kills.
+echo "[vm-setup] waiting for apt-get to exit..."
+for _i in $(seq 1 30); do
+    if ! pgrep -x apt-get >/dev/null 2>&1; then
+        break
+    fi
+    sleep 2
+done
+
+sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock \
+           /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend 2>/dev/null || true
+
+if ! swapon --show | grep -q .; then
+    # Use dd (not fallocate) to ensure real disk blocks are allocated on the
+    # qcow2-backed filesystem.  fallocate may create a sparse file in qcow2
+    # that has no actual backing blocks, making the swap unusable.
+    dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none oflag=direct
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null
+    swapon /swapfile
+    echo "[vm-setup] swap ready: $(free -h | awk '/^Swap/{print $2}')"
+fi
+
 if [[ "$install_deps" == "1" ]]; then
     install_xfstests_deps
+else
+    # Even when skipping full deps installation, install the bare minimum
+    # tools that xfstests requires at runtime.
+    # bc, xfs_io, and fusermount3 are bundled inside the prebuilt tarball and
+    # will be installed by prepare_xfstests_tree() above, so no apt is needed
+    # for those.  We only check+install fuse3 kernel module userspace here.
+    if ! command -v fusermount3 >/dev/null 2>&1; then
+        # fuse3 might be installed by the bundled tools above; check again later.
+        # As a last resort attempt apt, but allow failure since bundled covers it.
+        sudo bash -c 'export MALLOC_ARENA_MAX=1 DEBIAN_FRONTEND=noninteractive; \
+            apt-get install -y -qq --no-install-recommends fuse3' 2>/dev/null \
+        || true
+    fi
 fi
 
 prepare_xfstests_tree

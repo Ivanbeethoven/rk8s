@@ -14,11 +14,168 @@ const SLAYERFS_LOG_PATH: &str = "/var/log/slayerfs.log";
 const SLAYERFS_META_DIR: &str = "/tmp/slayerfs-meta";
 const XFSTESTS_STAGE_DIR: &str = "/opt/slayerfs-xfstests";
 const XFSTESTS_SCRIPT_IN_VM: &str = "/opt/slayerfs-xfstests/xfstests_slayer.sh";
-const XFSTESTS_CONFIG_IN_VM: &str = "/opt/slayerfs-xfstests/slayerfs-sqlite.yml";
 const XFSTESTS_BIN_IN_VM: &str = "/opt/slayerfs-xfstests/persistence_demo";
 const XFSTESTS_EXCLUDE_IN_VM: &str = "/opt/slayerfs-xfstests/xfstests_slayer.exclude";
 const XFSTESTS_REMOTE_DIR: &str = "/tmp/xfstests-dev";
 const XFSTESTS_HOST_ARTIFACT_ROOT: &str = "/tmp/slayerfs-kvm-xfstests";
+
+// ---------------------------------------------------------------------------
+// Meta-backend abstraction (mirrors the multinode test pattern)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetaBackend {
+    Sqlite,
+    Etcd,
+    Redis,
+}
+
+impl MetaBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            MetaBackend::Sqlite => "sqlite",
+            MetaBackend::Etcd => "etcd",
+            MetaBackend::Redis => "redis",
+        }
+    }
+
+    /// CLI value for `--meta-backend`.
+    fn cli_backend(self) -> &'static str {
+        match self {
+            MetaBackend::Sqlite => "sqlx",
+            MetaBackend::Etcd => "etcd",
+            MetaBackend::Redis => "redis",
+        }
+    }
+
+    /// Return the config YAML filename shipped from the repo root.
+    fn config_filename(self) -> &'static str {
+        match self {
+            MetaBackend::Sqlite => "slayerfs-sqlite.yml",
+            MetaBackend::Etcd => "slayerfs-etcd.yml",
+            MetaBackend::Redis => "slayerfs-redis.yml",
+        }
+    }
+
+    /// Path to the config file once uploaded into the xfstests staging dir.
+    fn xfstests_config_in_vm(self) -> String {
+        format!("{}/{}", XFSTESTS_STAGE_DIR, self.config_filename())
+    }
+}
+
+/// Build meta-URL(s) for the given backend, referencing the host gateway IP.
+fn backend_meta_url(backend: MetaBackend, gateway: &str) -> String {
+    match backend {
+        MetaBackend::Sqlite => {
+            // SQLite is local to the VM — no gateway needed.
+            "sqlite:///tmp/slayerfs-db/metadata.db".to_string()
+        }
+        MetaBackend::Etcd => format!("http://{}:2379", gateway),
+        MetaBackend::Redis => format!("redis://{}:6379/0", gateway),
+    }
+}
+
+async fn default_gateway_ip(vm: &mut Machine) -> Result<Option<String>> {
+    let out = exec_check(
+        vm,
+        r#"sh -lc "ip route | awk '/default/ {print \$3; exit}'""#,
+    )
+    .await?;
+    let ip = out.trim();
+    if ip.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(ip.to_string()))
+    }
+}
+
+fn guess_gateway_from_ip(ip: &str) -> Option<String> {
+    let parts: Vec<&str> = ip.trim().split('.').collect();
+    if parts.len() != 4 || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    Some(format!("{}.{}.{}.1", parts[0], parts[1], parts[2]))
+}
+
+async fn detect_gateway(vm: &mut Machine) -> Result<String> {
+    let gw = default_gateway_ip(vm).await?;
+    if let Some(ip) = gw {
+        return Ok(ip);
+    }
+    // Fallback: derive from VM's own IP
+    let vm_ip = exec_check(vm, "sh -lc \"hostname -I | awk '{print $1}'\"").await?;
+    let vm_ip = vm_ip.trim();
+    guess_gateway_from_ip(vm_ip)
+        .ok_or_else(|| anyhow::anyhow!("cannot detect host gateway IP from VM IP '{}'", vm_ip))
+}
+
+/// Clean up etcd metadata before a new test run (requires etcdctl in the VM
+/// or we use the bundled approach via curl).
+async fn cleanup_etcd_metadata(vm: &mut Machine, gateway: &str) -> Result<()> {
+    // Install etcdctl if not available (lightweight static binary).
+    let has_etcdctl = exec_check(vm, "command -v etcdctl >/dev/null 2>&1 && echo OK || echo NO")
+        .await
+        .map(|s| s.trim() == "OK")
+        .unwrap_or(false);
+
+    let endpoint = format!("http://{}:2379", gateway);
+
+    if has_etcdctl {
+        let prefixes = [
+            "slayerfs:", "f:", "r:", "c:", "p:", "l:", "session:", "session_info:", "slices/",
+        ];
+        for prefix in prefixes {
+            let cmd = format!(
+                "sh -lc 'ETCDCTL_API=3 etcdctl --endpoints={endpoint} del --prefix {prefix}'"
+            );
+            let _ = exec_check(vm, &cmd).await;
+        }
+    } else {
+        // Use etcd's HTTP API to delete all keys (no etcdctl needed).
+        // The v3 gRPC-gateway range_end="\0" deletes everything.
+        let cmd = format!(
+            r#"curl -s -X POST {endpoint}/v3/kv/deleterange -d '{{"key":"AA==","range_end":"AA=="}}' || true"#,
+        );
+        let _ = exec_check(vm, &cmd).await;
+    }
+    Ok(())
+}
+
+/// Clean up redis metadata before a new test run.
+async fn cleanup_redis_metadata(vm: &mut Machine, gateway: &str) -> Result<()> {
+    // Try redis-cli if available, otherwise use raw TCP.
+    let has_redis_cli =
+        exec_check(vm, "command -v redis-cli >/dev/null 2>&1 && echo OK || echo NO")
+            .await
+            .map(|s| s.trim() == "OK")
+            .unwrap_or(false);
+
+    if has_redis_cli {
+        let cmd = format!("sh -lc 'redis-cli -h {gateway} -p 6379 FLUSHALL'");
+        exec_check(vm, &cmd).await?;
+    } else {
+        // Minimal FLUSHALL via raw TCP (no redis-cli needed).
+        let cmd = format!(
+            "sh -lc 'printf \"*1\\r\\n\\$8\\r\\nFLUSHALL\\r\\n\" | nc -q1 {gateway} 6379 || true'"
+        );
+        let _ = exec_check(vm, &cmd).await;
+    }
+    Ok(())
+}
+
+/// Generate a SlayerFS config YAML for the given backend.
+/// For SQLite the URL is local; for Redis/Etcd it points to `gateway`.
+fn generate_backend_config(backend: MetaBackend, gateway: &str) -> String {
+    let db_section = match backend {
+        MetaBackend::Sqlite => "database:\n  type: sqlite\n  url: \"sqlite:///tmp/slayerfs/metadata.db\"".to_string(),
+        MetaBackend::Redis => format!("database:\n  type: redis\n  url: \"redis://{}:6379/0\"", gateway),
+        MetaBackend::Etcd => format!("database:\n  type: etcd\n  urls:\n    - \"http://{}:2379\"", gateway),
+    };
+    format!(
+        "{}\n\ncache:\n  enabled: true\n  capacity:\n    inode: 10000\n    path: 5000\n  ttl:\n    inode_ttl: 10.0\n    path_ttl: 10.0\n",
+        db_section
+    )
+}
 
 // NOTE: These tests use qlean for QEMU-based VM testing.
 // qlean 0.2.1+ supports TCG fallback when KVM is unavailable.
@@ -205,12 +362,48 @@ fn xfstests_host_artifact_dir() -> PathBuf {
 }
 
 async fn install_deps(vm: &mut Machine) -> Result<()> {
-    exec_check(vm, "apt-get update -qq").await?;
-    exec_check(
-        vm,
-        "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fuse3 ca-certificates coreutils util-linux procps",
-    )
-    .await?;
+    // Check if fuse3 (fusermount3) is already installed.
+    let fuse_check = vm
+        .exec("command -v fusermount3 >/dev/null 2>&1 && echo FUSE_OK || echo FUSE_MISSING")
+        .await
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("FUSE_OK"))
+        .unwrap_or(false);
+
+    if !fuse_check {
+        // Install fusermount3 from the pre-extracted bundle instead of using
+        // apt-get.  apt-get + unattended-upgrades exhaust RAM on a 2GB VM,
+        // causing the qlean SSH channel to drop (OOM kills sshd).
+        // fusermount3 from Debian trixie only dynamically links libc.so.6
+        // which is always present in the base image.
+        let manifest_dir = PathBuf::from(
+            std::env::var("CARGO_MANIFEST_DIR").context("CARGO_MANIFEST_DIR not set")?,
+        );
+        let fuse3_bundle_dir = manifest_dir.join("tests/scripts/fuse3-bundle");
+        let fusermount3 = fuse3_bundle_dir.join("fusermount3");
+        if fusermount3.exists() {
+            vm.upload(&fusermount3, Path::new("/usr/local/bin"))
+                .await
+                .context("upload bundled fusermount3")?;
+            exec_check(vm, "chmod 755 /usr/local/bin/fusermount3").await?;
+            tracing::info!("installed fusermount3 from bundle");
+        } else {
+            tracing::warn!(
+                "fuse3 bundle not found at {:?}; falling back to apt-get",
+                fuse3_bundle_dir
+            );
+            // Fall back: kill UA first to reduce OOM risk, then apt-get.
+            let _ = exec_check(vm, "\
+                pkill -9 -f 'unattended' 2>/dev/null || true; \
+                pkill -9 -x apt-get 2>/dev/null || true").await;
+            exec_check(vm, "MALLOC_ARENA_MAX=1 apt-get update -qq").await?;
+            exec_check(
+                vm,
+                "MALLOC_ARENA_MAX=1 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fuse3 ca-certificates coreutils util-linux procps",
+            )
+            .await?;
+        }
+    }
 
     exec_check(
         vm,
@@ -290,7 +483,7 @@ async fn assert_not_mounted(vm: &mut Machine) -> Result<()> {
     Ok(())
 }
 
-async fn run_slayerfs_mount_root(vm: &mut Machine, meta_url: &str) -> Result<()> {
+async fn run_slayerfs_mount_root(vm: &mut Machine, backend: MetaBackend, meta_url: &str) -> Result<()> {
     exec_check(
         vm,
         &format!("rm -f {log} && touch {log}", log = SLAYERFS_LOG_PATH),
@@ -321,37 +514,50 @@ async fn run_slayerfs_mount_root(vm: &mut Machine, meta_url: &str) -> Result<()>
     )
     .await?;
 
-    let db_path = meta_url
-        .strip_prefix("sqlite:///")
-        .or_else(|| meta_url.strip_prefix("sqlite://"))
-        .map(|s| s.split('?').next().unwrap_or(s))
-        .filter(|s| !s.starts_with(':'))
-        .map(|p| {
-            if p.starts_with('/') {
-                p.to_string()
-            } else {
-                format!("/{p}")
-            }
-        });
-    if let Some(db_path) = db_path {
-        exec_check(
-            vm,
-            &format!(
-                "sh -lc \"test -e '{p}' || touch '{p}'; chmod 666 '{p}'; stat -c '%A %U:%G %n' '{p}'\"",
-                p = db_path
-            ),
-        )
-        .await?;
+    // For SQLite, ensure the database file exists and is writable.
+    if backend == MetaBackend::Sqlite {
+        let db_path = meta_url
+            .strip_prefix("sqlite:///")
+            .or_else(|| meta_url.strip_prefix("sqlite://"))
+            .map(|s| s.split('?').next().unwrap_or(s))
+            .filter(|s| !s.starts_with(':'))
+            .map(|p| {
+                if p.starts_with('/') {
+                    p.to_string()
+                } else {
+                    format!("/{p}")
+                }
+            });
+        if let Some(db_path) = db_path {
+            exec_check(
+                vm,
+                &format!(
+                    "sh -lc \"test -e '{p}' || touch '{p}'; chmod 666 '{p}'; stat -c '%A %U:%G %n' '{p}'\"",
+                    p = db_path
+                ),
+            )
+            .await?;
+        }
     }
+
+    // Build the mount command with backend-specific CLI arguments.
+    let meta_args = match backend {
+        MetaBackend::Sqlite | MetaBackend::Redis => {
+            format!("--meta-backend {} --meta-url '{}'", backend.cli_backend(), meta_url)
+        }
+        MetaBackend::Etcd => {
+            format!("--meta-backend etcd --meta-etcd-urls '{}'", meta_url)
+        }
+    };
 
     exec_check(
         vm,
         &format!(
-            "nohup {bin} mount {mp} --data-dir {data} --meta-backend sqlx --meta-url '{meta_url}' > {log} 2>&1 &",
+            "nohup {bin} mount {mp} --data-dir {data} {meta_args} > {log} 2>&1 &",
             bin = SLAYERFS_BIN_IN_VM,
             mp = SLAYERFS_MOUNTPOINT,
             data = SLAYERFS_DATA_DIR,
-            meta_url = meta_url,
+            meta_args = meta_args,
             log = SLAYERFS_LOG_PATH
         ),
     )
@@ -572,8 +778,8 @@ async fn kill_slayerfs_best_effort(vm: &mut Machine) -> Result<()> {
     Ok(())
 }
 
-async fn run_in_vm(vm: &mut Machine, slayerfs_bin: &Path) -> Result<()> {
-    let r = run_full(vm, slayerfs_bin).await;
+async fn run_in_vm(vm: &mut Machine, slayerfs_bin: &Path, backend: MetaBackend) -> Result<()> {
+    let r = run_full(vm, slayerfs_bin, backend).await;
 
     if let Err(e) = r {
         let dbg = dump_debug_info(vm).await.unwrap_or_else(|e| e.to_string());
@@ -584,80 +790,238 @@ async fn run_in_vm(vm: &mut Machine, slayerfs_bin: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn start_vm_and_run(slayerfs_bin: PathBuf) -> Result<()> {
+async fn start_vm_and_run(slayerfs_bin: PathBuf, backend: MetaBackend) -> Result<()> {
     tracing_subscriber_init();
 
-    tracing::info!("using slayerfs binary at {:?}", slayerfs_bin);
+    tracing::info!("using slayerfs binary at {:?}, backend={}", slayerfs_bin, backend.as_str());
 
-    let image = create_image(Distro::Debian, "debian-13-generic-amd64").await?;
-    let config = MachineConfig {
-        core: 2,
-        mem: 2048,
-        disk: Some(10),
-        clear: true,
-    };
+    // Use a flag that is set to true only after run_in_vm returns Ok.
+    // This lets us distinguish "test passed but shutdown panicked (qlean bug)"
+    // from "test panicked during execution (real failure)".
+    let run_ok_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag_clone = std::sync::Arc::clone(&run_ok_flag);
 
-    let slayerfs_bin = std::sync::Arc::new(slayerfs_bin);
-    with_machine(&image, &config, move |vm| {
-        let slayerfs_bin = std::sync::Arc::clone(&slayerfs_bin);
-        Box::pin(async move { run_in_vm(vm, slayerfs_bin.as_ref()).await })
+    let thread_result = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async move {
+                let image = create_image(Distro::Debian, "debian-13-generic-amd64").await?;
+                let config = MachineConfig {
+                    core: 2,
+                    mem: 2048,
+                    disk: Some(10),
+                    clear: true,
+                };
+                let slayerfs_bin = std::sync::Arc::new(slayerfs_bin);
+                with_machine(&image, &config, move |vm| {
+                    let slayerfs_bin = std::sync::Arc::clone(&slayerfs_bin);
+                    let flag = std::sync::Arc::clone(&flag_clone);
+                    Box::pin(async move {
+                        let result = run_in_vm(vm, slayerfs_bin.as_ref(), backend).await;
+                        if result.is_ok() {
+                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        result
+                    })
+                })
+                .await
+            })
+        }))
     })
-    .await?;
+    .join();
 
-    Ok(())
+    match thread_result {
+        // Normal: no panic from with_machine.
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(e))) => Err(e),
+        Ok(Err(panic_val)) => {
+            // with_machine panicked. Check if run_in_vm completed successfully:
+            // if yes, the panic was qlean's shutdown SSH race (known bug) and
+            // the test actually passed.
+            if run_ok_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                tracing::warn!(
+                    "with_machine panicked after successful run_in_vm \
+                     (qlean shutdown/SSH race); treating as pass"
+                );
+                Ok(())
+            } else {
+                let msg = format!("{:?}", panic_val);
+                anyhow::bail!(
+                    "test panicked before run_in_vm could complete: {}",
+                    msg
+                )
+            }
+        }
+        Err(thread_err) => anyhow::bail!("test thread error: {:?}", thread_err),
+    }
 }
 
-async fn start_vm_and_run_xfstests(persistence_bin: PathBuf) -> Result<()> {
+async fn start_vm_and_run_xfstests(persistence_bin: PathBuf, backend: MetaBackend) -> Result<()> {
     tracing_subscriber_init();
 
-    tracing::info!("using persistence_demo binary at {:?}", persistence_bin);
+    tracing::info!("using persistence_demo binary at {:?}, backend={}", persistence_bin, backend.as_str());
 
-    let image = create_image(Distro::Debian, "debian-13-generic-amd64").await?;
-    let config = MachineConfig {
-        core: 2,
-        mem: 8192,
-        disk: Some(30),
-        clear: true,
-    };
+    let artifact_dir_holder: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let holder_clone = std::sync::Arc::clone(&artifact_dir_holder);
 
-    let persistence_bin = std::sync::Arc::new(persistence_bin);
-    with_machine(&image, &config, move |vm| {
-        let persistence_bin = std::sync::Arc::clone(&persistence_bin);
-        Box::pin(async move {
-            let artifact_dir = run_xfstests_in_vm(vm, persistence_bin.as_ref()).await?;
-            tracing::info!("xfstests artifacts stored at {}", artifact_dir.display());
-            Ok(())
-        })
+    // Run with_machine in a dedicated OS thread so we can catch the panic it
+    // sometimes throws during machine.shutdown() when the SSH channel is closed
+    // without an ExitStatus (a qlean bug: `systemctl poweroff` kills sshd
+    // before the command sends its ExitStatus back over SSH).
+    let thread_result = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async move {
+                let image = create_image(Distro::Debian, "debian-13-generic-amd64").await?;
+                let config = MachineConfig {
+                    core: 2,
+                    mem: 8192,
+                    disk: Some(30),
+                    clear: true,
+                };
+                let persistence_bin = std::sync::Arc::new(persistence_bin);
+                with_machine(&image, &config, move |vm| {
+                    let persistence_bin = std::sync::Arc::clone(&persistence_bin);
+                    let holder = std::sync::Arc::clone(&holder_clone);
+                    Box::pin(async move {
+                        let artifact_dir =
+                            run_xfstests_in_vm(vm, persistence_bin.as_ref(), backend).await?;
+                        tracing::info!(
+                            "xfstests artifacts stored at {}",
+                            artifact_dir.display()
+                        );
+                        *holder.lock().unwrap() = Some(artifact_dir);
+                        Ok(())
+                    })
+                })
+                .await
+            })
+        }))
     })
-    .await?;
+    .join();
 
-    Ok(())
+    match thread_result {
+        // Thread exited normally (no panic from with_machine).
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(e))) => Err(e),
+        Ok(Err(panic_val)) => {
+            // with_machine panicked — likely the qlean shutdown SSH race.
+            // If xfstests already ran and left artifacts, check their outcome.
+            let artifact_dir = artifact_dir_holder.lock().unwrap().clone();
+            tracing::warn!(
+                "with_machine panicked (qlean shutdown/SSH race during poweroff); \
+                 checking artifacts for test outcome"
+            );
+            if let Some(dir) = artifact_dir {
+                check_xfstests_outcome(&dir)
+            } else {
+                let msg = format!("{:?}", panic_val);
+                anyhow::bail!(
+                    "with_machine panicked before xfstests artifacts were collected: {}",
+                    msg
+                )
+            }
+        }
+        Err(thread_err) => {
+            anyhow::bail!("test thread panicked: {:?}", thread_err)
+        }
+    }
 }
 
-async fn run_full(vm: &mut Machine, slayerfs_bin: &Path) -> Result<()> {
+/// Inspect the xfstests result artifacts to determine pass/fail.
+fn check_xfstests_outcome(artifact_dir: &Path) -> Result<()> {
+    // Look for the check.out file which contains the summary line.
+    let check_out = artifact_dir.join("results/check.out");
+    if check_out.exists() {
+        let content = std::fs::read_to_string(&check_out)
+            .with_context(|| format!("read {:?}", check_out))?;
+        // check.out ends with "Passed all N tests" or similar on success.
+        if content.contains("Passed all") {
+            tracing::info!("xfstests outcome: PASS (from check.out):\n{}", content.trim());
+            return Ok(());
+        }
+        if content.contains("Failures:") || content.contains("failed") {
+            anyhow::bail!("xfstests reported failures:\n{}", content);
+        }
+    }
+    // Fall back to check if the results dir has any .out.bad files (failures).
+    let results_dir = artifact_dir.join("results");
+    if let Ok(rd) = std::fs::read_dir(&results_dir) {
+        let bad: Vec<_> = rd
+            .flatten()
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|x| x == "bad")
+                    .unwrap_or(false)
+            })
+            .collect();
+        if bad.is_empty() {
+            tracing::info!("xfstests outcome: no .out.bad files found, treating as PASS");
+            return Ok(());
+        }
+        anyhow::bail!(
+            "xfstests failed: found {} .out.bad file(s): {:?}",
+            bad.len(),
+            bad.iter().map(|e| e.path()).collect::<Vec<_>>()
+        );
+    }
+    anyhow::bail!(
+        "xfstests outcome unknown: no check.out or results dir found at {:?}",
+        artifact_dir
+    )
+}
+
+async fn run_full(vm: &mut Machine, slayerfs_bin: &Path, backend: MetaBackend) -> Result<()> {
     install_deps(vm).await?;
     setup_unprivileged_user(vm, "tester").await?;
     upload_slayerfs(vm, slayerfs_bin).await?;
 
-    let db_dir = "/tmp/slayerfs-db";
-    let db_path = "/tmp/slayerfs-db/metadata.db";
-    exec_check(vm, &format!("rm -rf {db_dir} && mkdir -p {db_dir}")).await?;
-    exec_check(
-        vm,
-        &format!(
-            "stat -c '%A %U:%G %n' /tmp {db_dir} || true; ls -ld {db_dir} && sh -lc 'touch {db_dir}/.w && rm {db_dir}/.w'",
-        ),
-    )
-    .await?;
+    // Determine the meta URL based on the backend.
+    let meta_url = match backend {
+        MetaBackend::Sqlite => {
+            let db_dir = "/tmp/slayerfs-db";
+            let db_path = "/tmp/slayerfs-db/metadata.db";
+            exec_check(vm, &format!("rm -rf {db_dir} && mkdir -p {db_dir}")).await?;
+            exec_check(
+                vm,
+                &format!(
+                    "stat -c '%A %U:%G %n' /tmp {db_dir} || true; ls -ld {db_dir} && sh -lc 'touch {db_dir}/.w && rm {db_dir}/.w'",
+                ),
+            )
+            .await?;
+            exec_check(
+                vm,
+                &format!("rm -f {db_path} && touch {db_path} && stat -c '%A %U:%G %n' {db_path}",),
+            )
+            .await?;
+            format!("sqlite://{db_path}")
+        }
+        MetaBackend::Etcd => {
+            let gateway = detect_gateway(vm).await?;
+            tracing::info!(backend = backend.as_str(), %gateway, "detected host gateway for etcd");
+            cleanup_etcd_metadata(vm, &gateway).await?;
+            backend_meta_url(backend, &gateway)
+        }
+        MetaBackend::Redis => {
+            let gateway = detect_gateway(vm).await?;
+            tracing::info!(backend = backend.as_str(), %gateway, "detected host gateway for redis");
+            cleanup_redis_metadata(vm, &gateway).await?;
+            backend_meta_url(backend, &gateway)
+        }
+    };
 
-    exec_check(
-        vm,
-        &format!("rm -f {db_path} && touch {db_path} && stat -c '%A %U:%G %n' {db_path}",),
-    )
-    .await?;
-
-    let meta_url = format!("sqlite://{db_path}");
-    run_slayerfs_mount_root(vm, &meta_url).await?;
+    tracing::info!(backend = backend.as_str(), %meta_url, "mounting slayerfs");
+    run_slayerfs_mount_root(vm, backend, &meta_url).await?;
     basic_fs_checks(vm).await?;
 
     exec_check(
@@ -678,7 +1042,7 @@ async fn run_full(vm: &mut Machine, slayerfs_bin: &Path) -> Result<()> {
     unmount_best_effort(vm).await?;
     assert_not_mounted(vm).await?;
 
-    run_slayerfs_mount_root(vm, &meta_url).await?;
+    run_slayerfs_mount_root(vm, backend, &meta_url).await?;
     exec_check(
         vm,
         &format!(
@@ -705,12 +1069,11 @@ async fn upload_slayerfs(vm: &mut Machine, slayerfs_bin: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn upload_xfstests_assets(vm: &mut Machine, persistence_bin: &Path) -> Result<()> {
+async fn upload_xfstests_assets(vm: &mut Machine, persistence_bin: &Path, backend: MetaBackend, gateway: &str) -> Result<()> {
     let manifest_dir =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").context("CARGO_MANIFEST_DIR not set")?);
     let script = manifest_dir.join("tests/scripts/xfstests_slayer.sh");
     let exclude = manifest_dir.join("tests/scripts/xfstests_slayer.exclude");
-    let config = manifest_dir.join("slayerfs-sqlite.yml");
     // Prebuilt xfstests tarballs checked into the repo via git lfs.
     // The shell script (xfstests_slayer.sh) expects them at:
     //   <script_dir>/xfstests-prebuilt/*.tar.gz
@@ -723,7 +1086,30 @@ async fn upload_xfstests_assets(vm: &mut Machine, persistence_bin: &Path) -> Res
     )
     .await?;
 
-    vm.upload(persistence_bin, Path::new(XFSTESTS_STAGE_DIR))
+    // Strip debug symbols from the binary to reduce upload size (573MB → ~36MB).
+    // We write to a named temp file so the original is not modified.
+    let stripped_persistence_bin = {
+        let tmp_dir = tempfile::TempDir::new().context("create temp dir for stripped binary")?;
+        let tmp_path = tmp_dir.path().join("persistence_demo");
+        // Keep the TempDir alive until upload is done.
+        let status = std::process::Command::new("strip")
+            .arg("--strip-debug")
+            .arg(persistence_bin)
+            .arg("-o")
+            .arg(&tmp_path)
+            .status()
+            .context("run strip")?;
+        if !status.success() {
+            tracing::warn!("strip failed; uploading unstripped binary ({}MB)", std::fs::metadata(persistence_bin).map(|m| m.len() / 1_000_000).unwrap_or(0));
+            (persistence_bin.to_path_buf(), None::<tempfile::TempDir>)
+        } else {
+            let sz = std::fs::metadata(&tmp_path).map(|m| m.len() / 1_000_000).unwrap_or(0);
+            tracing::info!("stripped persistence_demo: {}MB → {}MB", std::fs::metadata(persistence_bin).map(|m| m.len() / 1_000_000).unwrap_or(0), sz);
+            (tmp_path, Some(tmp_dir))
+        }
+    };
+
+    vm.upload(&stripped_persistence_bin.0, Path::new(XFSTESTS_STAGE_DIR))
         .await
         .context("upload persistence_demo for xfstests")?;
     vm.upload(&script, Path::new(XFSTESTS_STAGE_DIR))
@@ -732,9 +1118,20 @@ async fn upload_xfstests_assets(vm: &mut Machine, persistence_bin: &Path) -> Res
     vm.upload(&exclude, Path::new(XFSTESTS_STAGE_DIR))
         .await
         .context("upload xfstests exclude list")?;
-    vm.upload(&config, Path::new(XFSTESTS_STAGE_DIR))
-        .await
-        .context("upload slayerfs sqlite config")?;
+
+    // Generate and write the backend-specific config file directly in the VM.
+    let config_in_vm = backend.xfstests_config_in_vm();
+    let config_yaml = generate_backend_config(backend, gateway);
+    exec_check(
+        vm,
+        &format!(
+            "cat > {} <<'SLAYERFS_CFG_EOF'\n{}\nSLAYERFS_CFG_EOF",
+            config_in_vm, config_yaml
+        ),
+    )
+    .await
+    .context("write backend config to VM")?;
+    tracing::info!(backend = backend.as_str(), config = %config_in_vm, "wrote backend config in VM");
 
     // Upload all prebuilt tarballs found in the repo directory.
     if prebuilt_dir.is_dir() {
@@ -764,7 +1161,7 @@ async fn upload_xfstests_assets(vm: &mut Machine, persistence_bin: &Path) -> Res
             bin = XFSTESTS_BIN_IN_VM,
             script = XFSTESTS_SCRIPT_IN_VM,
             exclude = XFSTESTS_EXCLUDE_IN_VM,
-            cfg = XFSTESTS_CONFIG_IN_VM
+            cfg = config_in_vm
         ),
     )
     .await?;
@@ -806,6 +1203,7 @@ async fn collect_xfstests_artifacts(vm: &mut Machine, host_dir: &Path) -> Result
             host_dir.join("local.config"),
         ),
         ("/tmp/xfstests-dev/results", host_dir.join("results")),
+        ("/tmp/xfstests-script.log", host_dir.join("xfstests-script.log")),
     ];
 
     for (remote, local) in artifacts {
@@ -817,19 +1215,26 @@ async fn collect_xfstests_artifacts(vm: &mut Machine, host_dir: &Path) -> Result
     Ok(())
 }
 
-async fn run_xfstests_in_vm(vm: &mut Machine, persistence_bin: &Path) -> Result<PathBuf> {
-    // Prepare the VM environment BEFORE uploading assets or running the script:
-    // Kill unattended-upgrades aggressively and wait for apt locks to clear;
-    // this prevents apt lock conflicts later.  We ignore errors because the VM
-    // may not have all these services and because OOM may kill our pkill too —
-    // the important thing is we try.
-    upload_xfstests_assets(vm, persistence_bin).await?;
+async fn run_xfstests_in_vm(vm: &mut Machine, persistence_bin: &Path, backend: MetaBackend) -> Result<PathBuf> {
+    // Detect the host gateway for non-SQLite backends.
+    let gateway = detect_gateway(vm).await.unwrap_or_else(|_| "127.0.0.1".to_string());
+
+    // Clean up metadata from any previous run.
+    match backend {
+        MetaBackend::Etcd => { cleanup_etcd_metadata(vm, &gateway).await?; }
+        MetaBackend::Redis => { cleanup_redis_metadata(vm, &gateway).await?; }
+        MetaBackend::Sqlite => {}
+    }
+
+    // Note: unattended-upgrades cleanup and swap creation are handled entirely
+    // by the shell script (xfstests_slayer.sh / install_xfstests_deps).
+    upload_xfstests_assets(vm, persistence_bin, backend, &gateway).await?;
 
     let host_artifact_dir = xfstests_host_artifact_dir();
-    let xfstests_cases =
-        std::env::var("SLAYERFS_XFSTESTS_CASES").unwrap_or_else(|_| "generic/001".to_string());
-    // Fallback repo/branch only used when the prebuilt tarball is absent and
-    // XFSTESTS_FORCE_RECLONE=1 is set explicitly by the caller.
+    // When SLAYERFS_XFSTESTS_CASES is not set, the shell script runs the full
+    // xfstests/generic suite with exclusions from xfstests_slayer.exclude.
+    // Set the env var to restrict to specific cases, e.g. "generic/001 generic/002".
+    let xfstests_cases = std::env::var("SLAYERFS_XFSTESTS_CASES").ok();
     let xfstests_repo = std::env::var("SLAYERFS_XFSTESTS_REPO")
         .unwrap_or_else(|_| "https://gitee.com/anolis/xfstests-dev.git".to_string());
     let xfstests_branch =
@@ -838,22 +1243,28 @@ async fn run_xfstests_in_vm(vm: &mut Machine, persistence_bin: &Path) -> Result<
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(90 * 60);
-    // Default: use prebuilt tarball (XFSTESTS_PREBUILT_TAR=1 in the shell script).
-    // The VM disk is always clean (clear: true), so FORCE_RECLONE defaults to 0.
     let force_reclone = std::env::var("SLAYERFS_XFSTESTS_FORCE_RECLONE")
         .unwrap_or_else(|_| "0".to_string());
 
+    // Only pass XFSTESTS_CASES when explicitly requested; otherwise the shell
+    // script runs the full suite with -E xfstests_slayer.exclude.
+    let cases_env = match &xfstests_cases {
+        Some(c) => format!("XFSTESTS_CASES={}", shell_quote(c)),
+        None => String::new(),
+    };
+
+    let config_in_vm = backend.xfstests_config_in_vm();
     let cmd = format!(
         "env SLAYERFS_BIN_PATH={bin} SLAYERFS_CONFIG_PATH={cfg} SLAYERFS_LOG_FILE={log} \
-XFSTESTS_REPO={repo} XFSTESTS_BRANCH={branch} XFSTESTS_DIR={dir} XFSTESTS_CASES={cases} \
-XFSTESTS_FORCE_RECLONE={force_reclone} XFSTESTS_INSTALL_DEPS=1 {script}",
+XFSTESTS_REPO={repo} XFSTESTS_BRANCH={branch} XFSTESTS_DIR={dir} {cases_env} \
+XFSTESTS_FORCE_RECLONE={force_reclone} XFSTESTS_INSTALL_DEPS=0 {script}",
         bin = shell_quote(XFSTESTS_BIN_IN_VM),
-        cfg = shell_quote(XFSTESTS_CONFIG_IN_VM),
+        cfg = shell_quote(&config_in_vm),
         log = shell_quote(SLAYERFS_LOG_PATH),
         repo = shell_quote(&xfstests_repo),
         branch = shell_quote(&xfstests_branch),
         dir = shell_quote(XFSTESTS_REMOTE_DIR),
-        cases = shell_quote(&xfstests_cases),
+        cases_env = cases_env,
         force_reclone = shell_quote(&force_reclone),
         script = shell_quote(XFSTESTS_SCRIPT_IN_VM),
     );
@@ -876,16 +1287,52 @@ XFSTESTS_FORCE_RECLONE={force_reclone} XFSTESTS_INSTALL_DEPS=1 {script}",
     Ok(host_artifact_dir)
 }
 
+// ---------------------------------------------------------------------------
+// Basic KVM tests — one per metadata backend
+// ---------------------------------------------------------------------------
+
 #[tokio::test]
 #[ignore]
-async fn test_slayerfs_kvm() -> Result<()> {
+async fn test_slayerfs_kvm_sqlite() -> Result<()> {
     let slayerfs_bin = get_slayerfs_binary_path()?;
-    start_vm_and_run(slayerfs_bin).await
+    start_vm_and_run(slayerfs_bin, MetaBackend::Sqlite).await
 }
 
 #[tokio::test]
 #[ignore]
-async fn test_slayerfs_kvm_xfstests() -> Result<()> {
+async fn test_slayerfs_kvm_redis() -> Result<()> {
+    let slayerfs_bin = get_slayerfs_binary_path()?;
+    start_vm_and_run(slayerfs_bin, MetaBackend::Redis).await
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_slayerfs_kvm_etcd() -> Result<()> {
+    let slayerfs_bin = get_slayerfs_binary_path()?;
+    start_vm_and_run(slayerfs_bin, MetaBackend::Etcd).await
+}
+
+// ---------------------------------------------------------------------------
+// xfstests KVM tests — one per metadata backend
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn test_slayerfs_kvm_xfstests_sqlite() -> Result<()> {
     let persistence_bin = get_persistence_demo_path()?;
-    start_vm_and_run_xfstests(persistence_bin).await
+    start_vm_and_run_xfstests(persistence_bin, MetaBackend::Sqlite).await
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_slayerfs_kvm_xfstests_redis() -> Result<()> {
+    let persistence_bin = get_persistence_demo_path()?;
+    start_vm_and_run_xfstests(persistence_bin, MetaBackend::Redis).await
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_slayerfs_kvm_xfstests_etcd() -> Result<()> {
+    let persistence_bin = get_persistence_demo_path()?;
+    start_vm_and_run_xfstests(persistence_bin, MetaBackend::Etcd).await
 }
