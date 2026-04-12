@@ -12,7 +12,7 @@ services:
       --name etcd-single
       --data-dir /etcd-data
       --listen-client-urls http://0.0.0.0:2379
-      --advertise-client-urls http://127.0.0.1:2379
+      --advertise-client-urls http://etcd:2379
       --listen-peer-urls http://0.0.0.0:2380
       --initial-advertise-peer-urls http://127.0.0.1:2380
       --initial-cluster etcd-single=http://127.0.0.1:2380
@@ -63,6 +63,29 @@ services:
       retries: 10
     networks:
       - slayerfs-network
+
+  slayerfs:
+    build:
+      context: ..
+      dockerfile: slayerfs/Dockerfile
+    container_name: slayerfs-test
+    privileged: true
+    devices:
+      - /dev/fuse:/dev/fuse
+    depends_on:
+      - redis
+    volumes:
+      - slayerfs-data:/var/lib/slayerfs/data
+      - slayerfs-results:/opt/slayerfs/results
+    environment:
+      - RUST_LOG=slayerfs=info
+    command: ["-c", "/opt/slayerfs/redis-docker.yml", "-s", "/var/lib/slayerfs/data", "-m", "/mnt/slayerfs"]
+    networks:
+      - slayerfs-network
+
+volumes:
+  slayerfs-data:
+  slayerfs-results:
 
 networks:
   slayerfs-network:

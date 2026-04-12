@@ -1,0 +1,6 @@
+# Redis backend for Docker deployment
+database:
+  type: redis
+  url: "redis://redis:6379/0"
+cache:
+  enabled: true
