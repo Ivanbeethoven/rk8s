@@ -113,16 +113,27 @@ async fn detect_gateway(vm: &mut Machine) -> Result<String> {
 /// or we use the bundled approach via curl).
 async fn cleanup_etcd_metadata(vm: &mut Machine, gateway: &str) -> Result<()> {
     // Install etcdctl if not available (lightweight static binary).
-    let has_etcdctl = exec_check(vm, "command -v etcdctl >/dev/null 2>&1 && echo OK || echo NO")
-        .await
-        .map(|s| s.trim() == "OK")
-        .unwrap_or(false);
+    let has_etcdctl = exec_check(
+        vm,
+        "command -v etcdctl >/dev/null 2>&1 && echo OK || echo NO",
+    )
+    .await
+    .map(|s| s.trim() == "OK")
+    .unwrap_or(false);
 
     let endpoint = format!("http://{}:2379", gateway);
 
     if has_etcdctl {
         let prefixes = [
-            "slayerfs:", "f:", "r:", "c:", "p:", "l:", "session:", "session_info:", "slices/",
+            "slayerfs:",
+            "f:",
+            "r:",
+            "c:",
+            "p:",
+            "l:",
+            "session:",
+            "session_info:",
+            "slices/",
         ];
         for prefix in prefixes {
             let cmd = format!(
@@ -144,11 +155,13 @@ async fn cleanup_etcd_metadata(vm: &mut Machine, gateway: &str) -> Result<()> {
 /// Clean up redis metadata before a new test run.
 async fn cleanup_redis_metadata(vm: &mut Machine, gateway: &str) -> Result<()> {
     // Try redis-cli if available, otherwise use raw TCP.
-    let has_redis_cli =
-        exec_check(vm, "command -v redis-cli >/dev/null 2>&1 && echo OK || echo NO")
-            .await
-            .map(|s| s.trim() == "OK")
-            .unwrap_or(false);
+    let has_redis_cli = exec_check(
+        vm,
+        "command -v redis-cli >/dev/null 2>&1 && echo OK || echo NO",
+    )
+    .await
+    .map(|s| s.trim() == "OK")
+    .unwrap_or(false);
 
     if has_redis_cli {
         let cmd = format!("sh -lc 'redis-cli -h {gateway} -p 6379 FLUSHALL'");
@@ -167,9 +180,17 @@ async fn cleanup_redis_metadata(vm: &mut Machine, gateway: &str) -> Result<()> {
 /// For SQLite the URL is local; for Redis/Etcd it points to `gateway`.
 fn generate_backend_config(backend: MetaBackend, gateway: &str) -> String {
     let db_section = match backend {
-        MetaBackend::Sqlite => "database:\n  type: sqlite\n  url: \"sqlite:///tmp/slayerfs/metadata.db\"".to_string(),
-        MetaBackend::Redis => format!("database:\n  type: redis\n  url: \"redis://{}:6379/0\"", gateway),
-        MetaBackend::Etcd => format!("database:\n  type: etcd\n  urls:\n    - \"http://{}:2379\"", gateway),
+        MetaBackend::Sqlite => {
+            "database:\n  type: sqlite\n  url: \"sqlite:///tmp/slayerfs/metadata.db\"".to_string()
+        }
+        MetaBackend::Redis => format!(
+            "database:\n  type: redis\n  url: \"redis://{}:6379/0\"",
+            gateway
+        ),
+        MetaBackend::Etcd => format!(
+            "database:\n  type: etcd\n  urls:\n    - \"http://{}:2379\"",
+            gateway
+        ),
     };
     format!(
         "{}\n\ncache:\n  enabled: true\n  capacity:\n    inode: 10000\n    path: 5000\n  ttl:\n    inode_ttl: 10.0\n    path_ttl: 10.0\n",
@@ -393,9 +414,13 @@ async fn install_deps(vm: &mut Machine) -> Result<()> {
                 fuse3_bundle_dir
             );
             // Fall back: kill UA first to reduce OOM risk, then apt-get.
-            let _ = exec_check(vm, "\
+            let _ = exec_check(
+                vm,
+                "\
                 pkill -9 -f 'unattended' 2>/dev/null || true; \
-                pkill -9 -x apt-get 2>/dev/null || true").await;
+                pkill -9 -x apt-get 2>/dev/null || true",
+            )
+            .await;
             exec_check(vm, "MALLOC_ARENA_MAX=1 apt-get update -qq").await?;
             exec_check(
                 vm,
@@ -483,7 +508,11 @@ async fn assert_not_mounted(vm: &mut Machine) -> Result<()> {
     Ok(())
 }
 
-async fn run_slayerfs_mount_root(vm: &mut Machine, backend: MetaBackend, meta_url: &str) -> Result<()> {
+async fn run_slayerfs_mount_root(
+    vm: &mut Machine,
+    backend: MetaBackend,
+    meta_url: &str,
+) -> Result<()> {
     exec_check(
         vm,
         &format!("rm -f {log} && touch {log}", log = SLAYERFS_LOG_PATH),
@@ -543,7 +572,11 @@ async fn run_slayerfs_mount_root(vm: &mut Machine, backend: MetaBackend, meta_ur
     // Build the mount command with backend-specific CLI arguments.
     let meta_args = match backend {
         MetaBackend::Sqlite | MetaBackend::Redis => {
-            format!("--meta-backend {} --meta-url '{}'", backend.cli_backend(), meta_url)
+            format!(
+                "--meta-backend {} --meta-url '{}'",
+                backend.cli_backend(),
+                meta_url
+            )
         }
         MetaBackend::Etcd => {
             format!("--meta-backend etcd --meta-etcd-urls '{}'", meta_url)
@@ -793,7 +826,11 @@ async fn run_in_vm(vm: &mut Machine, slayerfs_bin: &Path, backend: MetaBackend) 
 async fn start_vm_and_run(slayerfs_bin: PathBuf, backend: MetaBackend) -> Result<()> {
     tracing_subscriber_init();
 
-    tracing::info!("using slayerfs binary at {:?}, backend={}", slayerfs_bin, backend.as_str());
+    tracing::info!(
+        "using slayerfs binary at {:?}, backend={}",
+        slayerfs_bin,
+        backend.as_str()
+    );
 
     // Use a flag that is set to true only after run_in_vm returns Ok.
     // This lets us distinguish "test passed but shutdown panicked (qlean bug)"
@@ -850,10 +887,7 @@ async fn start_vm_and_run(slayerfs_bin: PathBuf, backend: MetaBackend) -> Result
                 Ok(())
             } else {
                 let msg = format!("{:?}", panic_val);
-                anyhow::bail!(
-                    "test panicked before run_in_vm could complete: {}",
-                    msg
-                )
+                anyhow::bail!("test panicked before run_in_vm could complete: {}", msg)
             }
         }
         Err(thread_err) => anyhow::bail!("test thread error: {:?}", thread_err),
@@ -863,7 +897,11 @@ async fn start_vm_and_run(slayerfs_bin: PathBuf, backend: MetaBackend) -> Result
 async fn start_vm_and_run_xfstests(persistence_bin: PathBuf, backend: MetaBackend) -> Result<()> {
     tracing_subscriber_init();
 
-    tracing::info!("using persistence_demo binary at {:?}, backend={}", persistence_bin, backend.as_str());
+    tracing::info!(
+        "using persistence_demo binary at {:?}, backend={}",
+        persistence_bin,
+        backend.as_str()
+    );
 
     let artifact_dir_holder: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -895,10 +933,7 @@ async fn start_vm_and_run_xfstests(persistence_bin: PathBuf, backend: MetaBacken
                     Box::pin(async move {
                         let artifact_dir =
                             run_xfstests_in_vm(vm, persistence_bin.as_ref(), backend).await?;
-                        tracing::info!(
-                            "xfstests artifacts stored at {}",
-                            artifact_dir.display()
-                        );
+                        tracing::info!("xfstests artifacts stored at {}", artifact_dir.display());
                         *holder.lock().unwrap() = Some(artifact_dir);
                         Ok(())
                     })
@@ -939,46 +974,145 @@ async fn start_vm_and_run_xfstests(persistence_bin: PathBuf, backend: MetaBacken
 
 /// Inspect the xfstests result artifacts to determine pass/fail.
 fn check_xfstests_outcome(artifact_dir: &Path) -> Result<()> {
+    let artifact_debug = dump_xfstests_artifact_summary(artifact_dir);
+
     // Look for the check.out file which contains the summary line.
     let check_out = artifact_dir.join("results/check.out");
     if check_out.exists() {
-        let content = std::fs::read_to_string(&check_out)
-            .with_context(|| format!("read {:?}", check_out))?;
+        let content =
+            std::fs::read_to_string(&check_out).with_context(|| format!("read {:?}", check_out))?;
         // check.out ends with "Passed all N tests" or similar on success.
         if content.contains("Passed all") {
-            tracing::info!("xfstests outcome: PASS (from check.out):\n{}", content.trim());
+            tracing::info!(
+                "xfstests outcome: PASS (from check.out):\n{}",
+                content.trim()
+            );
             return Ok(());
         }
         if content.contains("Failures:") || content.contains("failed") {
-            anyhow::bail!("xfstests reported failures:\n{}", content);
+            anyhow::bail!("xfstests reported failures:\n{}\n\n{}", content, artifact_debug);
         }
     }
     // Fall back to check if the results dir has any .out.bad files (failures).
     let results_dir = artifact_dir.join("results");
-    if let Ok(rd) = std::fs::read_dir(&results_dir) {
-        let bad: Vec<_> = rd
-            .flatten()
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map(|x| x == "bad")
-                    .unwrap_or(false)
-            })
-            .collect();
+    if results_dir.exists() {
+        let mut bad = Vec::new();
+        collect_files_with_suffix(&results_dir, ".out.bad", &mut bad);
         if bad.is_empty() {
             tracing::info!("xfstests outcome: no .out.bad files found, treating as PASS");
             return Ok(());
         }
         anyhow::bail!(
-            "xfstests failed: found {} .out.bad file(s): {:?}",
+            "xfstests failed: found {} .out.bad file(s): {:?}\n\n{}",
             bad.len(),
-            bad.iter().map(|e| e.path()).collect::<Vec<_>>()
+            bad,
+            artifact_debug
         );
     }
     anyhow::bail!(
-        "xfstests outcome unknown: no check.out or results dir found at {:?}",
-        artifact_dir
+        "xfstests outcome unknown: no check.out or results dir found at {:?}\n\n{}",
+        artifact_dir,
+        artifact_debug
     )
+}
+
+fn tail_text_lines(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    let mut out = lines[start..].join("\n");
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn append_host_file_tail(output: &mut String, title: &str, path: &Path, max_lines: usize) {
+    output.push_str("\n=== ");
+    output.push_str(title);
+    output.push_str(" ===\n");
+
+    match std::fs::read_to_string(path) {
+        Ok(content) => output.push_str(&tail_text_lines(&content, max_lines)),
+        Err(err) if path.exists() => {
+            output.push_str(&format!("failed to read {}: {}\n", path.display(), err));
+        }
+        Err(_) => {
+            output.push_str(&format!("missing: {}\n", path.display()));
+        }
+    }
+}
+
+fn collect_files_with_suffix(root: &Path, suffix: &str, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_with_suffix(&path, suffix, out);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.ends_with(suffix))
+            .unwrap_or(false)
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn dump_xfstests_artifact_summary(host_dir: &Path) -> String {
+    let mut output = String::new();
+    output.push_str("=== host xfstests artifacts ===\n");
+    output.push_str(&format!("artifact_dir: {}\n", host_dir.display()));
+
+    append_host_file_tail(
+        &mut output,
+        "host slayerfs log (tail)",
+        &host_dir.join("slayerfs.log"),
+        300,
+    );
+    append_host_file_tail(
+        &mut output,
+        "host xfstests script log (tail)",
+        &host_dir.join("xfstests-script.log"),
+        300,
+    );
+    append_host_file_tail(
+        &mut output,
+        "host xfstests local.config",
+        &host_dir.join("local.config"),
+        200,
+    );
+    append_host_file_tail(
+        &mut output,
+        "host xfstests check.log (tail)",
+        &host_dir.join("results/check.log"),
+        300,
+    );
+    append_host_file_tail(
+        &mut output,
+        "host xfstests check.out (tail)",
+        &host_dir.join("results/check.out"),
+        300,
+    );
+
+    let mut out_bad_files = Vec::new();
+    collect_files_with_suffix(&host_dir.join("results"), ".out.bad", &mut out_bad_files);
+    out_bad_files.sort();
+
+    output.push_str("\n=== host xfstests .out.bad files ===\n");
+    if out_bad_files.is_empty() {
+        output.push_str("none\n");
+    } else {
+        for path in out_bad_files {
+            output.push_str(&format!("{}\n", path.display()));
+            append_host_file_tail(&mut output, &format!("tail {}", path.display()), &path, 200);
+        }
+    }
+
+    output
 }
 
 async fn run_full(vm: &mut Machine, slayerfs_bin: &Path, backend: MetaBackend) -> Result<()> {
@@ -1069,7 +1203,12 @@ async fn upload_slayerfs(vm: &mut Machine, slayerfs_bin: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn upload_xfstests_assets(vm: &mut Machine, persistence_bin: &Path, backend: MetaBackend, gateway: &str) -> Result<()> {
+async fn upload_xfstests_assets(
+    vm: &mut Machine,
+    persistence_bin: &Path,
+    backend: MetaBackend,
+    gateway: &str,
+) -> Result<()> {
     let manifest_dir =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").context("CARGO_MANIFEST_DIR not set")?);
     let script = manifest_dir.join("tests/scripts/xfstests_slayer.sh");
@@ -1091,21 +1230,45 @@ async fn upload_xfstests_assets(vm: &mut Machine, persistence_bin: &Path, backen
     let stripped_persistence_bin = {
         let tmp_dir = tempfile::TempDir::new().context("create temp dir for stripped binary")?;
         let tmp_path = tmp_dir.path().join("persistence_demo");
+        let original_size_mb = std::fs::metadata(persistence_bin)
+            .map(|m| m.len() / 1_000_000)
+            .unwrap_or(0);
         // Keep the TempDir alive until upload is done.
-        let status = std::process::Command::new("strip")
+        let strip_result = std::process::Command::new("strip")
             .arg("--strip-debug")
             .arg(persistence_bin)
             .arg("-o")
             .arg(&tmp_path)
-            .status()
-            .context("run strip")?;
-        if !status.success() {
-            tracing::warn!("strip failed; uploading unstripped binary ({}MB)", std::fs::metadata(persistence_bin).map(|m| m.len() / 1_000_000).unwrap_or(0));
-            (persistence_bin.to_path_buf(), None::<tempfile::TempDir>)
-        } else {
-            let sz = std::fs::metadata(&tmp_path).map(|m| m.len() / 1_000_000).unwrap_or(0);
-            tracing::info!("stripped persistence_demo: {}MB → {}MB", std::fs::metadata(persistence_bin).map(|m| m.len() / 1_000_000).unwrap_or(0), sz);
-            (tmp_path, Some(tmp_dir))
+            .status();
+        let use_unstripped = || (persistence_bin.to_path_buf(), None::<tempfile::TempDir>);
+        match strip_result {
+            Ok(status) if status.success() => {
+                let stripped_size_mb = std::fs::metadata(&tmp_path)
+                    .map(|m| m.len() / 1_000_000)
+                    .unwrap_or(0);
+                tracing::info!(
+                    "stripped persistence_demo: {}MB → {}MB",
+                    original_size_mb,
+                    stripped_size_mb
+                );
+                (tmp_path, Some(tmp_dir))
+            }
+            Ok(status) => {
+                tracing::warn!(
+                    "strip exited with status {:?}; uploading unstripped binary ({}MB)",
+                    status.code(),
+                    original_size_mb
+                );
+                use_unstripped()
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "strip is unavailable ({}); uploading unstripped binary ({}MB)",
+                    error,
+                    original_size_mb
+                );
+                use_unstripped()
+            }
         }
     };
 
@@ -1135,15 +1298,18 @@ async fn upload_xfstests_assets(vm: &mut Machine, persistence_bin: &Path, backen
 
     // Upload all prebuilt tarballs found in the repo directory.
     if prebuilt_dir.is_dir() {
-        let mut rd = tokio::fs::read_dir(&prebuilt_dir).await.with_context(|| {
-            format!("read prebuilt dir {:?}", prebuilt_dir)
-        })?;
+        let mut rd = tokio::fs::read_dir(&prebuilt_dir)
+            .await
+            .with_context(|| format!("read prebuilt dir {:?}", prebuilt_dir))?;
         while let Some(entry) = rd.next_entry().await? {
             let p = entry.path();
             if p.extension().map(|e| e == "gz").unwrap_or(false) {
-                vm.upload(&p, Path::new(&format!("{XFSTESTS_STAGE_DIR}/xfstests-prebuilt")))
-                    .await
-                    .with_context(|| format!("upload prebuilt tarball {:?}", p))?;
+                vm.upload(
+                    &p,
+                    Path::new(&format!("{XFSTESTS_STAGE_DIR}/xfstests-prebuilt")),
+                )
+                .await
+                .with_context(|| format!("upload prebuilt tarball {:?}", p))?;
                 tracing::info!("uploaded prebuilt xfstests tarball: {:?}", p);
             }
         }
@@ -1171,6 +1337,9 @@ async fn upload_xfstests_assets(vm: &mut Machine, persistence_bin: &Path, backen
 
 async fn dump_xfstests_debug_info(vm: &mut Machine) -> Result<String> {
     let mut s = dump_debug_info(vm).await?;
+
+    s.push_str("\n=== xfstests script log (tail) ===\n");
+    s.push_str(&get_file_tail(vm, "/tmp/xfstests-script.log", 300).await?);
 
     s.push_str("\n=== xfstests local.config ===\n");
     s.push_str(&exec_check(vm, "cat /tmp/xfstests-dev/local.config 2>/dev/null || true").await?);
@@ -1203,7 +1372,10 @@ async fn collect_xfstests_artifacts(vm: &mut Machine, host_dir: &Path) -> Result
             host_dir.join("local.config"),
         ),
         ("/tmp/xfstests-dev/results", host_dir.join("results")),
-        ("/tmp/xfstests-script.log", host_dir.join("xfstests-script.log")),
+        (
+            "/tmp/xfstests-script.log",
+            host_dir.join("xfstests-script.log"),
+        ),
     ];
 
     for (remote, local) in artifacts {
@@ -1215,14 +1387,24 @@ async fn collect_xfstests_artifacts(vm: &mut Machine, host_dir: &Path) -> Result
     Ok(())
 }
 
-async fn run_xfstests_in_vm(vm: &mut Machine, persistence_bin: &Path, backend: MetaBackend) -> Result<PathBuf> {
+async fn run_xfstests_in_vm(
+    vm: &mut Machine,
+    persistence_bin: &Path,
+    backend: MetaBackend,
+) -> Result<PathBuf> {
     // Detect the host gateway for non-SQLite backends.
-    let gateway = detect_gateway(vm).await.unwrap_or_else(|_| "127.0.0.1".to_string());
+    let gateway = detect_gateway(vm)
+        .await
+        .unwrap_or_else(|_| "127.0.0.1".to_string());
 
     // Clean up metadata from any previous run.
     match backend {
-        MetaBackend::Etcd => { cleanup_etcd_metadata(vm, &gateway).await?; }
-        MetaBackend::Redis => { cleanup_redis_metadata(vm, &gateway).await?; }
+        MetaBackend::Etcd => {
+            cleanup_etcd_metadata(vm, &gateway).await?;
+        }
+        MetaBackend::Redis => {
+            cleanup_redis_metadata(vm, &gateway).await?;
+        }
         MetaBackend::Sqlite => {}
     }
 
@@ -1243,8 +1425,8 @@ async fn run_xfstests_in_vm(vm: &mut Machine, persistence_bin: &Path, backend: M
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(90 * 60);
-    let force_reclone = std::env::var("SLAYERFS_XFSTESTS_FORCE_RECLONE")
-        .unwrap_or_else(|_| "0".to_string());
+    let force_reclone =
+        std::env::var("SLAYERFS_XFSTESTS_FORCE_RECLONE").unwrap_or_else(|_| "0".to_string());
 
     // Only pass XFSTESTS_CASES when explicitly requested; otherwise the shell
     // script runs the full suite with -E xfstests_slayer.exclude.
@@ -1271,15 +1453,17 @@ XFSTESTS_FORCE_RECLONE={force_reclone} XFSTESTS_INSTALL_DEPS=0 {script}",
 
     let run_result = exec_check_timed(vm, &cmd, Duration::from_secs(timeout_secs)).await;
     let _ = collect_xfstests_artifacts(vm, &host_artifact_dir).await;
+    let artifact_debug = dump_xfstests_artifact_summary(&host_artifact_dir);
 
     if let Err(err) = run_result {
         let dbg = dump_xfstests_debug_info(vm)
             .await
             .unwrap_or_else(|e| e.to_string());
         anyhow::bail!(
-            "{}\n\nartifacts: {}\n\n{}",
+            "{}\n\nartifacts: {}\n\n{}\n\n{}",
             err,
             host_artifact_dir.display(),
+            artifact_debug,
             dbg
         );
     }

@@ -2018,14 +2018,14 @@ impl MetaStore for RedisMetaStore {
             local last_updated = redis.call("HGET",key,field)
 
             if last_updated == false then
-                redis.call("HSET",key,field,new_value)
+                redis.call("HSET",key,field,now_time)
                 return true
             else
                 last_updated = tonumber(last_updated)
                 if now_time < last_updated + diff then
                     return false
                 else
-                    redis.call('HSET', key,field, new_value)
+                    redis.call('HSET', key,field, now_time)
                     return true
                 end
             end

@@ -91,6 +91,25 @@ install_xfstests_deps() {
     fi
 }
 
+validate_prebuilt_tar() {
+    local tar_path="$1"
+    local lfs_pointer_header='version https://git-lfs.github.com/spec/v1'
+
+    if gzip -t "$tar_path" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "[xfstests] Invalid prebuilt tarball: $tar_path"
+    if head -n 1 "$tar_path" 2>/dev/null | grep -Fqx "$lfs_pointer_header"; then
+        echo "[xfstests] The file looks like a Git LFS pointer, not the real archive."
+        echo "[xfstests] Fetch Git LFS objects before running tests. In GitHub Actions, run 'git lfs pull' or enable LFS checkout."
+    else
+        echo "[xfstests] The file is not a valid gzip archive."
+    fi
+
+    return 1
+}
+
 prepare_xfstests_tree() {
     # Prefer a prebuilt tarball (stored in the repo via git lfs) to avoid slow
     # network clone+compile during test runs.  The tarball is expected to be
@@ -115,6 +134,17 @@ prepare_xfstests_tree() {
         if [[ -z "$prebuilt_tar" ]]; then
             echo "[xfstests] No prebuilt tarball found under ${script_dir}/xfstests-prebuilt/, falling back to clone+build."
             use_prebuilt="0"
+        fi
+    fi
+
+    if [[ "$use_prebuilt" == "1" ]]; then
+        if ! validate_prebuilt_tar "$prebuilt_tar"; then
+            if [[ "$install_deps" == "1" ]]; then
+                echo "[xfstests] Falling back to clone+build because the prebuilt tarball is unusable."
+                use_prebuilt="0"
+            else
+                exit 1
+            fi
         fi
     fi
 

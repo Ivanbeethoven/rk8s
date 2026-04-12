@@ -33,6 +33,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
+            git-lfs \
             fuse3 \
             pkg-config \
             libssl-dev \
@@ -42,6 +43,13 @@ jobs:
             libvirt-clients \
             guestfish \
             xorriso
+
+      - name: Fetch LFS assets for KVM tests
+        env:
+          LFS_ASSETS: project/slayerfs/tests/scripts/fuse3-bundle/fusermount3
+        run: |
+          git lfs install --local
+          git lfs pull --include="$LFS_ASSETS"
 
       - name: Start backend services
         run: |
@@ -57,11 +65,19 @@ jobs:
         run: |
           cd project
           cargo build -p slayerfs
+          failed_backends=()
           for backend in sqlite redis etcd; do
             echo "=== KVM basic test: $backend ==="
-            cargo test -p slayerfs --test test_slayerfs_kvm_integration \
-              "test_slayerfs_kvm_${backend}" -- --ignored --nocapture --exact || true
+            if ! cargo test -p slayerfs --test test_slayerfs_kvm_integration \
+              "test_slayerfs_kvm_${backend}" -- --ignored --nocapture --exact; then
+              failed_backends+=("$backend")
+            fi
           done
+
+          if [[ ${#failed_backends[@]} -gt 0 ]]; then
+            echo "KVM basic tests failed for backends: ${failed_backends[*]}"
+            exit 1
+          fi
 
       - name: Stop backend services
         if: always()
@@ -134,6 +150,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
+            git-lfs \
             fuse3 \
             libfuse3-dev \
             pkg-config \
@@ -146,6 +163,13 @@ jobs:
             guestfish \
             xorriso
           protoc --version
+
+      - name: Fetch LFS assets for xfstests
+        env:
+          LFS_ASSETS: project/slayerfs/tests/scripts/xfstests-prebuilt/*.tar.gz,project/slayerfs/tests/scripts/fuse3-bundle/fusermount3
+        run: |
+          git lfs install --local
+          git lfs pull --include="$LFS_ASSETS"
 
       - name: Start backend services
         if: matrix.backend != 'sqlite'
@@ -172,6 +196,19 @@ jobs:
         if: always()
         run: |
           ARTIFACT_ROOT="/tmp/slayerfs-kvm-xfstests/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.backend }}"
+          append_summary_block() {
+            local title="$1"
+            local file_path="$2"
+            if [[ ! -f "$file_path" ]]; then
+              return
+            fi
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### $title" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            tail -n 300 "$file_path" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          }
+
           echo "## xfstests results (${{ matrix.backend }})" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
@@ -181,6 +218,30 @@ jobs:
             echo "No artifact directory found under $ARTIFACT_ROOT" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+
+          echo "Artifact directory: $LATEST" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::group::xfstests artifact dump (${{ matrix.backend }})"
+          for file_path in \
+            "$LATEST/xfstests-script.log" \
+            "$LATEST/slayerfs.log" \
+            "$LATEST/local.config" \
+            "$LATEST/results/check.log" \
+            "$LATEST/results/check.out"; do
+            if [[ -f "$file_path" ]]; then
+              echo "=== ${file_path#$LATEST/} ==="
+              cat "$file_path"
+              echo
+            fi
+          done
+
+          while IFS= read -r bad_file; do
+            [[ -n "$bad_file" ]] || continue
+            echo "=== ${bad_file#$LATEST/} ==="
+            cat "$bad_file"
+            echo
+          done < <(find "$LATEST/results" -name '*.out.bad' 2>/dev/null | sort)
+          echo "::endgroup::"
 
           CHECK_OUT="$LATEST/results/check.out"
           if [[ -f "$CHECK_OUT" ]]; then
@@ -200,6 +261,10 @@ jobs:
             find "$LATEST/results" -name '*.out.bad' -exec basename {} .out.bad \; | sort >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
           fi
+
+          append_summary_block "xfstests script log tail" "$LATEST/xfstests-script.log"
+          append_summary_block "slayerfs log tail" "$LATEST/slayerfs.log"
+          append_summary_block "xfstests check.log tail" "$LATEST/results/check.log"
 
       - name: Stop backend services
         if: always() && matrix.backend != 'sqlite'
