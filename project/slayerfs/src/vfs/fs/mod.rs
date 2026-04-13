@@ -8,11 +8,12 @@ use crate::meta::config::MetaClientConfig;
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
 use crate::meta::store::{AclRule, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot};
 use dashmap::{DashMap, Entry};
+use rfuse3::notify::Notify as FuseNotify;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 // Re-export types from meta::store for convenience
 pub use crate::meta::store::{DirEntry, FileAttr, FileType};
@@ -253,6 +254,7 @@ where
 {
     core: Arc<VfsCore<S, M>>,
     state: Arc<VfsState<S, M>>,
+    fuse_notify: Arc<RwLock<Option<FuseNotify>>>,
 }
 
 impl<S, M> Clone for VFS<S, M>
@@ -264,6 +266,7 @@ where
         Self {
             core: Arc::clone(&self.core),
             state: Arc::clone(&self.state),
+            fuse_notify: Arc::clone(&self.fuse_notify),
         }
     }
 }
@@ -328,7 +331,29 @@ where
         let config = Arc::new(config);
         let state = Arc::new(VfsState::new(config, backend));
 
-        Ok(Self { core, state })
+        Ok(Self {
+            core,
+            state,
+            fuse_notify: Arc::new(RwLock::new(None)),
+        })
+    }
+
+    pub async fn set_fuse_notify(&self, notify: FuseNotify) {
+        *self.fuse_notify.write().await = Some(notify);
+    }
+
+    pub async fn invalidate_entry_cache(&self, parent: u64, name: &str) {
+        let notify = self.fuse_notify.read().await.clone();
+        if let Some(notify) = notify {
+            notify.invalid_entry(parent, name.into()).await;
+        }
+    }
+
+    pub async fn invalidate_inode_cache(&self, inode: u64) {
+        let notify = self.fuse_notify.read().await.clone();
+        if let Some(notify) = notify {
+            notify.invalid_inode(inode, 0, 0).await;
+        }
     }
 
     pub(crate) fn root_ino(&self) -> i64 {

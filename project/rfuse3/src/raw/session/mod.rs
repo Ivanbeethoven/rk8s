@@ -93,9 +93,16 @@ use crate::{MountOptions, SetAttr};
 #[derive(Debug)]
 pub struct MountHandle {
     inner: Option<MountHandleInner>,
+    notify: Notify,
 }
 
 impl MountHandle {
+    /// Returns a clonable notifier that can be used to send kernel cache invalidation
+    /// notifications after normal filesystem mutations.
+    pub fn notify(&self) -> Notify {
+        self.notify.clone()
+    }
+
     pub async fn unmount(mut self) -> IoResult<()> {
         self.inner
             .take()
@@ -372,10 +379,14 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         }
     }
 
-    /// get a [`notify`].
+    /// Returns a clonable notifier for emitting kernel notifications.
+    ///
+    /// Filesystem implementations can hold this handle and issue explicit metadata-cache
+    /// invalidations (for example after create/rename/unlink/setattr) from ordinary callback
+    /// paths.
     ///
     /// [`notify`]: Notify
-    fn get_notify(&self) -> Notify {
+    pub fn notify(&self) -> Notify {
         Notify::new(self.response_sender.clone())
     }
 }
@@ -441,6 +452,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         self.fuse_connection.replace(Arc::new(fuse_connection));
 
         self.filesystem.replace(Arc::new(fs));
+        let session_notify = self.notify();
 
         debug!("mount {:?} success", mount_path);
 
@@ -451,6 +463,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 destroy_notify: notify,
                 unprivileged: true,
             }),
+            notify: session_notify,
         })
     }
 
@@ -476,6 +489,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         self.fuse_connection.replace(Arc::new(fuse_connection));
 
         self.filesystem.replace(Arc::new(fs));
+        let session_notify = self.notify();
 
         debug!("mount {:?} success", mount_path);
 
@@ -486,6 +500,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 destroy_notify: notify,
                 unprivileged: true,
             }),
+            notify: session_notify,
         })
     }
 
@@ -526,6 +541,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         self.fuse_connection.replace(Arc::new(fuse_connection));
 
         self.filesystem.replace(Arc::new(fs));
+        let session_notify = self.notify();
 
         debug!("mount {:?} success", mount_path);
 
@@ -537,6 +553,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
                 unprivileged: false,
             }),
+            notify: session_notify,
         })
     }
 
@@ -569,6 +586,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         self.fuse_connection.replace(Arc::new(fuse_connection));
 
         self.filesystem.replace(Arc::new(fs));
+        let session_notify = self.notify();
 
         debug!("mount {:?} success", mount_path);
 
@@ -578,6 +596,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
             }),
+            notify: session_notify,
         })
     }
 
@@ -662,16 +681,35 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     continue;
                 }
 
+                // Notification messages (unique=0) failures should not kill
+                // the reply loop. The kernel may return ENOENT when the
+                // inode/entry is not cached, which is benign.
+                let is_notification =
+                    reply_header.map_or(false, |(_, _, unique)| unique == 0);
+
                 if let Some((len, err_code, unique)) = reply_header {
-                    error!(
-                        error = %err,
-                        reply_len = len,
-                        reply_error = err_code,
-                        unique,
-                        "reply fuse failed"
-                    );
+                    if is_notification {
+                        warn!(
+                            error = %err,
+                            reply_len = len,
+                            notify_code = err_code,
+                            "fuse notification failed, ignoring"
+                        );
+                    } else {
+                        error!(
+                            error = %err,
+                            reply_len = len,
+                            reply_error = err_code,
+                            unique,
+                            "reply fuse failed"
+                        );
+                    }
                 } else {
                     error!("reply fuse failed {}", err);
+                }
+
+                if is_notification {
+                    continue;
                 }
 
                 return Err(err);
@@ -3892,7 +3930,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
-        let notify = self.get_notify();
+        let notify = self.notify();
 
         spawn(debug_span!("fuse_poll"), async move {
             debug!(

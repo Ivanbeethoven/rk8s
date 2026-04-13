@@ -726,6 +726,7 @@ where
         else {
             return Err(libc::ENOENT.into());
         };
+        self.invalidate_entry_cache(parent, name.as_ref()).await;
         let attr = vfs_to_fuse_attr(&vattr, &req);
         Ok(ReplyEntry {
             ttl: Duration::from_secs(1),
@@ -942,7 +943,8 @@ where
             p.push('/');
         }
         p.push_str(&name);
-        self.unlink(&p).await.map_err(Errno::from)
+        self.unlink(&p).await.map_err(Errno::from)?;
+        Ok(())
     }
 
     // Remove an empty directory
@@ -972,7 +974,8 @@ where
             p.push('/');
         }
         p.push_str(&name);
-        self.rmdir(&p).await.map_err(Errno::from)
+        self.rmdir(&p).await.map_err(Errno::from)?;
+        Ok(())
     }
 
     // Rename (files or directories)
@@ -1054,7 +1057,7 @@ where
         }
 
         VFS::rename(self, &oldp, &newp).await.map_err(|e| {
-            match e {
+            Errno::from(match e {
                 VfsError::NotFound { .. } => libc::ENOENT,
                 VfsError::AlreadyExists { .. } => libc::EEXIST,
                 VfsError::NotADirectory { .. } => libc::ENOTDIR,
@@ -1065,9 +1068,10 @@ where
                 VfsError::InvalidRenameTarget { .. } => libc::EINVAL,
                 VfsError::CrossesDevices => libc::EXDEV,
                 _ => libc::EIO,
-            }
-            .into()
-        })
+            })
+        })?;
+
+        Ok(())
     }
 
     // ===== Resource release & sync: stateless implementation, return success =====
