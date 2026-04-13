@@ -1,1 +1,12 @@
-target/
+**
+!target/
+!target/release/
+!target/release/slayerfs
+!slayerfs/
+!slayerfs/docker/
+!slayerfs/docker/Dockerfile
+!slayerfs/docker/entrypoint.sh
+!slayerfs/tests/
+!slayerfs/tests/scripts/
+!slayerfs/tests/scripts/xfstests-prebuilt/
+!slayerfs/tests/scripts/xfstests-prebuilt/xfstests-prebuilt.tar.gz

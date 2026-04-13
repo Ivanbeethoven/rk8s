@@ -78,7 +78,7 @@ cargo run -q --bin sdk_demo -- /tmp/slayerfs-objroot
 ## 🐳 Docker 镜像构建
 
 当前维护的容器流程是 `project/slayerfs/docker/Dockerfile` 对应的 SlayerFS 镜像构建。该镜像会包含：
-- 当前仓库编译得到的 `slayerfs` 主程序；
+- 宿主机构建并 strip 后的 `slayerfs` 主程序；
 - `project/slayerfs/docker/entrypoint.sh` 中的默认启动入口；
 - 从 xfstests 预构建压缩包中提取的一个辅助二进制，默认由 `XFSTESTS_BINARY` 控制。
 
@@ -92,11 +92,15 @@ git lfs pull --include="project/slayerfs/tests/scripts/xfstests-prebuilt/*.tar.g
 需要在 `rk8s` 仓库根目录执行构建，这样上下文才与 CI 中的配置一致：
 
 ```bash
+project/slayerfs/docker/build_slayerfs_host_binary.sh
+
 docker build \
 	-f project/slayerfs/docker/Dockerfile \
 	-t slayerfs:local \
 	project
 ```
+
+当前镜像要求宿主机先生成 `target/release/slayerfs`，推荐先在宿主机完成 release 构建并去除符号表，再把这个运行时二进制传给 `debian:trixie-slim` 镜像构建。
 
 如果希望换成预构建包里的其他 xfstests 工具，可以覆盖 `XFSTESTS_BINARY`：
 
@@ -112,9 +116,55 @@ docker build \
 - 入口会执行 `slayerfs mount`；
 - 本地数据后端默认目录为 `/var/lib/slayerfs/data`；
 - 元数据后端默认使用 sqlite，路径为 `/var/lib/slayerfs/metadata.db`；
-- 提取出的 xfstests 辅助二进制位于 `/opt/xfstests/bin`。
+- 提取出的 xfstests 辅助二进制位于 `/opt/xfstests/bin`；
+- 镜像声明了 `/mnt/slayerfs` 和 `/var/lib/slayerfs` 两个 volume。
+
+默认 local-fs + sqlite 运行示例：
+
+```bash
+docker run --rm \
+	--device /dev/fuse \
+	--cap-add SYS_ADMIN \
+	--security-opt apparmor=unconfined \
+	-v slayerfs-state:/var/lib/slayerfs \
+	-v slayerfs-mount:/mnt/slayerfs \
+	slayerfs:local
+```
+
+Redis 元数据后端示例：
+
+```bash
+docker run --rm \
+	--device /dev/fuse \
+	--cap-add SYS_ADMIN \
+	--security-opt apparmor=unconfined \
+	--network slayerfs_slayerfs-network \
+	-e SLAYERFS_META_BACKEND=redis \
+	-e SLAYERFS_META_URL=redis://redis:6379 \
+	-v slayerfs-data:/var/lib/slayerfs \
+	-v slayerfs-mount:/mnt/slayerfs \
+	slayerfs:local
+```
+
+Etcd 元数据后端示例：
+
+```bash
+docker run --rm \
+	--device /dev/fuse \
+	--cap-add SYS_ADMIN \
+	--security-opt apparmor=unconfined \
+	--network slayerfs_slayerfs-network \
+	-e SLAYERFS_META_BACKEND=etcd \
+	-e SLAYERFS_META_ETCD_URLS=http://etcd:2379 \
+	-v slayerfs-data:/var/lib/slayerfs \
+	-v slayerfs-mount:/mnt/slayerfs \
+	slayerfs:local
+```
+
+如果没有传入 `/dev/fuse` 和对应权限，容器仍然可以生成配置并初始化元数据后端，但会在 FUSE 挂载阶段失败。
 
 CI 中对应的是 `.github/workflows/slayerfs-docker.yml`。该工作流会在 pull request 和 `main` 分支 push 时构建同一份镜像；只有在配置了 `SLAYERFS_DOCKERHUB_REPOSITORY`、`DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN` 后，才会执行 Docker Hub 发布。
+
 
 ---
 

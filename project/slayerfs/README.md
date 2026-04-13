@@ -78,7 +78,7 @@ More: see `doc/sdk.md` and inline rustdoc.
 
 The maintained container flow is the SlayerFS image build in `project/slayerfs/docker/Dockerfile`.
 The image contains:
-- the `slayerfs` binary built from this workspace;
+- the host-built and stripped `slayerfs` binary from this workspace;
 - the default container entrypoint in `project/slayerfs/docker/entrypoint.sh`;
 - one xfstests helper binary copied from the prebuilt bundle, controlled by the `XFSTESTS_BINARY` build argument.
 
@@ -92,11 +92,15 @@ git lfs pull --include="project/slayerfs/tests/scripts/xfstests-prebuilt/*.tar.g
 Build from the `rk8s` repository root so the Docker build context matches the CI workflow:
 
 ```bash
+project/slayerfs/docker/build_slayerfs_host_binary.sh
+
 docker build \
 	-f project/slayerfs/docker/Dockerfile \
 	-t slayerfs:local \
 	project
 ```
+
+The image now expects a host-built `target/release/slayerfs` binary. The recommended flow is to build and strip the binary on the host first, then pass only that runtime artifact into the `debian:trixie-slim` image build.
 
 To copy a different tool from the prebuilt xfstests bundle, override `XFSTESTS_BINARY`:
 
@@ -112,9 +116,55 @@ Default runtime behavior:
 - entrypoint starts `slayerfs mount`;
 - local data backend uses `/var/lib/slayerfs/data`;
 - default metadata backend is sqlite at `/var/lib/slayerfs/metadata.db`;
-- the extracted xfstests helper is placed under `/opt/xfstests/bin`.
+- the extracted xfstests helper is placed under `/opt/xfstests/bin`;
+- the image declares `/mnt/slayerfs` and `/var/lib/slayerfs` as volumes.
+
+Minimal local-fs + sqlite run example:
+
+```bash
+docker run --rm \
+	--device /dev/fuse \
+	--cap-add SYS_ADMIN \
+	--security-opt apparmor=unconfined \
+	-v slayerfs-state:/var/lib/slayerfs \
+	-v slayerfs-mount:/mnt/slayerfs \
+	slayerfs:local
+```
+
+Redis metadata example:
+
+```bash
+docker run --rm \
+	--device /dev/fuse \
+	--cap-add SYS_ADMIN \
+	--security-opt apparmor=unconfined \
+	--network slayerfs_slayerfs-network \
+	-e SLAYERFS_META_BACKEND=redis \
+	-e SLAYERFS_META_URL=redis://redis:6379 \
+	-v slayerfs-data:/var/lib/slayerfs \
+	-v slayerfs-mount:/mnt/slayerfs \
+	slayerfs:local
+```
+
+Etcd metadata example:
+
+```bash
+docker run --rm \
+	--device /dev/fuse \
+	--cap-add SYS_ADMIN \
+	--security-opt apparmor=unconfined \
+	--network slayerfs_slayerfs-network \
+	-e SLAYERFS_META_BACKEND=etcd \
+	-e SLAYERFS_META_ETCD_URLS=http://etcd:2379 \
+	-v slayerfs-data:/var/lib/slayerfs \
+	-v slayerfs-mount:/mnt/slayerfs \
+	slayerfs:local
+```
+
+If `/dev/fuse` and the required container privileges are not provided, the image can still generate config and initialize metadata backends, but the FUSE mount step will fail.
 
 CI uses `.github/workflows/slayerfs-docker.yml` to build this same image on pull requests and pushes to `main`. Docker Hub publishing is only enabled when `SLAYERFS_DOCKERHUB_REPOSITORY`, `DOCKERHUB_USERNAME`, and `DOCKERHUB_TOKEN` are configured in GitHub.
+
 
 ---
 
