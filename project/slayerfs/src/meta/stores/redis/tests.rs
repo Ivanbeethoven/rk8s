@@ -140,6 +140,25 @@ impl TestSessionManager {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn test_symlink_roundtrip_and_unlink() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let dir = store.mkdir(root, "links".to_string()).await.unwrap();
+    let (ino, attr) = store.symlink(dir, "link.txt", "/target/path").await.unwrap();
+
+    assert_eq!(attr.kind, crate::meta::store::FileType::Symlink);
+    assert_eq!(attr.size, "/target/path".len() as u64);
+    assert_eq!(store.lookup(dir, "link.txt").await.unwrap(), Some(ino));
+    assert_eq!(store.read_symlink(ino).await.unwrap(), "/target/path");
+
+    store.unlink(dir, "link.txt").await.unwrap();
+    assert_eq!(store.lookup(dir, "link.txt").await.unwrap(), None);
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_hardlink_dentry_binding_cross_dir_rename_unlink() {
     let store = new_test_store().await;
     let root = store.root_ino();

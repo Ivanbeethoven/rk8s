@@ -49,6 +49,30 @@ cleanup() {
     done
 }
 
+copy_artifacts() {
+    local artifact_dir="${SLAYERFS_ARTIFACT_DIR:-}"
+
+    if [[ -z "$artifact_dir" ]]; then
+        return 0
+    fi
+
+    mkdir -p "$artifact_dir"
+
+    [[ -f "$_LOG" ]] && cp -f "$_LOG" "$artifact_dir/xfstests-script.log" || true
+    [[ -f "$log_file" ]] && cp -f "$log_file" "$artifact_dir/slayerfs.log" || true
+    [[ -f "$config_path" ]] && cp -f "$config_path" "$artifact_dir/backend.yml" || true
+    [[ -f "$xfstests_dir/local.config" ]] && cp -f "$xfstests_dir/local.config" "$artifact_dir/local.config" || true
+    [[ -d "$xfstests_dir/results" ]] && rm -rf "$artifact_dir/results" && cp -a "$xfstests_dir/results" "$artifact_dir/results" || true
+}
+
+on_exit() {
+    local status=$?
+    copy_artifacts || true
+    cleanup || true
+    trap - EXIT
+    exit "$status"
+}
+
 install_xfstests_deps() {
     export DEBIAN_FRONTEND=noninteractive
 
@@ -280,7 +304,7 @@ run_xfstests() {
     )
 }
 
-trap cleanup EXIT
+trap on_exit EXIT
 
 cleanup
 sudo rm -rf "$backend_dir" "$mount_dir"

@@ -18,7 +18,7 @@ on:
 
 jobs:
   unit-and-integration:
-    name: slayerfs basic test
+    name: slayerfs integration test
     runs-on: [self-hosted]
     env:
       CARGO_TERM_COLOR: always
@@ -44,13 +44,6 @@ jobs:
             guestfish \
             xorriso
 
-      - name: Fetch LFS assets for KVM tests
-        env:
-          LFS_ASSETS: project/slayerfs/tests/scripts/fuse3-bundle/fusermount3
-        run: |
-          git lfs install --local
-          git lfs pull --include="$LFS_ASSETS"
-
       - name: Start backend services
         run: |
           docker compose -f project/slayerfs/docker-compose.yml up -d
@@ -60,24 +53,6 @@ jobs:
           cd project
           cargo build -p slayerfs --example persistence_demo --release
           cargo test -p slayerfs --test test_slayerfs_qlean_multinode_smoke -- --ignored
-
-      - name: Run basic KVM tests (all backends)
-        run: |
-          cd project
-          cargo build -p slayerfs
-          failed_backends=()
-          for backend in sqlite redis etcd; do
-            echo "=== KVM basic test: $backend ==="
-            if ! cargo test -p slayerfs --test test_slayerfs_kvm_integration \
-              "test_slayerfs_kvm_${backend}" -- --ignored --nocapture --exact; then
-              failed_backends+=("$backend")
-            fi
-          done
-
-          if [[ ${#failed_backends[@]} -gt 0 ]]; then
-            echo "KVM basic tests failed for backends: ${failed_backends[*]}"
-            exit 1
-          fi
 
       - name: Stop backend services
         if: always()

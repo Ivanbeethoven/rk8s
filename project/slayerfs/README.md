@@ -72,20 +72,49 @@ More: see `doc/sdk.md` and inline rustdoc.
 - Design: `doc/arch.md`
 - SDK: `doc/sdk.md`
 - Benchmarks: `doc/bench.md`
+- Docker image build: `doc/docker-image-build.md`
 
-## 🧪 Integration Tests (QEMU/KVM)
+## 🐳 Docker Image Build
 
-`project/slayerfs/tests/test_slayerfs_kvm_integration.rs` uses the `qlean` crate to run a small end-to-end validation inside a QEMU/KVM VM.
+The maintained container flow is the SlayerFS image build in `project/slayerfs/docker/Dockerfile`.
+The image contains:
+- the `slayerfs` binary built from this workspace;
+- the default container entrypoint in `project/slayerfs/docker/entrypoint.sh`;
+- one xfstests helper binary copied from the prebuilt bundle, controlled by the `XFSTESTS_BINARY` build argument.
 
-Requirements (host machine): `qemu-system-x86_64`, `qemu-img`, `guestfish`/libguestfs tools, and a working `/dev/kvm`.
-
-Run:
+Before building, fetch the Git LFS tarball used by the Dockerfile:
 
 ```bash
-cd project
-cargo build -p slayerfs
-RUST_LOG=info cargo test -p slayerfs --test test_slayerfs_kvm_integration test_slayerfs_kvm_smoke -- --nocapture --ignored
+git lfs install --local
+git lfs pull --include="project/slayerfs/tests/scripts/xfstests-prebuilt/*.tar.gz"
 ```
+
+Build from the `rk8s` repository root so the Docker build context matches the CI workflow:
+
+```bash
+docker build \
+	-f project/slayerfs/docker/Dockerfile \
+	-t slayerfs:local \
+	project
+```
+
+To copy a different tool from the prebuilt xfstests bundle, override `XFSTESTS_BINARY`:
+
+```bash
+docker build \
+	-f project/slayerfs/docker/Dockerfile \
+	--build-arg XFSTESTS_BINARY=xfs_io \
+	-t slayerfs:local \
+	project
+```
+
+Default runtime behavior:
+- entrypoint starts `slayerfs mount`;
+- local data backend uses `/var/lib/slayerfs/data`;
+- default metadata backend is sqlite at `/var/lib/slayerfs/metadata.db`;
+- the extracted xfstests helper is placed under `/opt/xfstests/bin`.
+
+CI uses `.github/workflows/slayerfs-docker.yml` to build this same image on pull requests and pushes to `main`. Docker Hub publishing is only enabled when `SLAYERFS_DOCKERHUB_REPOSITORY`, `DOCKERHUB_USERNAME`, and `DOCKERHUB_TOKEN` are configured in GitHub.
 
 ---
 

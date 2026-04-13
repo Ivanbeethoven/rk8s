@@ -762,6 +762,7 @@ impl RedisMetaStore {
             name: "/".to_string(),
             kind: NodeKind::Dir,
             attr,
+            symlink_target: None,
             deleted: false,
         };
 
@@ -1453,6 +1454,43 @@ impl MetaStore for RedisMetaStore {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name, target))]
+    async fn symlink(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+    ) -> Result<(i64, FileAttr), MetaError> {
+        let ino = self.create_entry(parent, name.to_string(), FileType::Symlink).await?;
+        let now = current_time();
+
+        let mut node = self.get_node(ino).await?.ok_or(MetaError::NotFound(ino))?;
+        node.attr.size = target.len() as u64;
+        node.attr.atime = now;
+        node.attr.mtime = now;
+        node.attr.ctime = now;
+        node.symlink_target = Some(target.to_string());
+
+        self.save_node(&node).await?;
+
+        Ok((ino, node.as_file_attr()))
+    }
+
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
+    async fn read_symlink(&self, ino: i64) -> Result<String, MetaError> {
+        let node = self.get_node(ino).await?.ok_or(MetaError::NotFound(ino))?;
+
+        if node.kind != NodeKind::Symlink {
+            return Err(MetaError::NotSupported(format!(
+                "inode {ino} is not a symbolic link"
+            )));
+        }
+
+        node.symlink_target.ok_or_else(|| {
+            MetaError::Internal(format!("symlink target missing for inode {ino}"))
+        })
+    }
+
     #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn unlink(&self, parent: i64, name: &str) -> Result<(), MetaError> {
         let Some(child) = self.lookup(parent, name).await? else {
@@ -1463,8 +1501,10 @@ impl MetaStore for RedisMetaStore {
             .get_node(child)
             .await?
             .ok_or(MetaError::NotFound(child))?;
-        if node.kind != NodeKind::File {
-            return Err(MetaError::NotSupported(format!("{child} is not a file")));
+        if node.kind != NodeKind::File && node.kind != NodeKind::Symlink {
+            return Err(MetaError::NotSupported(format!(
+                "{child} is not a file or symbolic link"
+            )));
         }
 
         let node_key = self.node_key(child);
@@ -2159,6 +2199,8 @@ struct StoredNode {
     name: String,
     kind: NodeKind,
     attr: StoredAttr,
+    #[serde(default)]
+    symlink_target: Option<String>,
     deleted: bool,
 }
 

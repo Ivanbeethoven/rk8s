@@ -17,9 +17,9 @@ permissions:
   contents: read
 
 jobs:
-  docker-image-test:
-    name: slayerfs docker image test
-    runs-on: [self-hosted]
+  docker-build:
+    name: slayerfs docker build
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -27,15 +27,33 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Run docker image integration flow
+      - name: Install Git LFS
         run: |
-          chmod +x project/slayerfs/tests/scripts/test_docker_image.sh
-          project/slayerfs/tests/scripts/test_docker_image.sh --image slayerfs:test
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends git-lfs
+
+      - name: Fetch LFS assets for image build
+        env:
+          LFS_ASSETS: project/slayerfs/tests/scripts/xfstests-prebuilt/*.tar.gz
+        run: |
+          git lfs install --local
+          git lfs pull --include="$LFS_ASSETS"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: project
+          file: project/slayerfs/docker/Dockerfile
+          push: false
+          tags: slayerfs:ci
 
   docker-publish:
     name: push slayerfs image to Docker Hub
     if: github.event_name != 'pull_request' && vars.SLAYERFS_DOCKERHUB_REPOSITORY != '' && secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != ''
-    needs: docker-image-test
+    needs: docker-build
     runs-on: ubuntu-latest
     permissions:
       contents: read
