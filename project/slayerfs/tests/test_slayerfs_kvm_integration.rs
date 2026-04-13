@@ -990,7 +990,11 @@ fn check_xfstests_outcome(artifact_dir: &Path) -> Result<()> {
             return Ok(());
         }
         if content.contains("Failures:") || content.contains("failed") {
-            anyhow::bail!("xfstests reported failures:\n{}\n\n{}", content, artifact_debug);
+            anyhow::bail!(
+                "xfstests reported failures:\n{}\n\n{}",
+                content,
+                artifact_debug
+            );
         }
     }
     // Fall back to check if the results dir has any .out.bad files (failures).
