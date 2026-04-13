@@ -1,0 +1,87 @@
+services:
+  slayerfs:
+    image: ${SLAYERFS_TEST_IMAGE:-slayerfs:test}
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse:/dev/fuse
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      SLAYERFS_MOUNT_POINT: /mnt/slayerfs
+      SLAYERFS_DATA_BACKEND: local-fs
+      SLAYERFS_DATA_DIR: /var/lib/slayerfs/data
+      SLAYERFS_META_BACKEND: ${SLAYERFS_TEST_BACKEND:-sqlite}
+      SLAYERFS_META_URL: ${SLAYERFS_TEST_META_URL:-}
+      SLAYERFS_META_ETCD_URLS: ${SLAYERFS_TEST_META_ETCD_URLS:-http://etcd:2379}
+      RUST_LOG: ${SLAYERFS_TEST_RUST_LOG:-slayerfs=info}
+    volumes:
+      - slayerfs-data:/var/lib/slayerfs/data
+      - slayerfs-meta:/var/lib/slayerfs/meta
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/slayerfs-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    networks:
+      - slayerfs-image-test
+
+  redis:
+    image: docker.io/library/redis:7.2-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - yes
+      - --appendfsync
+      - everysec
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - slayerfs-image-test
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.6.0
+    environment:
+      ETCDCTL_API: "3"
+    command:
+      - /usr/local/bin/etcd
+      - --name
+      - etcd-single
+      - --data-dir
+      - /etcd-data
+      - --listen-client-urls
+      - http://0.0.0.0:2379
+      - --advertise-client-urls
+      - http://etcd:2379
+      - --listen-peer-urls
+      - http://0.0.0.0:2380
+      - --initial-advertise-peer-urls
+      - http://etcd:2380
+      - --initial-cluster
+      - etcd-single=http://etcd:2380
+      - --initial-cluster-token
+      - etcd-cluster-token
+      - --initial-cluster-state
+      - new
+      - --auto-compaction-retention=1
+      - --quota-backend-bytes=8589934592
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - slayerfs-image-test
+
+volumes:
+  slayerfs-data:
+  slayerfs-meta:
+
+networks:
+  slayerfs-image-test:
+    driver: bridge
