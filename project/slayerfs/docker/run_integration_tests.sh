@@ -16,7 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SLAYERFS_DIR="$(realpath "$SCRIPT_DIR/..")"
 PROJECT_DIR="$(realpath "$SLAYERFS_DIR/..")"
-COMPOSE_FILE="$SCRIPT_DIR/docker compose.integration.yml"
+COMPOSE_FILE="$SCRIPT_DIR/docker-compose.integration.yml"
 
 # --------------------------------------------------------------------------- #
 # 命令行参数

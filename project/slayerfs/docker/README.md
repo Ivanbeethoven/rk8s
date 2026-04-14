@@ -1,40 +1,40 @@
-# SlayerFS Docker 目录说明
+# SlayerFS docker/
 
-本文档说明 `docker/` 目录下的 Dockerfile、compose 文件和本地脚本的职责与推荐用法。
+这个目录主要提供两条测试路径：容器内 xfstests（推荐）与 KVM xfstests（旧路径）。
 
-## 1. 脚本列表
+## 容器内跑 xfstests（推荐）
 
-当前目录下与 Docker / 本地集成运行相关的脚本有：
+入口：`compose-xfstests/run_redis_xfstests.sh`
 
-- `build_slayerfs_host_binary.sh`
-- `run_integration_tests.sh`
-- `install_xfstests_deps.sh`
-- `manage_xfstests_backend_services.sh`
-- `run_xfstests_backend.sh`
-- `run_xfstests_sqlite.sh`
-- `run_xfstests_redis.sh`
-- `run_xfstests_etcd.sh`
+```bash
+cd project/slayerfs/docker
 
-其中：
+# 先跑少量 case 验证
+bash compose-xfstests/run_redis_xfstests.sh --cases "generic/001"
 
-- `build_slayerfs_host_binary.sh` 负责在宿主机执行 `cargo build --release -p slayerfs --bin slayerfs` 并去除符号表。
-- `run_integration_tests.sh` 用于本地 qlean smoke / integration 流程。
-- `run_xfstests_sqlite.sh`、`run_xfstests_redis.sh`、`run_xfstests_etcd.sh` 是三个直接入口。
-- `run_xfstests_backend.sh` 是共享执行器，三个入口脚本最终都会调用它。
-- `install_xfstests_deps.sh` 负责准备依赖和 Git LFS 资源。
-- `manage_xfstests_backend_services.sh` 负责启动和停止 redis / etcd 后端服务。
+# 启用 rustfs(s3) 跑（更慢）
+bash compose-xfstests/run_redis_xfstests.sh --s3 --cases "generic/001"
+```
 
-与这组脚本配套的 compose 文件也按后端拆分为：
+产物目录：`docker/compose-xfstests/artifacts/run-*/`
+- `results/check.log` / `results/check.out`：xfstests 输出（可实时观察）
+- `slayerfs.log`：SlayerFS 日志（按 run 独立保存）
+- `report.md`：汇总报告
 
-- `docker-compose.integration.yml`
-- `docker-compose.sqlite.yml`
-- `docker-compose.redis.yml`
-- `docker-compose.etcd.yml`
+## 本地 KVM xfstests（旧路径）
 
-本目录已有的 Docker 构建文件包括：
+目录：`kvm-xfstests/`
+- `kvm-xfstests/run_xfstests_sqlite.sh`
+- `kvm-xfstests/run_xfstests_redis.sh`
+- `kvm-xfstests/run_xfstests_etcd.sh`
 
-- `Dockerfile`
-- `entrypoint.sh`
+说明：
+- docker 根目录的 `run_xfstests_*` / `install_xfstests_deps.sh` / `manage_xfstests_backend_services.sh` 只是兼容 shim，会转发到 `kvm-xfstests/`。
+
+## 其它
+
+- `build_slayerfs_host_binary.sh`：在宿主机生成并 strip `target/release/slayerfs`（用于构建镜像）
+- `run_integration_tests.sh`：本地 qlean smoke / integration（非 xfstests）
 
 ## 1.1 镜像构建入口
 
@@ -45,6 +45,24 @@
 ```
 
 然后再执行 Docker build 或 compose build。也就是说，`Dockerfile` 现在只接收运行时二进制 `target/release/slayerfs`。
+
+### 1.1.1 直接构建镜像
+
+```bash
+# 1. 宿主机编译并 strip
+./build_slayerfs_host_binary.sh
+
+# 2. 直接 docker build（context 为项目根目录）
+docker build -t slayerfs:local -f Dockerfile ../..
+```
+
+构建产物约 90MB（镜像 `slayerfs:local`），Dockerfile 基于 `debian:trixie-slim`，包含 fuse3、sqlite3、xfsprogs 等运行时依赖。
+
+### 1.1.2 常见问题
+
+- **二进制路径**：`build_slayerfs_host_binary.sh` 将二进制输出到 `$PROJECT_DIR/target/release/slayerfs`，Dockerfile 中 `COPY target/release/slayerfs` 依赖此路径。由于 build context 是 `../..`（项目根目录），路径匹配。
+- **xfstests-prebuilt**：Dockerfile 需要 `slayerfs/tests/scripts/xfstests-prebuilt/xfstests-prebuilt.tar.gz`，如果缺失需要先 `git lfs pull`。
+- **容器名冲突**：若 docker compose 报容器名已被占用，先 `docker rm -f <container_name>` 再启动。
 
 ## 2. 推荐执行顺序
 
@@ -416,7 +434,68 @@ docker compose -f docker-compose.etcd.yml --profile s3-stack up -d rustfs rustfs
 
 `docker-compose.integration.yml` 则保留给本地 integration / qlean smoke 路径使用。
 
-## 13. 注意事项
+## 13. Docker Compose 快速启动 SlayerFS
+
+除了用 `run_xfstests_backend.sh` 走 KVM 测试路径外，也可以直接用 Docker Compose 在容器中运行 SlayerFS，适合快速验证和手动测试。
+
+### 13.1 Etcd 后端
+
+```bash
+# 1. 构建镜像（如已构建可跳过）
+./build_slayerfs_host_binary.sh
+docker build -t slayerfs:local -f Dockerfile ../..
+
+# 2. 启动 etcd
+docker compose -f docker-compose.etcd.yml up -d etcd
+
+# 3. 启动 slayerfs 容器（local-fs 数据后端 + etcd 元数据后端）
+docker run -d \
+  --name slayerfs-etcd-test \
+  --network docker_slayerfs-network \
+  --device /dev/fuse:/dev/fuse \
+  --cap-add SYS_ADMIN \
+  --security-opt apparmor=unconfined \
+  -e SLAYERFS_DATA_BACKEND=local-fs \
+  -e SLAYERFS_DATA_DIR=/var/lib/slayerfs/data \
+  -e SLAYERFS_META_BACKEND=etcd \
+  -e SLAYERFS_META_ETCD_URLS=http://etcd-slayerfs-test:2379 \
+  -e RUST_LOG=slayerfs=info \
+  slayerfs:local
+
+# 4. 查看日志确认挂载成功
+docker logs slayerfs-etcd-test
+
+# 5. 进入容器测试
+docker exec -it slayerfs-etcd-test bash
+
+# 6. 清理
+docker rm -f slayerfs-etcd-test
+docker compose -f docker-compose.etcd.yml down -v
+```
+
+### 13.2 使用 s3-stack profile（RustFS + etcd）
+
+```bash
+# 需要能拉取 rustfs/rustfs:latest 和 amazon/aws-cli:2
+docker compose -f docker-compose.etcd.yml --profile s3-stack up -d
+```
+
+### 13.3 容器内测试工具
+
+镜像内已包含 `xfs_io`（`/opt/xfstests/bin/xfs_io`），可用于 pwrite/pread/fsync 等操作。如需更全面的压力测试（fio、stress-ng），可在容器内额外安装：
+
+```bash
+docker exec slayerfs-etcd-test apt-get update -qq && apt-get install -y -qq fio stress-ng
+```
+
+### 13.4 已知限制
+
+- **fallocate**：FUSE 不支持 `fallocate`，`xfs_io -c "falloc"` 会返回 `Operation not supported`。
+- **mmap write**：`xfs_io -c "mwrite"` 可能触发 Bus error，FUSE mmap 写支持有限。
+- **fiemap**：`xfs_io -c "fiemap"` 返回 `Operation not supported`。
+- **copy_file_range**：`xfs_io -c "copy_range"` 可能不支持。
+
+## 14. 注意事项
 
 - 这些脚本的目标是对齐 GitHub Actions 里的 xfstests 本地跑法，而不是替代仓库中的所有集成测试脚本。
 - `run_xfstests_backend.sh` 当前默认依赖仓库中的 exclude 文件，不支持再从命令行直接传单个 case。
