@@ -31,8 +31,10 @@ use rand::RngCore;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
+use tokio::sync::Semaphore;
 use tokio::time::{interval, timeout};
 use tracing::{Instrument, warn};
 
@@ -45,6 +47,13 @@ const UPLOAD_MAX_RETRIES: u64 = 5;
 const MAX_UNFLUSHED_SLICES: usize = 3;
 const MAX_SLICES_THRESHOLD: usize = 800;
 const WRITE_MAX_WAIT: Duration = Duration::from_secs(30);
+
+const MAX_CONCURRENT_META_OPS: usize = 8;
+
+fn meta_ops_semaphore() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| Semaphore::new(MAX_CONCURRENT_META_OPS))
+}
 
 struct UploadPlan {
     chunk_id: u64,
@@ -870,7 +879,12 @@ where
 
                 let slice_id = match slice_id {
                     Some(slice_id) => slice_id,
-                    None => match handle.shared.backend.meta().next_id(SLICE_ID_KEY).await {
+                    None => {
+                        let _permit = meta_ops_semaphore()
+                            .acquire()
+                            .await
+                            .expect("meta ops semaphore closed");
+                        match handle.shared.backend.meta().next_id(SLICE_ID_KEY).await {
                         Ok(id) => {
                             let id = id as u64;
                             handle.set_slice_id(id);
@@ -880,7 +894,8 @@ where
                             handle.mark_failed(anyhow::anyhow!("Failed to get slice id: {e}"));
                             return;
                         }
-                    },
+                        }
+                    }
                 };
 
                 // The blocks to upload/write should be relative to the slice itself.
@@ -1018,6 +1033,10 @@ where
                     let file_offset = chunk_index * shared.config.layout.chunk_size + desc.offset;
                     let new_size = file_offset + desc.length;
 
+                    let _permit = meta_ops_semaphore()
+                        .acquire()
+                        .await
+                        .expect("meta ops semaphore closed");
                     let result = shared
                         .backend
                         .meta()
@@ -1294,11 +1313,15 @@ mod tests {
     use crate::chunk::store::{BlockKey, BlockStore, InMemoryBlockStore};
     use crate::meta::MetaLayer;
     use crate::meta::factory::create_meta_store_from_url;
+    use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
+    use crate::meta::store::{AclRule, DirEntry, FileAttr, FileType, MetaError, OpenFlags, SetAttrFlags, SetAttrRequest, StatFsSnapshot};
     use crate::meta::store::MetaStore;
     use crate::vfs::Inode;
     use crate::vfs::config::ReadConfig;
+    use crate::vfs::handles::DirHandle;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::AtomicI64;
     use tokio::time::{sleep, timeout};
 
     fn test_config(layout: ChunkLayout) -> Arc<WriteConfig> {
@@ -1357,6 +1380,250 @@ mod tests {
 
         async fn delete_range(&self, key: BlockKey, len: u64) -> anyhow::Result<()> {
             self.inner.delete_range(key, len).await
+        }
+    }
+
+    struct FailingCommitMeta {
+        next: AtomicI64,
+    }
+
+    impl FailingCommitMeta {
+        fn new(start: i64) -> Self {
+            Self {
+                next: AtomicI64::new(start),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MetaLayer for FailingCommitMeta {
+        fn root_ino(&self) -> i64 {
+            1
+        }
+
+        fn chroot(&self, _inode: i64) {}
+
+        async fn initialize(&self) -> Result<(), MetaError> {
+            Ok(())
+        }
+
+        async fn stat_fs(&self) -> Result<StatFsSnapshot, MetaError> {
+            Ok(StatFsSnapshot::default())
+        }
+
+        async fn stat(&self, _ino: i64) -> Result<Option<FileAttr>, MetaError> {
+            Ok(None)
+        }
+
+        async fn stat_fresh(&self, _ino: i64) -> Result<Option<FileAttr>, MetaError> {
+            Ok(None)
+        }
+
+        async fn lookup(&self, _parent: i64, _name: &str) -> Result<Option<i64>, MetaError> {
+            Ok(None)
+        }
+
+        async fn lookup_path(&self, _path: &str) -> Result<Option<(i64, FileType)>, MetaError> {
+            Ok(None)
+        }
+
+        async fn readdir(&self, _ino: i64) -> Result<Vec<DirEntry>, MetaError> {
+            Ok(Vec::new())
+        }
+
+        async fn opendir(&self, _ino: i64) -> Result<DirHandle, MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn mkdir(&self, _parent: i64, _name: String) -> Result<i64, MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn rmdir(&self, _parent: i64, _name: &str) -> Result<(), MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn create_file(&self, _parent: i64, _name: String) -> Result<i64, MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn link(&self, _ino: i64, _parent: i64, _name: &str) -> Result<FileAttr, MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn symlink(
+            &self,
+            _parent: i64,
+            _name: &str,
+            _target: &str,
+        ) -> Result<(i64, FileAttr), MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn unlink(&self, _parent: i64, _name: &str) -> Result<(), MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn rename(
+            &self,
+            _old_parent: i64,
+            _old_name: &str,
+            _new_parent: i64,
+            _new_name: String,
+        ) -> Result<(), MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn rename_exchange(
+            &self,
+            _old_parent: i64,
+            _old_name: &str,
+            _new_parent: i64,
+            _new_name: &str,
+        ) -> Result<(), MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn set_file_size(&self, _ino: i64, _size: u64) -> Result<(), MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn extend_file_size(&self, _ino: i64, _size: u64) -> Result<(), MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn truncate(&self, _ino: i64, _size: u64, _chunk_size: u64) -> Result<(), MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn get_names(&self, _ino: i64) -> Result<Vec<(Option<i64>, String)>, MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn get_dentries(&self, _ino: i64) -> Result<Vec<(i64, String)>, MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn get_dir_parent(&self, _dir_ino: i64) -> Result<Option<i64>, MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn get_paths(&self, _ino: i64) -> Result<Vec<String>, MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn read_symlink(&self, _ino: i64) -> Result<String, MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn set_attr(
+            &self,
+            _ino: i64,
+            _req: &SetAttrRequest,
+            _flags: SetAttrFlags,
+        ) -> Result<FileAttr, MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn open(&self, _ino: i64, _flags: OpenFlags) -> Result<FileAttr, MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn close(&self, _ino: i64) -> Result<(), MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn write(
+            &self,
+            _ino: i64,
+            _chunk_id: u64,
+            _slice: SliceDesc,
+            _new_size: u64,
+        ) -> Result<(), MetaError> {
+            Err(MetaError::Internal("injected meta write failure".to_string()))
+        }
+
+        async fn get_deleted_files(&self) -> Result<Vec<i64>, MetaError> {
+            Ok(Vec::new())
+        }
+
+        async fn remove_file_metadata(&self, _ino: i64) -> Result<(), MetaError> {
+            Ok(())
+        }
+
+        async fn get_slices(&self, _chunk_id: u64) -> Result<Vec<SliceDesc>, MetaError> {
+            Ok(Vec::new())
+        }
+
+        async fn append_slice(&self, _chunk_id: u64, _slice: SliceDesc) -> Result<(), MetaError> {
+            Ok(())
+        }
+
+        async fn next_id(&self, _key: &str) -> Result<i64, MetaError> {
+            Ok(self.next.fetch_add(1, Ordering::SeqCst))
+        }
+
+        async fn start_session(&self, _session_info: crate::meta::client::session::SessionInfo) -> Result<(), MetaError> {
+            Ok(())
+        }
+
+        async fn shutdown_session(&self) -> Result<(), MetaError> {
+            Ok(())
+        }
+
+        async fn get_plock(
+            &self,
+            _inode: i64,
+            _query: &FileLockQuery,
+        ) -> Result<FileLockInfo, MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn set_plock(
+            &self,
+            _inode: i64,
+            _owner: i64,
+            _block: bool,
+            _lock_type: FileLockType,
+            _range: FileLockRange,
+            _pid: u32,
+        ) -> Result<(), MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn set_xattr(
+            &self,
+            _inode: i64,
+            _name: &str,
+            _value: &[u8],
+            _flags: u32,
+        ) -> Result<(), MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn get_xattr(&self, _inode: i64, _name: &str) -> Result<Option<Vec<u8>>, MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn list_xattr(&self, _inode: i64) -> Result<Vec<String>, MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn remove_xattr(&self, _inode: i64, _name: &str) -> Result<(), MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn set_acl(&self, _inode: i64, _rule: AclRule) -> Result<(), MetaError> {
+            Err(MetaError::NotImplemented)
+        }
+
+        async fn get_acl(
+            &self,
+            _inode: i64,
+            _acl_type: u8,
+            _acl_id: u32,
+        ) -> Result<Option<AclRule>, MetaError> {
+            Err(MetaError::NotImplemented)
         }
     }
 
@@ -1648,5 +1915,63 @@ mod tests {
         })
         .await
         .expect("flush-all should commit");
+    }
+
+    #[tokio::test]
+    async fn test_data_corruption_when_meta_write_fails() {
+        let layout = ChunkLayout {
+            chunk_size: 4 * 1024,
+            block_size: 512,
+        };
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta = Arc::new(FailingCommitMeta::new(1));
+        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
+
+        let inode = Inode::new(1, 0);
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = FileWriter::new(
+            inode.clone(),
+            Arc::new(WriteConfig::new(layout).page_size(layout.block_size)),
+            backend.clone(),
+            reader,
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        let write_len = 128usize;
+        let write_offset = layout.chunk_size - write_len as u64;
+        let data = vec![4u8; write_len];
+        writer.write_at(write_offset, &data).await.unwrap();
+
+        let mut block_buf = vec![0xAAu8; layout.block_size as usize];
+        timeout(Duration::from_secs(1), async {
+            loop {
+                store
+                    .read_range((1, 0), 0, &mut block_buf)
+                    .await
+                    .unwrap();
+                if block_buf[0] != 0xAA {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("uploaded block should appear in store");
+        assert!(block_buf.iter().any(|&b| b == 4));
+
+        let cid = chunk_id_for(inode.ino(), 0).unwrap();
+        let mut fetcher = DataFetcher::new(layout, cid, backend.as_ref());
+        fetcher.prepare_slices().await.unwrap();
+
+        let out = fetcher
+            .read_at(write_offset.into(), write_len)
+            .await
+            .unwrap();
+
+        assert_eq!(out, vec![0u8; write_len]);
+        assert_ne!(out, data);
     }
 }

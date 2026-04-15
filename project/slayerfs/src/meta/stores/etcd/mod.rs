@@ -2571,19 +2571,7 @@ impl MetaStore for EtcdMetaStore {
     )]
     async fn append_slice(&self, chunk_id: u64, slice: SliceDesc) -> Result<(), MetaError> {
         let key = Self::etcd_slice_entry_key(chunk_id, slice.slice_id);
-
-        EtcdTxn::new(&self.client)
-            .max_retries(10)
-            .run(|tx| {
-                let key = key.clone();
-
-                Box::pin(async move {
-                    tx.set_typed(key, &slice)?;
-
-                    Ok(())
-                })
-            })
-            .await
+        self.etcd_put_json(key, &slice, None).await
     }
 
     async fn write(
@@ -2596,15 +2584,14 @@ impl MetaStore for EtcdMetaStore {
         let slice_key = Self::etcd_slice_entry_key(chunk_id, slice.slice_id);
         let inode_key = Self::etcd_reverse_key(ino);
 
+        self.etcd_put_json(slice_key, &slice, None).await?;
+
         EtcdTxn::new(&self.client)
             .max_retries(10)
             .run(|tx| {
-                let slice_key = slice_key.clone();
                 let inode_key = inode_key.clone();
 
                 Box::pin(async move {
-                    tx.set_typed(slice_key, &slice)?;
-
                     let mut entry_info: EtcdEntryInfo = tx
                         .get_typed_json(&inode_key)
                         .await?
@@ -2621,7 +2608,6 @@ impl MetaStore for EtcdMetaStore {
                         entry_info.size = Some(new_size as i64);
                         entry_info.modify_time =
                             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                        // POSIX: clear setuid/setgid bits on write (security: prevent privilege escalation)
                         entry_info.permission.mode &= !0o6000;
 
                         tx.set_typed_json(inode_key, &entry_info)?;
