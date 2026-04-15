@@ -92,8 +92,8 @@ else
     export SLAYERFS_DATA_BACKEND="local-fs"
 fi
 
-info "启动依赖服务: etcd + rustfs"
-docker compose -f "$COMPOSE_FILE" up -d etcd rustfs
+info "启动依赖服务: etcd + etcd-maintenance + rustfs"
+docker compose -f "$COMPOSE_FILE" up -d etcd etcd-maintenance rustfs
 
 info "初始化 rustfs bucket（一次性容器）"
 docker compose -f "$COMPOSE_FILE" run --rm rustfs-init

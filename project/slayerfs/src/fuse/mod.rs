@@ -410,7 +410,7 @@ where
         debug!(ino, fh, offset, "fuse.readdir");
         // Try to use handle first
         let entries = if fh != 0 {
-            let entries_offset = offset.saturating_sub(3) as u64;
+            let entries_offset = offset.saturating_sub(2) as u64;
             self.readdir(fh, entries_offset)
         } else {
             None
@@ -434,17 +434,30 @@ where
             }
         };
 
-        // Assemble entries including '.' and '..'; offsets reference the previous entry so start at offset+1
+        // Assemble entries including '.' and '..'. FUSE resumes from the offset
+        // published on the last emitted entry, so child indices map to offset-2.
         let mut all: Vec<DirectoryEntry> = Vec::with_capacity(entries.len() + 2);
+        let entries_offset = offset.saturating_sub(2) as u64;
 
         // Add "." and ".." entries for handle-based reads
-        if fh != 0 && offset <= 0 {
+        if fh != 0 && offset == 0 {
             all.push(DirectoryEntry {
                 inode: ino,
                 kind: FuseFileType::Directory,
                 name: OsString::from("."),
                 offset: 1,
             });
+            let parent_ino = self
+                .parent_of(ino as i64)
+                .await
+                .unwrap_or_else(|| self.root_ino()) as u64;
+            all.push(DirectoryEntry {
+                inode: parent_ino,
+                kind: FuseFileType::Directory,
+                name: OsString::from(".."),
+                offset: 2,
+            });
+        } else if fh != 0 && offset == 1 {
             let parent_ino = self
                 .parent_of(ino as i64)
                 .await
@@ -463,7 +476,11 @@ where
                 inode: e.ino as u64,
                 kind: vfs_kind_to_fuse(e.kind),
                 name: OsString::from(e.name.clone()),
-                offset: (offset.max(0) as u64 + i as u64 + if fh != 0 { 3 } else { 0 }) as i64,
+                offset: if fh != 0 {
+                    (entries_offset + i as u64 + 3) as i64
+                } else {
+                    (i as u64 + 1) as i64
+                },
             });
         }
 

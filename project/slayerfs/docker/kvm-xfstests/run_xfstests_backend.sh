@@ -28,7 +28,7 @@ case "$BACKEND" in
         ;;
     etcd)
         TEST_NAME="test_slayerfs_kvm_xfstests_etcd"
-        REQUIRED_SERVICES=(etcd)
+        REQUIRED_SERVICES=(etcd etcd-maintenance)
         ;;
     *)
         echo "不支持的后端: $BACKEND" >&2

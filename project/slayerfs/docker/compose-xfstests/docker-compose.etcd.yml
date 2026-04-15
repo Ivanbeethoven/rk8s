@@ -15,13 +15,31 @@ services:
       --initial-cluster etcd-single=http://etcd:2380
       --initial-cluster-token etcd-cluster-token
       --initial-cluster-state new
-      --auto-compaction-retention=1
-      --quota-backend-bytes=8589934592
+      --auto-compaction-mode=revision
+      --auto-compaction-retention=5000
+      --quota-backend-bytes=17179869184
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
       interval: 2s
       timeout: 5s
       retries: 30
+    networks:
+      - slayerfs-xfstests
+
+  etcd-maintenance:
+    image: slayerfs-etcd-maintenance:local
+    build:
+      context: ..
+      dockerfile: etcd-maintenance.Dockerfile
+    depends_on:
+      etcd:
+        condition: service_healthy
+    environment:
+      ETCDCTL_API: "3"
+      ETCDCTL_ENDPOINTS: http://etcd:2379
+      ETCD_COMPACT_RETENTION_REVISIONS: ${ETCD_COMPACT_RETENTION_REVISIONS:-5000}
+      ETCD_MAINTENANCE_INTERVAL_SECS: ${ETCD_MAINTENANCE_INTERVAL_SECS:-30}
+    restart: unless-stopped
     networks:
       - slayerfs-xfstests
 
@@ -85,6 +103,8 @@ services:
     depends_on:
       etcd:
         condition: service_healthy
+      etcd-maintenance:
+        condition: service_started
       rustfs-init:
         condition: service_completed_successfully
     environment:

@@ -44,7 +44,7 @@ case "$BACKEND" in
         ;;
     etcd)
         COMPOSE_FILE="$DOCKER_DIR/docker-compose.etcd.yml"
-        SERVICES=(etcd)
+        SERVICES=(etcd etcd-maintenance)
         ;;
     *)
         err "不支持的后端: $BACKEND"

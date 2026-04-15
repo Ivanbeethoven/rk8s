@@ -1049,29 +1049,24 @@ impl RedisMetaStore {
             }
             _ => {
                 // Handle lock request (ReadLock or WriteLock)
-                let current_json: Option<String> =
-                    conn.hget(&plock_key, &field).await.map_err(redis_err)?;
+                let all_entries: std::collections::HashMap<String, String> =
+                    conn.hgetall(&plock_key).await.map_err(redis_err)?;
 
                 // Get current locks for this owner/session
-                let current_records = if let Some(json) = current_json {
+                let current_records = if let Some(json) = all_entries.get(&field) {
                     serde_json::from_str(&json).unwrap_or_default()
                 } else {
                     Vec::new()
                 };
 
                 // Check for conflicts with other locks
-                let all_fields: Vec<String> = conn.hkeys(&plock_key).await.map_err(redis_err)?;
                 let mut conflict_found = false;
 
-                for other_field in all_fields {
+                for (other_field, other_records_json) in all_entries {
                     if other_field == field {
                         continue;
                     }
 
-                    let other_records_json: String = conn
-                        .hget(&plock_key, &other_field)
-                        .await
-                        .map_err(redis_err)?;
                     let other_records: Vec<PlockRecord> =
                         serde_json::from_str(&other_records_json).unwrap_or_default();
 
@@ -2108,21 +2103,19 @@ impl MetaStore for RedisMetaStore {
             .sid
             .get()
             .ok_or_else(|| MetaError::Internal("sid not set".to_string()))?;
+        let current_field = format!("{}:{}", sid, query.owner);
+        let plock_entries: std::collections::HashMap<String, String> =
+            conn.hgetall(&plock_key).await.map_err(redis_err)?;
 
         // First, try to get locks from current session's field
-        let current_field = format!("{}:{}", sid, query.owner);
-        let records_json: Result<String, _> = conn.hget(&plock_key, &current_field).await;
-        if let Ok(records_json) = records_json {
+        if let Some(records_json) = plock_entries.get(&current_field) {
             let records: Vec<PlockRecord> = serde_json::from_str(&records_json).unwrap_or_default();
             if let Some(v) = PlockRecord::get_plock(&records, query, sid, sid) {
                 return Ok(v);
             }
         }
 
-        // Get all plock entries for this inode
-        let plock_entries: Vec<String> = conn.hkeys(&plock_key).await.map_err(redis_err)?;
-
-        for field in plock_entries {
+        for (field, records_json) in plock_entries {
             // Skip current field as we already checked it
             if field == current_field {
                 continue;
@@ -2139,7 +2132,6 @@ impl MetaStore for RedisMetaStore {
                 .parse()
                 .map_err(|_| MetaError::Internal("Invalid owner in plock field".to_string()))?;
 
-            let records_json: String = conn.hget(&plock_key, &field).await.map_err(redis_err)?;
             let records: Vec<PlockRecord> = serde_json::from_str(&records_json).unwrap_or_default();
 
             if let Some(v) = PlockRecord::get_plock(&records, query, sid, &lock_sid) {

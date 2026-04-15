@@ -18,6 +18,7 @@ RUN apt-get update && \
         dump \
         e2fsprogs \
         fio \
+        liburing2 \
         gawk \
         libuuid1 \
         lvm2 \
