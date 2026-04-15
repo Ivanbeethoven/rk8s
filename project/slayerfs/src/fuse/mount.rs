@@ -20,7 +20,7 @@ use crate::vfs::fs::VFS;
 /// Build default mount options for SlayerFS.
 fn default_mount_options() -> MountOptions {
     let mut mo = MountOptions::default();
-    mo.fs_name("slayerfs");
+    mo.fs_name(std::env::var("SLAYERFS_FS_NAME").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()).unwrap_or_else(|| "slayerfs".to_string()));
     // Enable kernel-side permission checking (recommended for most filesystems)
     mo.default_permissions(true);
     // Allow other users to access the filesystem (required for multi-user scenarios and xfstests)
