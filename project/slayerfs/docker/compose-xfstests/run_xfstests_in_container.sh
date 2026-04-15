@@ -13,6 +13,7 @@ data_backend="${SLAYERFS_DATA_BACKEND:-local-fs}"
 data_dir="${SLAYERFS_DATA_DIR:-${SLAYERFS_HOME:-/var/lib/slayerfs}/data}"
 meta_backend="${SLAYERFS_META_BACKEND:-redis}"
 meta_url="${SLAYERFS_META_URL:-}"
+meta_etcd_urls="${SLAYERFS_META_ETCD_URLS:-http://etcd:2379}"
 sqlite_path="${SLAYERFS_SQLITE_PATH:-${SLAYERFS_HOME:-/var/lib/slayerfs}/metadata.db}"
 log_file="${SLAYERFS_LOG_FILE:-/artifacts/slayerfs.log}"
 xfstests_dir="${XFSTESTS_DIR:-/opt/xfstests-dev}"
@@ -88,6 +89,20 @@ meta:
   redis:
     url: "$meta_url"
 EOF
+                ;;
+            etcd)
+                cat <<EOF
+meta:
+  backend: etcd
+  etcd:
+    urls:
+EOF
+                local old_ifs="$IFS"
+                IFS=','
+                for url in $meta_etcd_urls; do
+                    echo "      - \"${url}\""
+                done
+                IFS="$old_ifs"
                 ;;
             *)
                 err "不支持的 SLAYERFS_META_BACKEND: $meta_backend"
