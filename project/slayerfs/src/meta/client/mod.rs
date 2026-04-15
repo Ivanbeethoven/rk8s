@@ -881,7 +881,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn cached_stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
         let inode = self.check_root(ino);
-        info!("MetaClient: stat request for inode {}", inode);
+        trace!("MetaClient: stat request for inode {}", inode);
 
         if let Some(attr) = self.inode_cache.get_attr(inode).await {
             trace!("MetaClient: Inode cache HIT for inode {}", inode);
@@ -893,7 +893,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         let attr = self.store.stat(inode).await?;
 
         if let Some(ref a) = attr {
-            info!("MetaClient: Caching attr for inode {}", inode);
+            trace!("MetaClient: Caching attr for inode {}", inode);
             self.inode_cache.insert_node(inode, a.clone(), None).await;
         }
 
@@ -917,22 +917,22 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
     #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn cached_lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
         let parent = self.check_root(parent);
-        info!("MetaClient: lookup request for ({}, '{}')", parent, name);
+        trace!("MetaClient: lookup request for ({}, '{}')", parent, name);
 
         if let Some(ino) = self.inode_cache.lookup(parent, name).await {
-            info!(
+            trace!(
                 "MetaClient: Inode cache HIT for ({}, '{}') -> inode {}",
                 parent, name, ino
             );
             return Ok(Some(ino));
         }
 
-        debug!("MetaClient: Inode cache MISS for ({}, '{}')", parent, name);
+        trace!("MetaClient: Inode cache MISS for ({}, '{}')", parent, name);
 
         let result = self.store.lookup(parent, name).await?;
 
         if let Some(ino) = result {
-            info!(
+            trace!(
                 "MetaClient: Caching lookup result ({}, '{}') -> inode {}",
                 parent, name, ino
             );
@@ -1226,10 +1226,10 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn readdir(&self, ino: i64) -> Result<Vec<DirEntry>, MetaError> {
         let inode = self.check_root(ino);
-        info!("MetaClient: readdir request for inode {}", inode);
+        trace!("MetaClient: readdir request for inode {}", inode);
 
         if let Some(entries) = self.inode_cache.readdir(inode).await {
-            info!(
+            trace!(
                 "MetaClient: Inode cache HIT for readdir inode {} ({} entries)",
                 inode,
                 entries.len()
@@ -1250,7 +1250,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         // Sort once before caching so readops always return stable ordering by name.
         entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-        info!(
+        trace!(
             "MetaClient: Caching readdir result for inode {} ({} entries)",
             inode,
             entries.len()

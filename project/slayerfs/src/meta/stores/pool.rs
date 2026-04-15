@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use tracing::info;
+use tracing::trace;
 
 /// Local ID allocation pool
 ///
@@ -24,7 +24,7 @@ impl IdPool {
             pool.next += 1;
             let remaining = pool.end - pool.next;
 
-            info!(
+            trace!(
                 counter_key = counter_key,
                 allocated_id = id,
                 pool_hit = true,

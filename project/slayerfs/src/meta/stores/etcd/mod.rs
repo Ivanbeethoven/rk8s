@@ -18,6 +18,7 @@ use crate::meta::file_lock::{
 };
 use crate::meta::store::{
     DirEntry, FileAttr, LockName, MetaError, MetaStore, SetAttrFlags, SetAttrRequest,
+    StatFsSnapshot,
 };
 use crate::meta::stores::pool::IdPool;
 use crate::meta::{INODE_ID_KEY, Permission};
@@ -101,6 +102,14 @@ impl EtcdMetaStore {
             Some(id) => format!("session_info:{}", id),
             None => "session_info:".to_string(),
         }
+    }
+
+    fn etcd_slice_prefix(chunk_id: u64) -> String {
+        format!("slices/{chunk_id}/")
+    }
+
+    fn etcd_slice_entry_key(chunk_id: u64, slice_id: u64) -> String {
+        format!("{}{:016x}", Self::etcd_slice_prefix(chunk_id), slice_id)
     }
 
     #[allow(dead_code)]
@@ -311,17 +320,53 @@ impl EtcdMetaStore {
             chunk_size,
             |cutoff_chunk, cutoff_offset| async move {
                 let chunk_id = chunk_id_for(ino, cutoff_chunk)?;
-                let key = key_for_slice(chunk_id);
-                let mut slices: Vec<SliceDesc> =
-                    self.etcd_get_json(&key).await?.unwrap_or_default();
-                trim_slices_in_place(&mut slices, cutoff_offset);
-                if slices.is_empty() {
-                    let mut client = self.client.clone();
-                    client.delete(key.as_str(), None).await.map_err(|e| {
-                        MetaError::Internal(format!("Failed to delete key {key}: {e}"))
+                let prefix = Self::etcd_slice_prefix(chunk_id);
+                let mut client = self.client.clone();
+                let resp = client
+                    .get(
+                        prefix.clone(),
+                        Some(etcd_client::GetOptions::new().with_prefix()),
+                    )
+                    .await
+                    .map_err(|e| {
+                        MetaError::Internal(format!("Failed to scan slice keys {prefix}: {e}"))
                     })?;
+
+                if !resp.kvs().is_empty() {
+                    let mut slices = Vec::with_capacity(resp.kvs().len());
+                    for kv in resp.kvs() {
+                        let desc: SliceDesc = crate::meta::serialization::deserialize_meta(kv.value())?;
+                        slices.push(desc);
+                    }
+
+                    trim_slices_in_place(&mut slices, cutoff_offset);
+
+                    client
+                        .delete(
+                            prefix.clone(),
+                            Some(etcd_client::DeleteOptions::new().with_prefix()),
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Internal(format!("Failed to delete slice keys {prefix}: {e}"))
+                        })?;
+
+                    for desc in slices {
+                        let key = Self::etcd_slice_entry_key(chunk_id, desc.slice_id);
+                        self.etcd_put_json(&key, &desc, None).await?;
+                    }
                 } else {
-                    self.etcd_put_json(&key, &slices, None).await?;
+                    let key = key_for_slice(chunk_id);
+                    let mut slices: Vec<SliceDesc> =
+                        self.etcd_get_json(&key).await?.unwrap_or_default();
+                    trim_slices_in_place(&mut slices, cutoff_offset);
+                    if slices.is_empty() {
+                        client.delete(key.as_str(), None).await.map_err(|e| {
+                            MetaError::Internal(format!("Failed to delete key {key}: {e}"))
+                        })?;
+                    } else {
+                        self.etcd_put_json(&key, &slices, None).await?;
+                    }
                 }
                 Ok(())
             },
@@ -329,7 +374,17 @@ impl EtcdMetaStore {
                 for idx in start..end {
                     let chunk_id = chunk_id_for(ino, idx)?;
                     let key = key_for_slice(chunk_id);
+                    let prefix = Self::etcd_slice_prefix(chunk_id);
                     let mut client = self.client.clone();
+                    client
+                        .delete(
+                            prefix.clone(),
+                            Some(etcd_client::DeleteOptions::new().with_prefix()),
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Internal(format!("Failed to delete slice keys {prefix}: {e}"))
+                        })?;
                     client.delete(key.as_str(), None).await.map_err(|e| {
                         MetaError::Internal(format!("Failed to delete key {key}: {e}"))
                     })?;
@@ -2401,6 +2456,11 @@ impl MetaStore for EtcdMetaStore {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
+    async fn stat_fs(&self) -> Result<StatFsSnapshot, MetaError> {
+        Ok(StatFsSnapshot::default())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn get_deleted_files(&self) -> Result<Vec<i64>, MetaError> {
         let mut client = self.client.clone();
 
@@ -2475,6 +2535,25 @@ impl MetaStore for EtcdMetaStore {
         fields(chunk_id, slice_count = tracing::field::Empty)
     )]
     async fn get_slices(&self, chunk_id: u64) -> Result<Vec<SliceDesc>, MetaError> {
+        let prefix = Self::etcd_slice_prefix(chunk_id);
+        let mut client = self.client.clone();
+        let resp = client
+            .get(
+                prefix.clone(),
+                Some(etcd_client::GetOptions::new().with_prefix()),
+            )
+            .await
+            .map_err(|e| MetaError::Internal(format!("Failed to scan slice keys {prefix}: {e}")))?;
+        if !resp.kvs().is_empty() {
+            let mut slices = Vec::with_capacity(resp.kvs().len());
+            for kv in resp.kvs() {
+                let desc: SliceDesc = crate::meta::serialization::deserialize_meta(kv.value())?;
+                slices.push(desc);
+            }
+            tracing::Span::current().record("slice_count", slices.len());
+            return Ok(slices);
+        }
+
         let key = key_for_slice(chunk_id);
         let slices: Vec<SliceDesc> = self
             .etcd_get_json(&key)
@@ -2491,7 +2570,7 @@ impl MetaStore for EtcdMetaStore {
         fields(chunk_id, slice_id = slice.slice_id, offset = slice.offset, len = slice.length)
     )]
     async fn append_slice(&self, chunk_id: u64, slice: SliceDesc) -> Result<(), MetaError> {
-        let key = key_for_slice(chunk_id);
+        let key = Self::etcd_slice_entry_key(chunk_id, slice.slice_id);
 
         EtcdTxn::new(&self.client)
             .max_retries(10)
@@ -2499,9 +2578,7 @@ impl MetaStore for EtcdMetaStore {
                 let key = key.clone();
 
                 Box::pin(async move {
-                    let mut source: Vec<SliceDesc> = tx.get_typed(&key).await?.unwrap_or_default();
-                    source.push(slice);
-                    tx.set_typed(key, &source)?;
+                    tx.set_typed(key, &slice)?;
 
                     Ok(())
                 })
@@ -2516,7 +2593,7 @@ impl MetaStore for EtcdMetaStore {
         slice: SliceDesc,
         new_size: u64,
     ) -> Result<(), MetaError> {
-        let slice_key = key_for_slice(chunk_id);
+        let slice_key = Self::etcd_slice_entry_key(chunk_id, slice.slice_id);
         let inode_key = Self::etcd_reverse_key(ino);
 
         EtcdTxn::new(&self.client)
@@ -2526,11 +2603,7 @@ impl MetaStore for EtcdMetaStore {
                 let inode_key = inode_key.clone();
 
                 Box::pin(async move {
-                    let mut slices: Vec<SliceDesc> =
-                        tx.get_typed(&slice_key).await?.unwrap_or_default();
-                    slices.push(slice);
-
-                    tx.set_typed(slice_key, &slices)?;
+                    tx.set_typed(slice_key, &slice)?;
 
                     let mut entry_info: EtcdEntryInfo = tx
                         .get_typed_json(&inode_key)
