@@ -338,7 +338,9 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
     }
 
     fn validate_symlink_target(target: &str) -> Result<(), MetaError> {
-        if target.len() > NAME_MAX {
+        // Symlink payload is not a directory entry name. It may legitimately be
+        // much longer than NAME_MAX, including slash-separated paths.
+        if target.contains('\0') {
             return Err(MetaError::InvalidFilename);
         }
 
@@ -881,7 +883,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn cached_stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
         let inode = self.check_root(ino);
-        info!("MetaClient: stat request for inode {}", inode);
+        debug!("MetaClient: stat request for inode {}", inode);
 
         if let Some(attr) = self.inode_cache.get_attr(inode).await {
             trace!("MetaClient: Inode cache HIT for inode {}", inode);
@@ -893,7 +895,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         let attr = self.store.stat(inode).await?;
 
         if let Some(ref a) = attr {
-            info!("MetaClient: Caching attr for inode {}", inode);
+            debug!("MetaClient: Caching attr for inode {}", inode);
             self.inode_cache.insert_node(inode, a.clone(), None).await;
         }
 
@@ -917,10 +919,10 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
     #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn cached_lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
         let parent = self.check_root(parent);
-        info!("MetaClient: lookup request for ({}, '{}')", parent, name);
+        debug!("MetaClient: lookup request for ({}, '{}')", parent, name);
 
         if let Some(ino) = self.inode_cache.lookup(parent, name).await {
-            info!(
+            debug!(
                 "MetaClient: Inode cache HIT for ({}, '{}') -> inode {}",
                 parent, name, ino
             );
@@ -932,7 +934,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         let result = self.store.lookup(parent, name).await?;
 
         if let Some(ino) = result {
-            info!(
+            debug!(
                 "MetaClient: Caching lookup result ({}, '{}') -> inode {}",
                 parent, name, ino
             );
@@ -1226,10 +1228,10 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn readdir(&self, ino: i64) -> Result<Vec<DirEntry>, MetaError> {
         let inode = self.check_root(ino);
-        info!("MetaClient: readdir request for inode {}", inode);
+        debug!("MetaClient: readdir request for inode {}", inode);
 
         if let Some(entries) = self.inode_cache.readdir(inode).await {
-            info!(
+            debug!(
                 "MetaClient: Inode cache HIT for readdir inode {} ({} entries)",
                 inode,
                 entries.len()
@@ -1254,7 +1256,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         // Sort once before caching so readops always return stable ordering by name.
         entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-        info!(
+        debug!(
             "MetaClient: Caching readdir result for inode {} ({} entries)",
             inode,
             entries.len()
@@ -1745,19 +1747,10 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         self.ensure_writable()?;
 
         if flags.exchange {
-            // Exchange operation - both must exist
-            let _src_ino = self.cached_lookup_required(old_parent, old_name).await?;
-            let _dest_ino = self.cached_lookup_required(new_parent, &new_name).await?;
-
-            // Perform exchange (simplified - not truly atomic)
-            let temp_name = format!("{}.exchange_temp_{}", old_name, std::process::id());
-            self.rename(old_parent, old_name, old_parent, temp_name.clone())
-                .await?;
-            self.rename(new_parent, &new_name, old_parent, old_name.to_string())
-                .await?;
-            self.rename(old_parent, &temp_name, new_parent, new_name)
-                .await?;
-            Ok(())
+            // Delegate to the atomic rename_exchange implementation (backed by
+            // Lua script in Redis; transactional in SQL backends).
+            self.rename_exchange(old_parent, old_name, new_parent, &new_name)
+                .await
         } else if flags.noreplace {
             // Check if destination exists
             if self.cached_lookup(new_parent, &new_name).await?.is_some() {
@@ -2033,9 +2026,33 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         range: FileLockRange,
         pid: u32,
     ) -> Result<(), MetaError> {
-        self.store
+        debug!(
+            "MetaClient: set_plock inode={}, owner={}, block={}, type={:?}, range=[{}, {}), pid={}",
+            inode, owner, block, lock_type, range.start, range.end, pid
+        );
+        let res = self
+            .store
             .set_plock(inode, owner, block, lock_type, range, pid)
-            .await
+            .await;
+        match &res {
+            Ok(()) => debug!("MetaClient: set_plock OK inode={}", inode),
+            Err(e) => warn!("MetaClient: set_plock ERR inode={}: {:?}", inode, e),
+        }
+        res
+    }
+
+    async fn get_flock(&self, inode: i64, owner: i64) -> Result<FileLockType, MetaError> {
+        self.store.get_flock(inode, owner).await
+    }
+
+    async fn set_flock(
+        &self,
+        inode: i64,
+        owner: i64,
+        block: bool,
+        lock_type: FileLockType,
+    ) -> Result<(), MetaError> {
+        self.store.set_flock(inode, owner, block, lock_type).await
     }
 
     async fn set_xattr(

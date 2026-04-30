@@ -18,7 +18,7 @@ use crate::raw::abi::*;
 use crate::raw::filesystem::Filesystem;
 use crate::raw::reply::ReplyXAttr;
 use crate::raw::request::Request;
-use crate::SetAttr;
+use crate::{Errno, SetAttr};
 
 use super::utils::{apply_direct_io, reply_error_in_worker, spawn};
 use super::worker::{DispatchCtx, WorkItem};
@@ -757,16 +757,15 @@ pub(super) async fn worker_unlink<FS: Filesystem + Send + Sync + 'static>(
             ?name,
             "unlink (worker)"
         );
-        let resp_value = if let Err(err) = fs
+        let resp = if let Err(err) = fs
             .unlink(Request::from(&item), item.in_header.nodeid, &name)
             .await
         {
-            err.into()
+            err
         } else {
-            0
+            Errno::from(0)
         };
-        let data =
-            reply_error_in_worker(resp_value.into(), item.unique).expect("serialize out_header");
+        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
         let _ = resp_sender.unbounded_send(Either::Left(data));
     });
 }
@@ -797,16 +796,15 @@ pub(super) async fn worker_rmdir<FS: Filesystem + Send + Sync + 'static>(
             ?name,
             "rmdir (worker)"
         );
-        let resp_value = if let Err(err) = fs
+        let resp = if let Err(err) = fs
             .rmdir(Request::from(&item), item.in_header.nodeid, &name)
             .await
         {
-            err.into()
+            err
         } else {
-            0
+            Errno::from(0)
         };
-        let data =
-            reply_error_in_worker(resp_value.into(), item.unique).expect("serialize out_header");
+        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
         let _ = resp_sender.unbounded_send(Either::Left(data));
     });
 }
@@ -867,7 +865,7 @@ pub(super) async fn worker_rename<FS: Filesystem + Send + Sync + 'static>(
             ?new_name,
             "rename (worker)"
         );
-        let resp_value = if let Err(err) = fs
+        let resp = if let Err(err) = fs
             .rename(
                 Request::from(&item),
                 item.in_header.nodeid,
@@ -877,12 +875,11 @@ pub(super) async fn worker_rename<FS: Filesystem + Send + Sync + 'static>(
             )
             .await
         {
-            err.into()
+            err
         } else {
-            0
+            Errno::from(0)
         };
-        let data =
-            reply_error_in_worker(resp_value.into(), item.unique).expect("serialize out_header");
+        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
         let _ = resp_sender.unbounded_send(Either::Left(data));
     });
 }
@@ -1028,7 +1025,7 @@ pub(super) async fn worker_release<FS: Filesystem + Send + Sync + 'static>(
             flush,
             "release (worker)"
         );
-        let resp_value = if let Err(err) = fs
+        let resp = if let Err(err) = fs
             .release(
                 Request::from(&item),
                 item.in_header.nodeid,
@@ -1039,12 +1036,11 @@ pub(super) async fn worker_release<FS: Filesystem + Send + Sync + 'static>(
             )
             .await
         {
-            err.into()
+            err
         } else {
-            0
+            Errno::from(0)
         };
-        let data =
-            reply_error_in_worker(resp_value.into(), item.unique).expect("serialize out_header");
+        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
         let _ = resp_sender.unbounded_send(Either::Left(data));
     });
 }
@@ -1077,7 +1073,7 @@ pub(super) async fn worker_fsync<FS: Filesystem + Send + Sync + 'static>(
             data_sync,
             "fsync (worker)"
         );
-        let resp_value = if let Err(err) = fs
+        let resp = if let Err(err) = fs
             .fsync(
                 Request::from(&item),
                 item.in_header.nodeid,
@@ -1086,12 +1082,11 @@ pub(super) async fn worker_fsync<FS: Filesystem + Send + Sync + 'static>(
             )
             .await
         {
-            err.into()
+            err
         } else {
-            0
+            Errno::from(0)
         };
-        let data =
-            reply_error_in_worker(resp_value.into(), item.unique).expect("serialize out_header");
+        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
         let _ = resp_sender.unbounded_send(Either::Left(data));
     });
 }
@@ -1152,7 +1147,7 @@ pub(super) async fn worker_setxattr<FS: Filesystem + Send + Sync + 'static>(
             "setxattr (worker)"
         );
         // TODO handle os X argument
-        let resp_value = if let Err(err) = fs
+        let resp = if let Err(err) = fs
             .setxattr(
                 Request::from(&item),
                 item.in_header.nodeid,
@@ -1166,13 +1161,11 @@ pub(super) async fn worker_setxattr<FS: Filesystem + Send + Sync + 'static>(
             )
             .await
         {
-            err.into()
+            err
         } else {
-            0
+            Errno::from(0)
         };
-
-        let data =
-            reply_error_in_worker(resp_value.into(), item.unique).expect("serialize out_header");
+        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
         let _ = resp_sender.unbounded_send(Either::Left(data));
     });
 }
@@ -1383,17 +1376,15 @@ pub(super) async fn worker_removexattr<FS: Filesystem + Send + Sync + 'static>(
             "removexattr (worker)"
         );
 
-        let resp_value = if let Err(err) = fs
+        let resp = if let Err(err) = fs
             .removexattr(Request::from(&item), item.in_header.nodeid, &name)
             .await
         {
-            err.into()
+            err
         } else {
-            0
+            Errno::from(0)
         };
-
-        let data =
-            reply_error_in_worker(resp_value.into(), item.unique).expect("serialize out_header");
+        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
         let _ = resp_sender.unbounded_send(Either::Left(data));
     });
 }
@@ -1428,7 +1419,7 @@ pub(super) async fn worker_flush<FS: Filesystem + Send + Sync + 'static>(
             "flush (worker)"
         );
 
-        let resp_value = if let Err(err) = fs
+        let resp = if let Err(err) = fs
             .flush(
                 Request::from(&item),
                 item.in_header.nodeid,
@@ -1437,13 +1428,11 @@ pub(super) async fn worker_flush<FS: Filesystem + Send + Sync + 'static>(
             )
             .await
         {
-            err.into()
+            err
         } else {
-            0
+            Errno::from(0)
         };
-
-        let data =
-            reply_error_in_worker(resp_value.into(), item.unique).expect("serialize out_header");
+        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
         let _ = resp_sender.unbounded_send(Either::Left(data));
     });
 }
@@ -1536,7 +1525,7 @@ pub(super) async fn worker_releasedir<FS: Filesystem + Send + Sync + 'static>(
             "releasedir (worker)"
         );
 
-        let resp_value = if let Err(err) = fs
+        let resp = if let Err(err) = fs
             .releasedir(
                 Request::from(&item),
                 item.in_header.nodeid,
@@ -1545,13 +1534,11 @@ pub(super) async fn worker_releasedir<FS: Filesystem + Send + Sync + 'static>(
             )
             .await
         {
-            err.into()
+            err
         } else {
-            0
+            Errno::from(0)
         };
-
-        let data =
-            reply_error_in_worker(resp_value.into(), item.unique).expect("serialize out_header");
+        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
         let _ = resp_sender.unbounded_send(Either::Left(data));
     });
 }
@@ -1587,7 +1574,7 @@ pub(super) async fn worker_fsyncdir<FS: Filesystem + Send + Sync + 'static>(
             "fsyncdir (worker)"
         );
 
-        let resp_value = if let Err(err) = fs
+        let resp = if let Err(err) = fs
             .fsyncdir(
                 Request::from(&item),
                 item.in_header.nodeid,
@@ -1596,13 +1583,11 @@ pub(super) async fn worker_fsyncdir<FS: Filesystem + Send + Sync + 'static>(
             )
             .await
         {
-            err.into()
+            err
         } else {
-            0
+            Errno::from(0)
         };
-
-        let data =
-            reply_error_in_worker(resp_value.into(), item.unique).expect("serialize out_header");
+        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
         let _ = resp_sender.unbounded_send(Either::Left(data));
     });
 }
@@ -1636,17 +1621,15 @@ pub(super) async fn worker_access<FS: Filesystem + Send + Sync + 'static>(
             "access (worker)"
         );
 
-        let resp_value = if let Err(err) = fs
+        let resp = if let Err(err) = fs
             .access(Request::from(&item), item.in_header.nodeid, access_in.mask)
             .await
         {
-            err.into()
+            err
         } else {
-            0
+            Errno::from(0)
         };
-
-        let data =
-            reply_error_in_worker(resp_value.into(), item.unique).expect("serialize out_header");
+        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
         let _ = resp_sender.unbounded_send(Either::Left(data));
     });
 }
@@ -1833,7 +1816,7 @@ pub(super) async fn worker_fallocate<FS: Filesystem + Send + Sync + 'static>(
             "fallocate (worker)"
         );
 
-        let resp_value = if let Err(err) = fs
+        let resp = if let Err(err) = fs
             .fallocate(
                 Request::from(&item),
                 item.in_header.nodeid,
@@ -1844,13 +1827,11 @@ pub(super) async fn worker_fallocate<FS: Filesystem + Send + Sync + 'static>(
             )
             .await
         {
-            err.into()
+            err
         } else {
-            0
+            Errno::from(0)
         };
-
-        let data =
-            reply_error_in_worker(resp_value.into(), item.unique).expect("serialize out_header");
+        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
         let _ = resp_sender.unbounded_send(Either::Left(data));
     });
 }
@@ -2028,7 +2009,7 @@ pub(super) async fn worker_rename2<FS: Filesystem + Send + Sync + 'static>(
             "rename2 (worker)"
         );
 
-        let resp_value = if let Err(err) = fs
+        let resp = if let Err(err) = fs
             .rename2(
                 Request::from(&item),
                 item.in_header.nodeid,
@@ -2039,13 +2020,11 @@ pub(super) async fn worker_rename2<FS: Filesystem + Send + Sync + 'static>(
             )
             .await
         {
-            err.into()
+            err
         } else {
-            0
+            Errno::from(0)
         };
-
-        let data =
-            reply_error_in_worker(resp_value.into(), item.unique).expect("serialize out_header");
+        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
         let _ = resp_sender.unbounded_send(Either::Left(data));
     });
 }
@@ -2298,7 +2277,7 @@ pub(super) async fn worker_setlk<FS: Filesystem + Send + Sync + 'static>(
             "setlk (worker)"
         );
 
-        let resp_value = if let Err(err) = fs
+        let resp = if let Err(err) = fs
             .setlk(
                 Request::from(&item),
                 item.in_header.nodeid,
@@ -2312,13 +2291,12 @@ pub(super) async fn worker_setlk<FS: Filesystem + Send + Sync + 'static>(
             )
             .await
         {
-            err.into()
+            err
         } else {
-            0
+            Errno::from(0)
         };
 
-        let data =
-            reply_error_in_worker(resp_value.into(), item.unique).expect("serialize out_header");
+        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
         let _ = resp_sender.unbounded_send(Either::Left(data));
     });
 }

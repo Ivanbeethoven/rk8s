@@ -763,7 +763,13 @@ where
 
             let fh = self
                 .vfs
-                .open(fi.inode(), fi.attr().clone(), flags.read, flags.write)
+                .open(
+                    fi.inode(),
+                    fi.attr().clone(),
+                    flags.read,
+                    flags.write || flags.append,
+                    flags.append,
+                )
                 .await
                 .map_err(io::Error::from)?;
             let file_id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
@@ -811,7 +817,13 @@ where
 
             let fh = self
                 .vfs
-                .open(fi.inode(), fi.attr().clone(), flags.read, flags.write)
+                .open(
+                    fi.inode(),
+                    fi.attr().clone(),
+                    flags.read,
+                    flags.write || flags.append,
+                    flags.append,
+                )
                 .await
                 .map_err(io::Error::from)?;
             let file_id = self.next_file_id.fetch_add(1, Ordering::Relaxed);

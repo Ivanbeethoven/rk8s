@@ -381,7 +381,7 @@ mod io_tests {
         M: MetaLayer + Send + Sync + 'static,
     {
         let attr = fs.stat(path).await.expect("stat");
-        fs.open(attr.ino, attr, read, write).await.unwrap()
+        fs.open(attr.ino, attr, read, write, false).await.unwrap()
     }
 
     async fn write_path<S, M>(fs: &VFS<S, M>, path: &str, offset: u64, data: &[u8]) -> usize
@@ -586,13 +586,68 @@ mod io_tests {
 
         fs.create_file("/close.bin").await.unwrap();
         let attr = fs.stat("/close.bin").await.unwrap();
-        let fh = fs.open(attr.ino, attr.clone(), false, true).await.unwrap();
+        let fh = fs
+            .open(attr.ino, attr.clone(), false, true, false)
+            .await
+            .unwrap();
         let data = vec![1u8; 2048];
         fs.write(fh, 0, &data).await.unwrap();
         fs.close(fh).await.unwrap();
 
         assert!(!fs.state.writer.has_file(attr.ino as u64));
         assert!(!fs.state.inodes.contains_key(&attr.ino));
+    }
+
+    #[tokio::test]
+    async fn test_fs_append_handles_use_fresh_size_concurrently() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = InMemoryBlockStore::new();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let fs = Arc::new(VFS::new(layout, store, meta_store).await.unwrap());
+
+        fs.create_file("/append.txt").await.unwrap();
+        let attr = fs.stat("/append.txt").await.unwrap();
+        let barrier = Arc::new(Barrier::new(4));
+        let mut tasks = Vec::new();
+
+        for line in [
+            b"one\n".as_slice(),
+            b"two\n".as_slice(),
+            b"three\n".as_slice(),
+        ] {
+            let fs = Arc::clone(&fs);
+            let barrier = Arc::clone(&barrier);
+            let attr = attr.clone();
+            let line = line.to_vec();
+            tasks.push(tokio::spawn(async move {
+                let fh = fs.open(attr.ino, attr, false, true, true).await.unwrap();
+                barrier.wait().await;
+                fs.write(fh, 0, &line).await.unwrap();
+                fh
+            }));
+        }
+
+        barrier.wait().await;
+        let mut handles = Vec::new();
+        for task in tasks {
+            handles.push(task.await.unwrap());
+        }
+        for fh in handles {
+            fs.close(fh).await.unwrap();
+        }
+
+        let out = read_path(&fs, "/append.txt", 0, 14).await;
+        for line in [
+            b"one\n".as_slice(),
+            b"two\n".as_slice(),
+            b"three\n".as_slice(),
+        ] {
+            assert!(out.windows(line.len()).any(|window| window == line));
+        }
     }
 
     #[tokio::test]
@@ -616,7 +671,10 @@ mod io_tests {
         write_path(&fs, "/stale_trunc.bin", 0, &data).await;
 
         let attr = fs.stat("/stale_trunc.bin").await.unwrap();
-        let fh = fs.open(attr.ino, attr.clone(), true, false).await.unwrap();
+        let fh = fs
+            .open(attr.ino, attr.clone(), true, false, false)
+            .await
+            .unwrap();
 
         let offset = layout.block_size as u64;
         let probe_len = 1024usize;
@@ -648,7 +706,10 @@ mod io_tests {
 
         fs.create_file("/copy.bin").await.unwrap();
         let attr = fs.stat("/copy.bin").await.unwrap();
-        let fh = fs.open(attr.ino, attr.clone(), true, true).await.unwrap();
+        let fh = fs
+            .open(attr.ino, attr.clone(), true, true, false)
+            .await
+            .unwrap();
 
         let mut expected = vec![0u8; 0x6f000];
 
@@ -693,7 +754,10 @@ mod io_tests {
 
         fs.create_file("/rewrite.bin").await.unwrap();
         let attr = fs.stat("/rewrite.bin").await.unwrap();
-        let fh = fs.open(attr.ino, attr.clone(), true, true).await.unwrap();
+        let fh = fs
+            .open(attr.ino, attr.clone(), true, true, false)
+            .await
+            .unwrap();
 
         fs.truncate_inode(attr.ino, 0x15000).await.unwrap();
         fs.truncate_inode(attr.ino, 0x50000).await.unwrap();
@@ -731,7 +795,10 @@ mod io_tests {
 
         fs.create_file("/trimmed-prefix.bin").await.unwrap();
         let attr = fs.stat("/trimmed-prefix.bin").await.unwrap();
-        let fh = fs.open(attr.ino, attr.clone(), true, true).await.unwrap();
+        let fh = fs
+            .open(attr.ino, attr.clone(), true, true, false)
+            .await
+            .unwrap();
 
         fs.truncate_inode(attr.ino, 0x35063).await.unwrap();
 

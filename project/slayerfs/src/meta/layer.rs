@@ -264,6 +264,16 @@ pub trait MetaLayer: Send + Sync {
         pid: u32,
     ) -> Result<(), MetaError>;
 
+    async fn get_flock(&self, inode: i64, owner: i64) -> Result<FileLockType, MetaError>;
+
+    async fn set_flock(
+        &self,
+        inode: i64,
+        owner: i64,
+        block: bool,
+        lock_type: FileLockType,
+    ) -> Result<(), MetaError>;
+
     // ---------- Extended attribute & ACL ----------
     async fn set_xattr(
         &self,

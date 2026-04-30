@@ -33,7 +33,7 @@ use tokio::net::lookup_host;
 use tokio::select;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, error};
+use tracing::{Instrument, error, info};
 use uuid::Uuid;
 
 const ROOT_INODE: i64 = 1;
@@ -46,10 +46,317 @@ const DELETED_SET_KEY: &str = "delslices";
 const ALL_SESSIONS_KEY: &str = "allsessions";
 const SESSION_INFOS_KEY: &str = "sessioninfos";
 const PLOCK_PREFIX: &str = "plock";
+const FLOCK_PREFIX: &str = "flock";
+const PLOCK_EPOCH_KEY: &str = "plock_epoch";
 const LOCKS_KEY: &str = "locks";
 const LOCKED_KEY: &str = "locked";
 const LINK_PARENT_KEY_PREFIX: &str = "lp:";
 const TRUNCATE_REWRITE_MAX_RETRIES: usize = 64;
+
+// Lua script for atomically releasing all locks held by a dead session.
+// Constructs plock keys dynamically from the locked set so the entire
+// cleanup is atomic — no TOCTOU window between reading locked_files and
+// deleting the lock fields.
+const CLEANUP_SESSION_LUA: &str = r#"
+    local cjson = cjson
+
+    local locked_key  = KEYS[1]
+    local sessions_key = KEYS[2]
+    local infos_key   = KEYS[3]
+    local sid_str     = ARGV[1]
+    local plock_prefix = ARGV[2]
+
+    -- Collect every inode this session holds locks on
+    local locked_files = redis.call('SMEMBERS', locked_key)
+
+    for _, inode in ipairs(locked_files) do
+        local plock_key = plock_prefix .. inode
+        local fields = redis.call('HKEYS', plock_key)
+        local to_delete = {}
+        for _, field in ipairs(fields) do
+            -- field format: sid:owner; match the sid prefix
+            if string.sub(field, 1, #sid_str + 1) == sid_str .. ":" then
+                table.insert(to_delete, field)
+            end
+        end
+        if #to_delete > 0 then
+            redis.call('HDEL', plock_key, unpack(to_delete))
+        end
+    end
+
+    -- Remove session bookkeeping
+    redis.call('DEL',  locked_key)
+    redis.call('ZREM', sessions_key, sid_str)
+    redis.call('HDEL', infos_key,   sid_str)
+
+    return cjson.encode({ok=true})
+"#;
+
+// Lua script for atomic BSD flock (whole-file advisory lock).
+// Each lock value is a simple string: "R" (shared/read) or "W" (exclusive/write).
+// Follows the same fencing pattern as SET_PLOCK_LUA.
+const FLOCK_LUA: &str = r#"
+    local cjson = cjson
+
+    local flock_key = KEYS[1]
+    local locked_key = KEYS[2]
+    local field = ARGV[1]
+    local lock_type = tonumber(ARGV[2])  -- 0=Read, 1=Write, 2=UnLock
+    local inode_str = ARGV[3]
+    local epoch = tonumber(ARGV[4])
+
+    -- helpers: extract {epoch, value} from stored raw
+    local function parse_val(raw)
+        if raw == false or raw == nil then return {epoch=0, val=nil} end
+        local ok, parsed = pcall(cjson.decode, raw)
+        if not ok or type(parsed) ~= "table" then return {epoch=0, val=nil} end
+        return {epoch = tonumber(parsed.epoch) or 0, val = parsed.val}
+    end
+
+    if lock_type == 2 then  -- UnLock
+        local current_raw = redis.call('HGET', flock_key, field)
+        if current_raw == false then
+            return cjson.encode({ok=true})
+        end
+        local cur = parse_val(current_raw)
+        if cur.epoch > epoch then
+            return cjson.encode({ok=true})  -- stale unlock, ignore
+        end
+        redis.call('HDEL', flock_key, field)
+        -- Remove from locked set if field was the last one
+        if redis.call('HLEN', flock_key) == 0 then
+            redis.call('SREM', locked_key, inode_str)
+        end
+        return cjson.encode({ok=true})
+    end
+
+    -- ReadLock or WriteLock
+    local all = redis.call('HGETALL', flock_key)
+    for i = 1, #all, 2 do
+        local other_field = all[i]
+        local other_raw = all[i + 1]
+        if other_field ~= field then
+            local other = parse_val(other_raw)
+            if other.val == "W" then
+                return cjson.encode({ok=false, error="lock_conflict"})
+            end
+            if lock_type == 1 and other.val == "R" then
+                -- Write lock conflicts with any Read lock
+                return cjson.encode({ok=false, error="lock_conflict"})
+            end
+        end
+    end
+
+    -- Acquire: store as {epoch, val}
+    local val = (lock_type == 1) and "W" or "R"
+    redis.call('HSET', flock_key, field,
+                cjson.encode({epoch = epoch, val = val}))
+    redis.call('SADD', locked_key, inode_str)
+    return cjson.encode({ok=true})
+"#;
+
+// Lua script for atomically setting or releasing a POSIX advisory lock.
+// Each lock value is a JSON object {epoch, records} where epoch is the
+// monotonic fencing token of the session that wrote it.  A stale session
+// (whose locks were cleaned up by another node) cannot release locks
+// written by a newer incarnation because its epoch will be lower.
+// This performs a read-check-write cycle inside Redis so that concurrent
+// lock attempts cannot both pass the conflict check — the same pattern
+// used by CREATE_ENTRY_LUA, LINK_LUA, etc.
+const SET_PLOCK_LUA: &str = r#"
+    local cjson = cjson
+
+    local plock_key = KEYS[1]
+    local locked_key = KEYS[2]
+    local field = ARGV[1]
+    local lock_type = tonumber(ARGV[2])  -- 0=Read, 1=Write, 2=UnLock
+    local pid = tonumber(ARGV[3])
+    local range_start = tonumber(ARGV[4])
+    local range_end   = tonumber(ARGV[5])
+    local inode_str   = ARGV[6]
+    local epoch       = tonumber(ARGV[7])
+
+    -- ------------------------------------------------------------------
+    -- helpers
+    -- ------------------------------------------------------------------
+    local function overlaps(a_s, a_e, b_s, b_e)
+        return a_e > b_s and a_s < b_e
+    end
+
+    -- Extract the records array from a stored lock value.
+    -- Value is {epoch:N, records:[...]}.  Accepts legacy bare-array
+    -- format (epoch=0) for transparent upgrade.
+    local function get_records(raw)
+        if raw == false or raw == nil then return {} end
+        local ok, parsed = pcall(cjson.decode, raw)
+        if not ok then return {} end
+        -- object with records key
+        if type(parsed) == "table" and parsed.records then
+            return parsed.records
+        end
+        -- object with epoch but no records (corner case)
+        if type(parsed) == "table" and parsed.epoch then
+            return {}
+        end
+        -- legacy bare array
+        if type(parsed) == "table" and #parsed > 0 then
+            return parsed
+        end
+        return {}
+    end
+
+    -- Extract epoch from a stored lock value.
+    local function get_epoch(raw)
+        if raw == false or raw == nil then return 0 end
+        local ok, parsed = pcall(cjson.decode, raw)
+        if not ok then return 0 end
+        if type(parsed) == "table" and parsed.epoch then
+            return tonumber(parsed.epoch) or 0
+        end
+        return 0
+    end
+
+    local function check_conflict(new_type, new_start, new_end, other_raw)
+        local records = get_records(other_raw)
+        for _, r in ipairs(records) do
+            -- 1 = Write lock
+            if (new_type == 1 or r.lock_type == 1)
+               and overlaps(new_start, new_end,
+                            r.lock_range.start, r.lock_range["end"]) then
+                return true
+            end
+        end
+        return false
+    end
+
+    -- Merge a new lock record into an existing (same-owner) list.
+    -- Returns the new list with UnLock ranges removed and adjacent
+    -- same-type-same-pid records merged.
+    local function update_locks(existing, new_lock)
+        local result = {}
+        local inserted = false
+
+        for _, r in ipairs(existing) do
+            if r.lock_range["end"] <= new_lock.lock_range.start then
+                table.insert(result, r)
+            elseif r.lock_range.start >= new_lock.lock_range["end"] then
+                if not inserted then
+                    table.insert(result, new_lock)
+                    inserted = true
+                end
+                table.insert(result, r)
+            else
+                if r.lock_range.start < new_lock.lock_range.start then
+                    table.insert(result, {
+                        lock_type = r.lock_type, pid = r.pid,
+                        lock_range = {start = r.lock_range.start,
+                                      ["end"] = new_lock.lock_range.start}
+                    })
+                end
+                if not inserted then
+                    table.insert(result, new_lock)
+                    inserted = true
+                end
+                if r.lock_range["end"] > new_lock.lock_range["end"] then
+                    table.insert(result, {
+                        lock_type = r.lock_type, pid = r.pid,
+                        lock_range = {start = new_lock.lock_range["end"],
+                                      ["end"] = r.lock_range["end"]}
+                    })
+                end
+            end
+        end
+
+        if not inserted then
+            table.insert(result, new_lock)
+        end
+
+        -- Remove UnLock records and empty ranges
+        local filtered = {}
+        for _, r in ipairs(result) do
+            if r.lock_type ~= 2 and r.lock_range.start < r.lock_range["end"] then  -- 2 = UnLock
+                table.insert(filtered, r)
+            end
+        end
+
+        -- Merge adjacent same-type same-pid records
+        local merged = {}
+        for _, r in ipairs(filtered) do
+            local last = merged[#merged]
+            if last ~= nil
+               and last.lock_type == r.lock_type
+               and last.pid == r.pid
+               and last.lock_range["end"] == r.lock_range.start then
+                last.lock_range["end"] = r.lock_range["end"]
+            else
+                table.insert(merged, r)
+            end
+        end
+
+        return merged
+    end
+
+    -- ------------------------------------------------------------------
+    -- main
+    -- ------------------------------------------------------------------
+    if lock_type == 2 then  -- UnLock
+        local current_raw = redis.call('HGET', plock_key, field)
+        if current_raw == false then
+            return cjson.encode({ok=true})
+        end
+
+        local stored_epoch = get_epoch(current_raw)
+        -- Fencing: if another (newer) session already wrote here, our
+        -- unlock is stale — silently ignore so we don't corrupt the
+        -- active session's locks.
+        if stored_epoch > epoch then
+            return cjson.encode({ok=true})
+        end
+
+        local existing = get_records(current_raw)
+        local new_lock = {
+            lock_type = 2, pid = pid,  -- 2 = UnLock
+            lock_range = {start = range_start, ["end"] = range_end}
+        }
+        local new_records = update_locks(existing, new_lock)
+
+        if #new_records == 0 then
+            redis.call('HDEL', plock_key, field)
+            redis.call('SREM', locked_key, inode_str)
+        else
+            redis.call('HSET', plock_key, field,
+                        cjson.encode({epoch = epoch, records = new_records}))
+        end
+        return cjson.encode({ok=true})
+    else
+        -- ReadLock or WriteLock — check conflicts with all OTHER owners
+        local all = redis.call('HGETALL', plock_key)
+        for i = 1, #all, 2 do
+            local other_field = all[i]
+            local other_raw   = all[i + 1]
+            if other_field ~= field then
+                if check_conflict(lock_type, range_start, range_end, other_raw) then
+                    return cjson.encode({ok=false, error="lock_conflict"})
+                end
+            end
+        end
+
+        -- Merge into current owner's list
+        local current_raw = redis.call('HGET', plock_key, field)
+        local existing = get_records(current_raw)
+
+        local new_lock = {
+            lock_type = lock_type, pid = pid,
+            lock_range = {start = range_start, ["end"] = range_end}
+        }
+        local new_records = update_locks(existing, new_lock)
+
+        redis.call('HSET', plock_key, field,
+                    cjson.encode({epoch = epoch, records = new_records}))
+        redis.call('SADD', locked_key, inode_str)
+        return cjson.encode({ok=true})
+    end
+"#;
 
 const CHUNK_ID_BASE: u64 = 1_000_000_000u64;
 
@@ -408,13 +715,7 @@ const RENAME_LUA: &str = r#"
         return cjson.encode({ok=false, error="parent_not_directory", ino=new_parent_ino})
     end
 
-    -- Check target doesn't exist
-    local target_exists = redis.call('HEXISTS', new_parent_dir_key, new_name)
-    if target_exists == 1 then
-        return cjson.encode({ok=false, error="already_exists"})
-    end
-
-    -- Get child node
+    -- Get child (source) node early; needed for type-checking against destination
     local child_json = redis.call('GET', child_node_key)
     if not child_json then
         return cjson.encode({ok=false, error="node_not_found", ino=tonumber(dentry_ino)})
@@ -422,6 +723,56 @@ const RENAME_LUA: &str = r#"
     local ok_child, child_node = pcall(cjson.decode, child_json)
     if not ok_child or not child_node or not child_node.attr then
         return cjson.encode({ok=false, error="corrupt_node"})
+    end
+
+    -- Atomically handle existing destination (POSIX rename semantics: destination is
+    -- replaced atomically; no window for concurrent renames to observe a partial state).
+    local new_parent_nlink_adj = 0
+    local dest_ino_str = redis.call('HGET', new_parent_dir_key, new_name)
+    if dest_ino_str then
+        local dest_node_key = 'i' .. dest_ino_str
+        local dest_node_json = redis.call('GET', dest_node_key)
+        if not dest_node_json then
+            return cjson.encode({ok=false, error="corrupt_node"})
+        end
+        local ok_dest, dest_node = pcall(cjson.decode, dest_node_json)
+        if not ok_dest or not dest_node or not dest_node.attr then
+            return cjson.encode({ok=false, error="corrupt_node"})
+        end
+
+        local src_kind = child_node.kind
+        local dest_kind = dest_node.kind
+
+        if src_kind == "Dir" and dest_kind == "Dir" then
+            -- Destination directory must be empty
+            local dest_dir_key = 'd' .. dest_ino_str
+            local dest_entry_count = redis.call('HLEN', dest_dir_key)
+            if dest_entry_count > 0 then
+                return cjson.encode({ok=false, error="target_dir_not_empty", ino=tonumber(dest_ino_str)})
+            end
+            -- Remove destination directory atomically
+            redis.call('HDEL', new_parent_dir_key, new_name)
+            redis.call('DEL', dest_node_key)
+            redis.call('DEL', dest_dir_key)
+            -- Destination dir had a ".." entry pointing to new_parent; account for its removal
+            new_parent_nlink_adj = new_parent_nlink_adj - 1
+        elseif src_kind == "Dir" then
+            -- Directory cannot replace a non-directory
+            return cjson.encode({ok=false, error="target_not_directory", ino=tonumber(dest_ino_str)})
+        elseif dest_kind == "Dir" then
+            -- Non-directory cannot replace a directory
+            return cjson.encode({ok=false, error="target_is_directory", ino=tonumber(dest_ino_str)})
+        else
+            -- file/symlink replacing file/symlink: decrement nlink, delete node if no links remain
+            dest_node.attr.nlink = dest_node.attr.nlink - 1
+            redis.call('HDEL', new_parent_dir_key, new_name)
+            if dest_node.attr.nlink <= 0 then
+                redis.call('DEL', dest_node_key)
+                redis.call('DEL', 'lp:' .. dest_ino_str)
+            else
+                redis.call('SET', dest_node_key, cjson.encode(dest_node))
+            end
+        end
     end
 
     -- Update node parent/name OR link_parents based on node kind/nlink
@@ -497,6 +848,8 @@ const RENAME_LUA: &str = r#"
     if child_node.kind == "Dir" and old_parent_ino ~= new_parent_ino then
         new_parent_node.attr.nlink = new_parent_node.attr.nlink + 1
     end
+    -- Apply nlink adjustment from atomically-removed destination directory
+    new_parent_node.attr.nlink = new_parent_node.attr.nlink + new_parent_nlink_adj
     new_parent_node.attr.mtime = timestamp
     new_parent_node.attr.ctime = timestamp
     redis.call('SET', new_parent_node_key, cjson.encode(new_parent_node))
@@ -691,6 +1044,18 @@ const RENAME_EXCHANGE_LUA: &str = r#"
     return cjson.encode({ok=true})
 "#;
 
+/// Wrapper for deserializing plock values stored by the Lua script.
+/// Format: `{"epoch": N, "records": [{lock_type, pid, lock_range}]}`
+/// Also handles legacy bare-array format for transparent upgrade.
+#[derive(Debug, Deserialize)]
+struct PlockValue {
+    #[serde(default)]
+    #[allow(dead_code)]
+    epoch: Option<i64>,
+    #[serde(default)]
+    records: Vec<PlockRecord>,
+}
+
 /// Response structure for Lua script results
 #[derive(Debug, Deserialize)]
 struct LuaResponse {
@@ -719,11 +1084,17 @@ struct LuaResponse {
 pub struct RedisMetaStore {
     conn: ConnectionManager,
     _config: Config,
-    sid: std::sync::OnceLock<Uuid>,
+    /// Current session id.  Wrapped in a Mutex so it can be updated on
+    /// session restart (OnceLock would permanently fail on second start).
+    sid: std::sync::Mutex<Option<Uuid>>,
+    /// Monotonic fencing token, incremented at session creation.
+    /// Prevents a stale session from releasing locks after cleanup.
+    /// Same Mutex treatment as `sid` — sessions can be restarted.
+    epoch: std::sync::Mutex<Option<i64>>,
     chunk_scan_cursor: std::sync::Mutex<Option<String>>,
     chunk_scan_buffer: std::sync::Mutex<Vec<u64>>,
     chunk_scan_next_cursor: std::sync::Mutex<Option<String>>,
-    global_lock_tokens: std::sync::Mutex<HashMap<String, i64>>,
+    global_lock_tokens: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl RedisMetaStore {
@@ -809,7 +1180,8 @@ impl RedisMetaStore {
         let store = Self {
             conn,
             _config: config,
-            sid: std::sync::OnceLock::new(),
+            sid: std::sync::Mutex::new(None),
+            epoch: std::sync::Mutex::new(None),
             chunk_scan_cursor: std::sync::Mutex::new(None),
             chunk_scan_buffer: std::sync::Mutex::new(Vec::new()),
             chunk_scan_next_cursor: std::sync::Mutex::new(None),
@@ -837,17 +1209,23 @@ impl RedisMetaStore {
     async fn create_connection(config: &Config) -> Result<ConnectionManager, MetaError> {
         match &config.database.db_config {
             DatabaseType::Redis { url } => {
+                info!("connecting to redis: {url}");
                 let resolved_url = Self::resolve_redis_url(url).await?;
+                if *url != resolved_url {
+                    info!("redis host resolved: {url} -> {resolved_url}");
+                }
                 let client = redis::Client::open(resolved_url.as_str()).map_err(|e| {
                     MetaError::Config(format!(
                         "Failed to parse Redis URL {resolved_url} (from {url}): {e}"
                     ))
                 })?;
-                ConnectionManager::new(client).await.map_err(|e| {
+                let cm = ConnectionManager::new(client).await.map_err(|e| {
                     MetaError::Config(format!(
                         "Failed to connect to Redis backend using {resolved_url}: {e}"
                     ))
-                })
+                })?;
+                info!("redis connection established");
+                Ok(cm)
             }
             _ => Err(MetaError::Config(
                 "RedisMetaStore requires database.type = redis".to_string(),
@@ -925,11 +1303,11 @@ impl RedisMetaStore {
     async fn init_root_directory(&self) -> Result<(), MetaError> {
         let mut conn = self.conn.clone();
         let root_key = self.node_key(ROOT_INODE);
-        let exists: bool = conn.exists(root_key).await.map_err(redis_err)?;
-        if exists {
-            return Ok(());
-        }
 
+        // Use SETNX so concurrent initializations can't both pass an exists
+        // check and then both write — the first SETNX wins and initialises,
+        // the second is a no-op.  This eliminates the TOCTOU race between
+        // the old EXISTS + SET pair.
         let now = current_time();
         let attr = StoredAttr {
             size: 0,
@@ -952,11 +1330,19 @@ impl RedisMetaStore {
         };
 
         let data = serde_json::to_vec(&root).map_err(|e| MetaError::Internal(e.to_string()))?;
-        let _: () = conn
-            .set(self.node_key(ROOT_INODE), data)
+        // SETNX returns 1 if the key was created, 0 if it already existed.
+        let created: bool = redis::cmd("SETNX")
+            .arg(&root_key)
+            .arg(&data)
+            .query_async(&mut conn)
             .await
             .map_err(redis_err)?;
+        if !created {
+            return Ok(()); // another caller initialised first
+        }
+
         // Ensure the root directory hash exists for emptiness checks.
+        // (HSET + HDEL is idempotent — harmless if another init races here.)
         let _: () = redis::cmd("HSET")
             .arg(self.dir_key(ROOT_INODE))
             .arg("__root__")
@@ -1173,6 +1559,89 @@ impl RedisMetaStore {
         format!("{}:{}", sid, owner)
     }
 
+    fn flock_key(&self, inode: i64) -> String {
+        format!("{}:{}", FLOCK_PREFIX, inode)
+    }
+
+    /// Atomically set or release a BSD flock.
+    ///
+    /// Uses FLOCK_LUA for atomic read-check-write inside Redis.
+    /// Returns LockConflict when a blocking caller should retry.
+    async fn try_set_flock(
+        &self,
+        inode: i64,
+        owner: i64,
+        lock_type: FileLockType,
+    ) -> Result<(), MetaError> {
+        let sid = self.get_sid()?;
+        let epoch = self.get_epoch()?;
+        let flock_key = self.flock_key(inode);
+        let locked_key = Self::locked_key(sid);
+        let field = self.plock_field(&sid, owner);
+
+        let lock_type_num = lock_type.as_u32();
+
+        let script = redis::Script::new(FLOCK_LUA);
+        let result: String = script
+            .key(&flock_key)
+            .key(&locked_key)
+            .arg(&field)
+            .arg(lock_type_num)
+            .arg(inode)
+            .arg(epoch)
+            .invoke_async(&mut self.conn.clone())
+            .await
+            .map_err(redis_err)?;
+
+        let response: LuaResponse = serde_json::from_str(&result)
+            .map_err(|e| MetaError::Internal(format!("flock Lua response parse error: {e}")))?;
+
+        match response.error.as_deref() {
+            Some("lock_conflict") => Err(MetaError::LockConflict {
+                inode,
+                owner,
+                range: FileLockRange {
+                    start: 0,
+                    end: u64::MAX,
+                },
+            }),
+            Some(other) => Err(MetaError::Internal(format!("flock Lua error: {other}"))),
+            None if response.ok => Ok(()),
+            None => Err(MetaError::Internal("unexpected flock Lua response".into())),
+        }
+    }
+
+    async fn get_flock_inner(&self, inode: i64, owner: i64) -> Result<FileLockType, MetaError> {
+        let sid = self.get_sid()?;
+        let field = self.plock_field(&sid, owner);
+        let flock_key = self.flock_key(inode);
+
+        let raw: Option<String> = redis::cmd("HGET")
+            .arg(&flock_key)
+            .arg(&field)
+            .query_async(&mut self.conn.clone())
+            .await
+            .map_err(redis_err)?;
+
+        Ok(match raw {
+            Some(v) => {
+                let parsed: serde_json::Value = serde_json::from_str(&v).unwrap_or_default();
+                match parsed.get("val").and_then(|v| v.as_str()) {
+                    Some("W") => FileLockType::Write,
+                    Some("R") => FileLockType::Read,
+                    _ => FileLockType::UnLock,
+                }
+            }
+            None => FileLockType::UnLock,
+        })
+    }
+
+    /// Atomically set or release a POSIX advisory lock.
+    ///
+    /// Uses a Redis Lua script to perform the read-check-write cycle
+    /// atomically, following the same pattern as the other metadata
+    /// mutations (CREATE_ENTRY_LUA, RENAME_LUA, etc.).  This avoids the
+    /// TOCTOU race that a plain HGETALL + HSET would have.
     async fn try_set_plock(
         &self,
         inode: i64,
@@ -1181,109 +1650,41 @@ impl RedisMetaStore {
         lock_type: FileLockType,
         range: FileLockRange,
     ) -> Result<(), MetaError> {
-        let mut conn = self.conn.clone();
+        let sid = self.get_sid()?;
+        let epoch = self.get_epoch()?;
         let plock_key = self.plock_key(inode);
-        let sid = self
-            .sid
-            .get()
-            .ok_or_else(|| MetaError::Internal("sid not set".to_string()))?;
-        let field = self.plock_field(sid, owner);
+        let locked_key = Self::locked_key(sid);
+        let field = self.plock_field(&sid, owner);
 
-        // Check if file exists
-        if self.get_node(inode).await?.is_none() {
-            return Err(MetaError::NotFound(inode));
-        }
+        let lock_type_num = lock_type.as_u32();
 
-        match lock_type {
-            FileLockType::UnLock => {
-                // Handle unlock
-                let current_json: Option<String> =
-                    conn.hget(&plock_key, &field).await.map_err(redis_err)?;
+        let script = redis::Script::new(SET_PLOCK_LUA);
+        let result: String = script
+            .key(&plock_key)
+            .key(&locked_key)
+            .arg(&field)
+            .arg(lock_type_num)
+            .arg(new_lock.pid)
+            .arg(new_lock.lock_range.start)
+            .arg(new_lock.lock_range.end)
+            .arg(inode)
+            .arg(epoch)
+            .invoke_async(&mut self.conn.clone())
+            .await
+            .map_err(redis_err)?;
 
-                if let Some(json) = current_json {
-                    let records: Vec<PlockRecord> = serde_json::from_str(&json).unwrap_or_default();
+        let response: LuaResponse = serde_json::from_str(&result)
+            .map_err(|e| MetaError::Internal(format!("plock Lua response parse error: {e}")))?;
 
-                    if records.is_empty() {
-                        // Remove the field if no records
-                        let _: () = redis::pipe()
-                            .atomic()
-                            .hdel(&plock_key, &field)
-                            .srem(Self::locked_key(*sid), inode)
-                            .exec_async(&mut conn)
-                            .await
-                            .map_err(redis_err)?;
-                        return Ok(());
-                    }
-
-                    let new_records = PlockRecord::update_locks(records, new_lock);
-
-                    if new_records.is_empty() {
-                        // Remove the field if no records after update
-                        let _: () = conn.hdel(&plock_key, &field).await.map_err(redis_err)?;
-                    } else {
-                        let new_json = serde_json::to_string(&new_records).map_err(|e| {
-                            MetaError::Internal(format!("Serialization error: {e}"))
-                        })?;
-                        let _: () = conn
-                            .hset(&plock_key, &field, new_json)
-                            .await
-                            .map_err(redis_err)?;
-                    }
-                }
-                Ok(())
-            }
-            _ => {
-                // Handle lock request (ReadLock or WriteLock)
-                let all_entries: std::collections::HashMap<String, String> =
-                    conn.hgetall(&plock_key).await.map_err(redis_err)?;
-
-                // Get current locks for this owner/session
-                let current_records = if let Some(json) = all_entries.get(&field) {
-                    serde_json::from_str(json).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-
-                // Check for conflicts with other locks
-                let mut conflict_found = false;
-
-                for (other_field, other_records_json) in all_entries {
-                    if other_field == field {
-                        continue;
-                    }
-
-                    let other_records: Vec<PlockRecord> =
-                        serde_json::from_str(&other_records_json).unwrap_or_default();
-
-                    conflict_found =
-                        PlockRecord::check_conflict(&lock_type, &range, &other_records);
-                    if conflict_found {
-                        break;
-                    }
-                }
-
-                if conflict_found {
-                    return Err(MetaError::LockConflict {
-                        inode,
-                        owner,
-                        range,
-                    });
-                }
-
-                // Update locks
-                let new_records = PlockRecord::update_locks(current_records, new_lock);
-                let new_json = serde_json::to_string(&new_records)
-                    .map_err(|e| MetaError::Internal(format!("Serialization error: {e}")))?;
-
-                let _: () = redis::pipe()
-                    .atomic()
-                    .hset(&plock_key, &field, new_json)
-                    .sadd(Self::locked_key(*sid), inode)
-                    .exec_async(&mut conn)
-                    .await
-                    .map_err(redis_err)?;
-                Ok(())
-            }
+        match response.error.as_deref() {
+            Some("lock_conflict") => Err(MetaError::LockConflict {
+                inode,
+                owner,
+                range,
+            }),
+            Some(other) => Err(MetaError::Internal(format!("plock Lua error: {other}"))),
+            None if response.ok => Ok(()),
+            None => Err(MetaError::Internal("unexpected plock Lua response".into())),
         }
     }
 
@@ -1337,51 +1738,31 @@ impl RedisMetaStore {
     }
 
     async fn shutdown_session_by_id(&self, session_id: Uuid) -> Result<(), MetaError> {
-        let mut conn = self.conn.clone();
-        let session_id_string = session_id.to_string();
-
         let locked_key = Self::locked_key(session_id);
+        let sid_str = session_id.to_string();
+        let plock_prefix = format!("{PLOCK_PREFIX}:");
 
-        let locked_files: Vec<i64> = conn
-            .smembers(&locked_key)
+        let script = redis::Script::new(CLEANUP_SESSION_LUA);
+        let result: String = script
+            .key(&locked_key)
+            .key(ALL_SESSIONS_KEY)
+            .key(SESSION_INFOS_KEY)
+            .arg(&sid_str)
+            .arg(&plock_prefix)
+            .invoke_async(&mut self.conn.clone())
             .await
-            .map_err(|e| MetaError::Internal(format!("Failed to get locked files: {}", e)))?;
-        let mut pipe = redis::pipe();
-        let pipe_atomic = pipe.atomic();
-        for file in locked_files {
-            let owners: Vec<String> = conn
-                .hkeys(self.plock_key(file))
-                .await
-                .map_err(|e| MetaError::Internal(e.to_string()))?;
+            .map_err(redis_err)?;
 
-            let mut fields: Vec<String> = Vec::new();
-            for owner in owners {
-                let owner_sid = owner.split(':').next().ok_or_else(|| {
-                    MetaError::Internal(format!(
-                        "Malformed lock owner format in Redis: '{}'",
-                        owner
-                    ))
-                })?;
-                if owner_sid == session_id_string {
-                    fields.push(owner);
-                }
-            }
+        let response: LuaResponse = serde_json::from_str(&result)
+            .map_err(|e| MetaError::Internal(format!("cleanup_session Lua parse error: {e}")))?;
 
-            if !fields.is_empty() {
-                pipe_atomic.hdel(self.plock_key(file), &fields);
-            }
-
-            pipe_atomic.srem(&locked_key, file);
+        if response.ok {
+            Ok(())
+        } else {
+            Err(MetaError::Internal(response.error.unwrap_or_else(|| {
+                "cleanup_session Lua script failed".into()
+            })))
         }
-
-        pipe_atomic
-            .zrem(ALL_SESSIONS_KEY, &session_id_string)
-            .hdel(SESSION_INFOS_KEY, &session_id_string)
-            .exec_async(&mut conn)
-            .await
-            .map_err(|err| MetaError::Internal(err.to_string()))?;
-
-        Ok(())
     }
 
     async fn prune_slices_for_truncate(
@@ -1417,16 +1798,24 @@ impl RedisMetaStore {
         .await
     }
 
-    fn set_sid(&self, session_id: Uuid) -> Result<(), MetaError> {
-        self.sid
-            .set(session_id)
-            .map_err(|_| MetaError::Internal("sid has been set".to_string()))?;
-        Ok(())
+    fn set_sid(&self, session_id: Uuid) {
+        *self.sid.lock().unwrap() = Some(session_id);
     }
-    fn get_sid(&self) -> Result<&Uuid, MetaError> {
+    fn get_sid(&self) -> Result<Uuid, MetaError> {
         self.sid
-            .get()
+            .lock()
+            .map_err(|_| MetaError::Internal("sid lock poisoned".to_string()))?
             .ok_or_else(|| MetaError::Internal("sid has not been set".to_string()))
+    }
+
+    fn set_epoch(&self, epoch: i64) {
+        *self.epoch.lock().unwrap() = Some(epoch);
+    }
+    fn get_epoch(&self) -> Result<i64, MetaError> {
+        self.epoch
+            .lock()
+            .map_err(|_| MetaError::Internal("epoch lock poisoned".to_string()))?
+            .ok_or_else(|| MetaError::Internal("epoch has not been set".to_string()))
     }
 
     async fn refresh_session(
@@ -3054,6 +3443,16 @@ impl MetaStore for RedisMetaStore {
     ) -> Result<Session, MetaError> {
         let mut conn = self.conn.clone();
 
+        // Increment the global fencing-token epoch so that locks written by
+        // this session carry a monotonic version.  Stale sessions whose
+        // locks were cleaned up carry a lower epoch and are silently ignored.
+        let epoch: i64 = redis::cmd("INCR")
+            .arg(PLOCK_EPOCH_KEY)
+            .query_async(&mut conn)
+            .await
+            .map_err(|err| MetaError::Internal(format!("Failed to incr plock epoch: {err}")))?;
+        self.set_epoch(epoch);
+
         let session_id = Uuid::now_v7();
         let expire = (Utc::now() + chrono::Duration::minutes(5)).timestamp_millis();
         let session = Session {
@@ -3074,7 +3473,7 @@ impl MetaStore for RedisMetaStore {
             .exec_async(&mut conn)
             .await
             .map_err(|err| MetaError::Internal(err.to_string()))?;
-        self.set_sid(session_id)?;
+        self.set_sid(session_id);
 
         tokio::spawn(Self::life_cycle(
             token.clone(),
@@ -3088,7 +3487,7 @@ impl MetaStore for RedisMetaStore {
     #[tracing::instrument(level = "trace", skip(self))]
     async fn shutdown_session(&self) -> Result<(), MetaError> {
         let session_id = self.get_sid()?;
-        self.shutdown_session_by_id(*session_id).await?;
+        self.shutdown_session_by_id(session_id).await?;
         Ok(())
     }
 
@@ -3113,6 +3512,10 @@ impl MetaStore for RedisMetaStore {
         let lock_name = lock_name.to_string();
         let mut conn = self.conn.clone();
         let now = Utc::now().timestamp_millis();
+        // Generate a unique nonce to prevent token collision between nodes
+        // that acquire the lock within the same millisecond after TTL expiry.
+        let nonce: u64 = rand::random();
+        let token_value = format!("{}:{}", now, nonce);
 
         let script = redis::Script::new(
             r#"
@@ -3120,19 +3523,32 @@ impl MetaStore for RedisMetaStore {
             local field = ARGV[1]
             local now_time = tonumber(ARGV[2])
             local diff = tonumber(ARGV[3])
+            local new_token = ARGV[4]
 
-            local last_updated = redis.call("HGET",key,field)
+            local current = redis.call("HGET", key, field)
 
-            if last_updated == false then
-                redis.call("HSET", key, field, now_time)
-                return now_time
+            if current == false then
+                redis.call("HSET", key, field, new_token)
+                return new_token
             else
-                last_updated = tonumber(last_updated)
-                if now_time < last_updated + diff then
+                -- Parse timestamp from "timestamp:nonce" format
+                local colon_pos = string.find(current, ":", 1, true)
+                local locked_at
+                if colon_pos then
+                    locked_at = tonumber(string.sub(current, 1, colon_pos - 1))
+                else
+                    locked_at = tonumber(current)
+                end
+                if locked_at == nil then
+                    -- Corrupted value, overwrite
+                    redis.call("HSET", key, field, new_token)
+                    return new_token
+                end
+                if now_time < locked_at + diff then
                     return false
                 else
-                    redis.call("HSET", key, field, now_time)
-                    return now_time
+                    redis.call("HSET", key, field, new_token)
+                    return new_token
                 end
             end
             "#,
@@ -3145,30 +3561,32 @@ impl MetaStore for RedisMetaStore {
             .arg(&lock_name)
             .arg(now)
             .arg(diff)
+            .arg(&token_value)
             .invoke_async(&mut conn)
             .await;
 
         match resp {
             Ok(redis::Value::BulkString(bytes)) => {
-                // Lua returns the token (timestamp) as a number, which redis-rs
-                // may encode as a bulk string in some versions.
-                if let Ok(token_str) = std::str::from_utf8(&bytes)
-                    && let Ok(token) = token_str.parse::<i64>()
-                {
+                if let Ok(returned_token) = std::str::from_utf8(&bytes) {
+                    if returned_token == "false" || returned_token == "0" {
+                        return false;
+                    }
                     if let Ok(mut tokens) = self.global_lock_tokens.lock() {
-                        tokens.insert(lock_name, token);
+                        tokens.insert(lock_name, returned_token.to_string());
                     }
                     return true;
                 }
                 false
             }
-            Ok(redis::Value::Int(token)) => {
+            Ok(redis::Value::SimpleString(s)) => {
+                if s == "false" || s == "0" {
+                    return false;
+                }
                 if let Ok(mut tokens) = self.global_lock_tokens.lock() {
-                    tokens.insert(lock_name, token);
+                    tokens.insert(lock_name, s);
                 }
                 true
             }
-            Ok(redis::Value::SimpleString(s)) if s == "false" || s == "0" => false,
             Ok(redis::Value::Nil) => false,
             Ok(other) => {
                 tracing::warn!("Unexpected response from get_global_lock Lua: {:?}", other);
@@ -3187,15 +3605,23 @@ impl MetaStore for RedisMetaStore {
         let now = Utc::now().timestamp_millis();
         let ttl_millis = chrono::Duration::seconds(ttl_secs as i64).num_milliseconds();
 
-        let locked_at: Option<i64> = conn
+        let stored: Option<String> = conn
             .hget(LOCKS_KEY, &lock_name)
             .await
             .map_err(redis_err)
             .ok()
             .flatten();
 
-        match locked_at {
-            Some(locked_at) => now <= locked_at + ttl_millis,
+        match stored {
+            Some(value) => {
+                // Parse timestamp from "timestamp:nonce" or legacy plain integer format
+                let locked_at = if let Some(colon_pos) = value.find(':') {
+                    value[..colon_pos].parse::<i64>().unwrap_or(0)
+                } else {
+                    value.parse::<i64>().unwrap_or(0)
+                };
+                now <= locked_at + ttl_millis
+            }
             None => false,
         }
     }
@@ -3203,7 +3629,7 @@ impl MetaStore for RedisMetaStore {
     async fn release_global_lock(&self, lock_name: LockName) -> bool {
         let lock_name = lock_name.to_string();
         let expected_token = match self.global_lock_tokens.lock() {
-            Ok(tokens) => tokens.get(&lock_name).copied(),
+            Ok(tokens) => tokens.get(&lock_name).cloned(),
             Err(err) => {
                 error!("Error reading local lock token {}: {}", lock_name, err);
                 None
@@ -3219,14 +3645,13 @@ impl MetaStore for RedisMetaStore {
             r#"
             local key = KEYS[1]
             local field = ARGV[1]
-            local expected = tonumber(ARGV[2])
+            local expected = ARGV[2]
 
             local current = redis.call("HGET", key, field)
             if current == false then
                 return false
             end
 
-            current = tonumber(current)
             if current == expected then
                 redis.call("HDEL", key, field)
                 return true
@@ -3239,7 +3664,7 @@ impl MetaStore for RedisMetaStore {
         let resp: Result<bool, _> = script
             .key(LOCKS_KEY)
             .arg(&lock_name)
-            .arg(expected_token)
+            .arg(&expected_token)
             .invoke_async(&mut conn)
             .await;
 
@@ -3270,28 +3695,33 @@ impl MetaStore for RedisMetaStore {
     ) -> Result<FileLockInfo, MetaError> {
         let mut conn = self.conn.clone();
         let plock_key = self.plock_key(inode);
-        let sid = self
-            .sid
-            .get()
-            .ok_or_else(|| MetaError::Internal("sid not set".to_string()))?;
+        let sid = self.get_sid()?;
         let current_field = format!("{}:{}", sid, query.owner);
+        // Single HGETALL fetches all lock entries — iterate the result directly
+        // instead of making redundant HKEYS + per-field HGET calls.
         let plock_entries: std::collections::HashMap<String, String> =
             conn.hgetall(&plock_key).await.map_err(redis_err)?;
 
+        // Helper to parse plock values: new {epoch, records} format first,
+        // then fall back to legacy bare-array format for transparent upgrade.
+        let parse_records = |raw: &str| -> Vec<PlockRecord> {
+            serde_json::from_str::<PlockValue>(raw)
+                .map(|v| v.records)
+                .or_else(|_| serde_json::from_str::<Vec<PlockRecord>>(raw))
+                .unwrap_or_default()
+        };
+
         // First, try to get locks from current session's field
         if let Some(records_json) = plock_entries.get(&current_field) {
-            let records: Vec<PlockRecord> = serde_json::from_str(records_json).unwrap_or_default();
-            if let Some(v) = PlockRecord::get_plock(&records, query, sid, sid) {
+            let records = parse_records(records_json);
+            if let Some(v) = PlockRecord::get_plock(&records, query, &sid, &sid) {
                 return Ok(v);
             }
         }
 
-        // Get all plock entries for this inode
-        let plock_entries: Vec<String> = conn.hkeys(&plock_key).await.map_err(redis_err)?;
-
-        for field in plock_entries {
-            // Skip current field as we already checked it
-            if field == current_field {
+        // Check other sessions' locks from the already-fetched HGETALL result
+        for (field, records_json) in &plock_entries {
+            if *field == current_field {
                 continue;
             }
 
@@ -3302,14 +3732,10 @@ impl MetaStore for RedisMetaStore {
 
             let lock_sid = Uuid::parse_str(parts[0])
                 .map_err(|_| MetaError::Internal("Invalid sid in plock field".to_string()))?;
-            let _lock_owner: i64 = parts[1]
-                .parse()
-                .map_err(|_| MetaError::Internal("Invalid owner in plock field".to_string()))?;
 
-            let records_json: String = conn.hget(&plock_key, &field).await.map_err(redis_err)?;
-            let records: Vec<PlockRecord> = serde_json::from_str(&records_json).unwrap_or_default();
+            let records = parse_records(records_json);
 
-            if let Some(v) = PlockRecord::get_plock(&records, query, sid, &lock_sid) {
+            if let Some(v) = PlockRecord::get_plock(&records, query, &sid, &lock_sid) {
                 return Ok(v);
             }
         }
@@ -3338,6 +3764,16 @@ impl MetaStore for RedisMetaStore {
     ) -> Result<(), MetaError> {
         let new_lock = PlockRecord::new(lock_type, pid, range.start, range.end);
 
+        // If blocking: add a small random delay before the first attempt so
+        // concurrent waiters don't burst in sync.  This gives each waiter a
+        // different cadence and statistical fairness without needing a
+        // server-side queue.
+        if block {
+            let initial_jitter_ms = (rand::random::<f64>() * 2.0) as u64;
+            tokio::time::sleep(tokio::time::Duration::from_millis(initial_jitter_ms)).await;
+        }
+
+        let mut attempt: u32 = 0;
         loop {
             let result = self
                 .try_set_plock(inode, owner, new_lock, lock_type, range)
@@ -3346,16 +3782,80 @@ impl MetaStore for RedisMetaStore {
             match result {
                 Ok(()) => return Ok(()),
                 Err(MetaError::LockConflict { .. }) if block => {
-                    if lock_type == FileLockType::Write {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                    } else {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    }
-                    continue;
+                    // Exponential backoff with jitter to prevent thundering-herd.
+                    // Base 2 ms, capped at 50 ms so long-waiting clients aren't
+                    // excessively penalized relative to new arrivals.
+                    let base_ms: u64 = 2;
+                    let max_ms: u64 = 50;
+                    let exp = attempt.min(8);
+                    let delay_ms = (base_ms * (1u64 << exp)).min(max_ms);
+                    // Jitter: 0.5–1.5 × delay
+                    let jitter: f64 = 0.5 + rand::random::<f64>();
+                    let jittered_ms = ((delay_ms as f64) * jitter) as u64;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(jittered_ms)).await;
+                    attempt += 1;
                 }
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Set or release a BSD flock (whole-file advisory lock).
+    ///
+    /// When `block` is true and a conflict is detected the call will poll
+    /// with short sleeps (1 ms for write locks, 10 ms for read locks)
+    /// mirroring the JuiceFS strategy for fairness.
+    async fn set_flock(
+        &self,
+        inode: i64,
+        owner: i64,
+        block: bool,
+        lock_type: FileLockType,
+    ) -> Result<(), MetaError> {
+        if block {
+            let initial_jitter_ms = (rand::random::<f64>() * 2.0) as u64;
+            tokio::time::sleep(tokio::time::Duration::from_millis(initial_jitter_ms)).await;
+        }
+
+        loop {
+            match self.try_set_flock(inode, owner, lock_type).await {
+                Ok(()) => return Ok(()),
+                Err(MetaError::LockConflict { .. }) if block => {
+                    let delay_ms: u64 = if lock_type == FileLockType::Write {
+                        1
+                    } else {
+                        10
+                    };
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn get_flock(&self, inode: i64, owner: i64) -> Result<FileLockType, MetaError> {
+        let sid = self.get_sid()?;
+        let field = self.plock_field(&sid, owner);
+        let flock_key = self.flock_key(inode);
+
+        let raw: Option<String> = redis::cmd("HGET")
+            .arg(&flock_key)
+            .arg(&field)
+            .query_async(&mut self.conn.clone())
+            .await
+            .map_err(redis_err)?;
+
+        Ok(match raw {
+            Some(v) => {
+                let parsed: serde_json::Value = serde_json::from_str(&v).unwrap_or_default();
+                match parsed.get("val").and_then(|v| v.as_str()) {
+                    Some("W") => FileLockType::Write,
+                    Some("R") => FileLockType::Read,
+                    _ => FileLockType::UnLock,
+                }
+            }
+            None => FileLockType::UnLock,
+        })
     }
 }
 

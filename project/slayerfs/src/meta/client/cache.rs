@@ -11,7 +11,7 @@ use dashmap::{DashMap, Entry};
 use moka::future::Cache;
 use moka::notification::RemovalCause;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::debug;
 
 /// Type alias for children map to reduce complexity
 /// BTreeMap provides ordered iteration for consistent ls output
@@ -113,7 +113,7 @@ impl InodeCache {
             .time_to_idle(ttl)
             .eviction_listener(
                 move |key: Arc<i64>, _value: Arc<InodeEntry>, cause: RemovalCause| {
-                    info!("InodeCache: Evicting inode {} (cause: {:?})", key, cause);
+                    debug!("InodeCache: Evicting inode {} (cause: {:?})", key, cause);
                     entries_clone.remove(&*key);
                 },
             )

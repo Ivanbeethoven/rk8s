@@ -11,14 +11,14 @@ use tracing::{debug, error, info, warn};
 
 type CompactionHook = Arc<dyn Fn(u64) + Send + Sync>;
 
-pub struct ChunkLockGuard<M: MetaStore + ?Sized> {
+pub struct ChunkLockGuard<M: MetaStore + ?Sized + 'static> {
     chunk_id: u64,
     locked_chunks: Arc<RwLock<HashSet<u64>>>,
     meta_store: Arc<M>,
     unlocked: bool,
 }
 
-impl<M: MetaStore + ?Sized> ChunkLockGuard<M> {
+impl<M: MetaStore + ?Sized + 'static> ChunkLockGuard<M> {
     fn new(chunk_id: u64, locked_chunks: Arc<RwLock<HashSet<u64>>>, meta_store: Arc<M>) -> Self {
         Self {
             chunk_id,
@@ -52,12 +52,18 @@ impl<M: MetaStore + ?Sized> ChunkLockGuard<M> {
     }
 }
 
-impl<M: MetaStore + ?Sized> Drop for ChunkLockGuard<M> {
+impl<M: MetaStore + ?Sized + 'static> Drop for ChunkLockGuard<M> {
     fn drop(&mut self) {
         if !self.unlocked {
             let chunk_id = self.chunk_id;
             let locked_chunks = Arc::clone(&self.locked_chunks);
+            let meta_store = Arc::clone(&self.meta_store);
             tokio::spawn(async move {
+                // Best-effort release of global lock on unexpected drop (panic, early return).
+                // TTL expiry is still the ultimate fallback for crash scenarios.
+                let _ = meta_store
+                    .release_global_lock(LockName::ChunkCompactLock(chunk_id))
+                    .await;
                 let mut locked = locked_chunks.write().await;
                 locked.remove(&chunk_id);
             });
@@ -94,7 +100,7 @@ pub struct CompactLockManager<M: MetaStore + ?Sized> {
     ttl_config: LockTtlConfig,
 }
 
-impl<M: MetaStore + ?Sized> CompactLockManager<M> {
+impl<M: MetaStore + ?Sized + 'static> CompactLockManager<M> {
     #[allow(dead_code)]
     pub fn new(meta_store: Arc<M>) -> Self {
         Self {
@@ -299,63 +305,75 @@ where
                     }
                 };
 
-                if is_sync {
-                    let mut lock_guard =
-                        lock_manager.try_lock(chunk_id, slice_count, is_sync).await;
+                // Both sync and async compaction require the distributed lock
+                // to prevent multiple nodes from compacting the same chunk.
+                let mut lock_guard = lock_manager.try_lock(chunk_id, slice_count, is_sync).await;
 
-                    if lock_guard.is_none() {
-                        warn!(
-                            chunk_id,
-                            "Could not acquire compact lock (local or global), skipping"
-                        );
+                if lock_guard.is_none() {
+                    debug!(
+                        chunk_id,
+                        is_sync, "Could not acquire compact lock (local or global), skipping"
+                    );
+                    continue;
+                }
+
+                // Re-read slice count after acquiring lock to reduce TOCTOU window.
+                // Another node may have already compacted this chunk.
+                let slice_count = match compactor.analyze_chunk(chunk_id).await {
+                    Ok((count, _, _)) => count,
+                    Err(e) => {
+                        warn!(chunk_id, error = %e, "Failed to re-analyze chunk after lock");
+                        if let Some(ref mut guard) = lock_guard {
+                            guard.unlock().await;
+                        }
                         continue;
                     }
+                };
 
-                    info!(chunk_id, "Acquired sync compact lock, blocking writes");
-
-                    let result = compactor.compact_sequential(chunk_id).await;
-                    if let Some(ref mut guard) = lock_guard {
-                        guard.unlock().await;
+                // Re-check if compaction is still needed after lock
+                match compactor.should_compact(chunk_id).await {
+                    Ok((true, _)) => {}
+                    _ => {
+                        debug!(chunk_id, "Compaction no longer needed after re-check");
+                        if let Some(ref mut guard) = lock_guard {
+                            guard.unlock().await;
+                        }
+                        continue;
                     }
+                }
 
-                    match result {
-                        Ok(CompactResult::Skipped) => {
-                            debug!(chunk_id, "Sync compaction skipped");
-                        }
-                        Ok(CompactResult::Light { removed }) => {
-                            info!(chunk_id, removed, "Sync light compaction completed");
-                            if let Some(hook) = compaction_hook {
-                                hook(chunk_id);
-                            }
-                        }
-                        Ok(CompactResult::Heavy { .. }) => {
-                            info!(chunk_id, "Sync heavy compaction completed");
-                            if let Some(hook) = compaction_hook {
-                                hook(chunk_id);
-                            }
-                        }
-                        Err(e) => {
-                            warn!(chunk_id, error = %e, "Sync compaction failed");
-                        }
-                    }
+                if is_sync {
+                    info!(
+                        chunk_id,
+                        slice_count, "Acquired sync compact lock, blocking writes"
+                    );
                 } else {
-                    match compactor.compact_sequential(chunk_id).await {
-                        Ok(CompactResult::Skipped) => {}
-                        Ok(CompactResult::Light { removed }) => {
-                            debug!(chunk_id, removed, "Async light compaction completed");
-                            if let Some(hook) = compaction_hook {
-                                hook(chunk_id);
-                            }
+                    debug!(chunk_id, slice_count, "Acquired async compact lock");
+                }
+
+                let result = compactor.compact_sequential(chunk_id).await;
+                if let Some(ref mut guard) = lock_guard {
+                    guard.unlock().await;
+                }
+
+                match result {
+                    Ok(CompactResult::Skipped) => {
+                        debug!(chunk_id, "Compaction skipped");
+                    }
+                    Ok(CompactResult::Light { removed }) => {
+                        info!(chunk_id, removed, is_sync, "Light compaction completed");
+                        if let Some(hook) = compaction_hook {
+                            hook(chunk_id);
                         }
-                        Ok(CompactResult::Heavy { .. }) => {
-                            debug!(chunk_id, "Async heavy compaction completed");
-                            if let Some(hook) = compaction_hook {
-                                hook(chunk_id);
-                            }
+                    }
+                    Ok(CompactResult::Heavy { .. }) => {
+                        info!(chunk_id, is_sync, "Heavy compaction completed");
+                        if let Some(hook) = compaction_hook {
+                            hook(chunk_id);
                         }
-                        Err(e) => {
-                            warn!(chunk_id, error = %e, "Async compaction failed");
-                        }
+                    }
+                    Err(e) => {
+                        warn!(chunk_id, error = %e, is_sync, "Compaction failed");
                     }
                 }
             }

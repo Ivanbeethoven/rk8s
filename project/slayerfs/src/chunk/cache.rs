@@ -1217,7 +1217,7 @@ impl ChunksCache {
 
     /// Creates a new ChunksCache with custom configuration
     pub async fn new_with_config(mut config: ChunksCacheConfig) -> anyhow::Result<Self> {
-        info!(
+        debug!(
             "Creating new ChunksCache with configuration: hot_cache_size={}, cold_cache_size={}, base_promotion_threshold={}",
             config.hot_cache_size, config.cold_cache_size, config.base_promotion_threshold
         );

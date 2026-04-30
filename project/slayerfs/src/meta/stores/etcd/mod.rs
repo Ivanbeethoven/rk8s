@@ -61,7 +61,7 @@ pub struct EtcdMetaStore {
     _config: Config,
     /// Local ID pools keyed by counter key (inode, slice, etc.)
     id_pools: IdPool,
-    global_lock_tokens: Mutex<HashMap<String, i64>>,
+    global_lock_tokens: Mutex<HashMap<String, String>>,
     chunk_scan_cursor: Mutex<Option<String>>,
     sid: OnceLock<Uuid>,
     lease: OnceLock<i64>,
@@ -2661,30 +2661,36 @@ impl MetaStore for EtcdMetaStore {
     #[tracing::instrument(level = "trace", skip(self), fields(lock_name = ?lock_name, ttl_secs))]
     async fn get_global_lock(&self, lock_name: LockName, ttl_secs: u64) -> bool {
         let lock_key = lock_name.to_string();
+        let nonce: u64 = rand::random();
         let result = EtcdTxn::new(&self.client)
             .max_retries(3)
             .run(|tx| {
                 let lock_key = lock_key.clone();
+                let nonce = nonce;
 
                 Box::pin(async move {
                     let now = Utc::now().timestamp_millis();
-                    let current = tx.get_typed_json::<i64>(&lock_key).await?;
+                    let current = tx.get_typed_json::<String>(&lock_key).await?;
 
-                    let acquired_token = if let Some(current) = current {
-                        if now > current + Duration::seconds(ttl_secs as i64).num_milliseconds() {
-                            Some(now)
+                    let should_acquire = if let Some(ref current) = current {
+                        // Parse timestamp from "timestamp:nonce" or legacy plain integer
+                        let locked_at = if let Some(colon_pos) = current.find(':') {
+                            current[..colon_pos].parse::<i64>().unwrap_or(0)
                         } else {
-                            None
-                        }
+                            current.parse::<i64>().unwrap_or(0)
+                        };
+                        now > locked_at + Duration::seconds(ttl_secs as i64).num_milliseconds()
                     } else {
-                        Some(now)
+                        true
                     };
 
-                    if let Some(token) = acquired_token {
+                    if should_acquire {
+                        let token = format!("{}:{}", now, nonce);
                         tx.set_typed_json(&lock_key, &token)?;
+                        Ok(Some(token))
+                    } else {
+                        Ok(None)
                     }
-
-                    Ok(acquired_token)
                 })
             })
             .await;
@@ -2709,8 +2715,15 @@ impl MetaStore for EtcdMetaStore {
         let now = Utc::now().timestamp_millis();
         let ttl_millis = Duration::seconds(ttl_secs as i64).num_milliseconds();
 
-        match self.etcd_get_json_serde_only::<i64>(&lock_key).await {
-            Ok(Some(locked_at)) => now <= locked_at + ttl_millis,
+        match self.etcd_get_json_serde_only::<String>(&lock_key).await {
+            Ok(Some(value)) => {
+                let locked_at = if let Some(colon_pos) = value.find(':') {
+                    value[..colon_pos].parse::<i64>().unwrap_or(0)
+                } else {
+                    value.parse::<i64>().unwrap_or(0)
+                };
+                now <= locked_at + ttl_millis
+            }
             Ok(None) => false,
             Err(err) => {
                 error!("Error checking lock {}: {}", lock_key, err);
@@ -2722,7 +2735,7 @@ impl MetaStore for EtcdMetaStore {
     async fn release_global_lock(&self, lock_name: LockName) -> bool {
         let lock_key = lock_name.to_string();
         let expected_token = match self.global_lock_tokens.lock() {
-            Ok(tokens) => tokens.get(&lock_key).copied(),
+            Ok(tokens) => tokens.get(&lock_key).cloned(),
             Err(err) => {
                 error!("Error reading local lock token {}: {}", lock_key, err);
                 None
@@ -2736,10 +2749,11 @@ impl MetaStore for EtcdMetaStore {
             .max_retries(3)
             .run(|tx| {
                 let lock_key = lock_key.clone();
+                let expected_token = expected_token.clone();
 
                 Box::pin(async move {
-                    let current = tx.get_typed_json::<i64>(&lock_key).await?;
-                    if current == Some(expected_token) {
+                    let current = tx.get_typed_json::<String>(&lock_key).await?;
+                    if current.as_ref() == Some(&expected_token) {
                         tx.delete(&lock_key);
                         Ok(true)
                     } else {

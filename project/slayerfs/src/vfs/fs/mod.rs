@@ -240,6 +240,7 @@ where
     reader: Arc<DataReader<S, M>>,
     writer: Arc<DataWriter<S, M>>,
     modified: ModifiedTracker,
+    append_locks: DashMap<i64, Arc<Mutex<()>>>,
 }
 
 impl<S, M> VfsState<S, M>
@@ -261,7 +262,15 @@ where
             reader,
             writer,
             modified: ModifiedTracker::new(),
+            append_locks: DashMap::new(),
         }
+    }
+
+    fn append_lock(&self, ino: i64) -> Arc<Mutex<()>> {
+        self.append_locks
+            .entry(ino)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 }
 
@@ -542,6 +551,7 @@ where
             attr.size = size;
         }
 
+        tracing::debug!(ino, nlink = attr.nlink, kind = ?attr.kind, "stat_ino");
         Some(attr)
     }
 
@@ -794,8 +804,29 @@ where
         Ok(ino)
     }
 
+    /// Create a hard link using inode numbers directly, avoiding path reconstruction.
+    /// This is the preferred path from FUSE which already has the inodes.
+    #[tracing::instrument(level = "debug", skip(self), fields(src_ino, parent_ino, name))]
+    pub(crate) async fn link_by_ino(
+        &self,
+        src_ino: i64,
+        parent_ino: i64,
+        name: &str,
+    ) -> Result<FileAttr, VfsError> {
+        if name.is_empty() || name.contains('/') || name.contains('\0') {
+            return Err(VfsError::InvalidFilename);
+        }
+
+        let attr = self.meta_link(src_ino, parent_ino, name).await?;
+
+        self.state.modified.touch(parent_ino).await;
+        self.state.modified.touch(src_ino).await;
+
+        Ok(attr)
+    }
+
     /// Create a hard link at `link_path` that references `existing_path`.
-    #[tracing::instrument(level = "trace", skip(self), fields(existing_path, link_path))]
+    #[tracing::instrument(level = "debug", skip(self), fields(existing_path, link_path))]
     pub async fn link(&self, existing_path: &str, link_path: &str) -> Result<FileAttr, VfsError> {
         let existing_path = Self::norm_path(existing_path);
         let link_path = Self::norm_path(link_path);
@@ -1139,6 +1170,7 @@ where
     }
 
     /// Optimized rename within the same directory - avoids duplicate parent resolution
+    #[tracing::instrument(level = "debug", skip(self), fields(dir, old_name, new_name))]
     async fn rename_same_directory(
         &self,
         dir: &str,
@@ -1150,56 +1182,14 @@ where
         let new_path = format!("{}{}{}", dir, if dir == "/" { "" } else { "/" }, new_name);
 
         // Validate the rename operation
-        let (_src_ino, src_attr) = self
+        let (_src_ino, _src_attr) = self
             .validate_rename_operation(
                 &old_path, &new_path, parent_ino, old_name, parent_ino, new_name,
             )
             .await?;
 
         // Handle destination existence and replacement semantics
-        let dst_path = format!("{}{}{}", dir, if dir == "/" { "" } else { "/" }, new_name);
-        if let Some((dest_ino, dest_kind)) = self.meta_lookup_path(&dst_path).await? {
-            // Handle replacement logic (same as in main rename function)
-            match (src_attr.kind, dest_kind) {
-                // Directory replacing directory
-                (FileType::Dir, FileType::Dir) => {
-                    let children = self.meta_readdir(dest_ino).await?;
-                    if !children.is_empty() {
-                        return Err(VfsError::DirectoryNotEmpty {
-                            path: PathHint::some(format!(
-                                "cannot replace non-empty directory '{}/{}'",
-                                dir, new_name
-                            )),
-                        });
-                    }
-                    self.meta_rmdir(parent_ino, new_name).await?;
-                }
-                // Directory replacing file/symlink - not allowed
-                (FileType::Dir, FileType::File) | (FileType::Dir, FileType::Symlink) => {
-                    return Err(VfsError::IsADirectory {
-                        path: PathHint::some(format!(
-                            "cannot replace file '{}/{}' with directory",
-                            dir, old_name
-                        )),
-                    });
-                }
-                // File/symlink replacing directory - not allowed
-                (FileType::File, FileType::Dir) | (FileType::Symlink, FileType::Dir) => {
-                    return Err(VfsError::IsADirectory {
-                        path: PathHint::some(format!(
-                            "cannot replace directory '{}/{}' with file",
-                            dir, new_name
-                        )),
-                    });
-                }
-                // File/symlink replacing file/symlink - allowed
-                _ => {
-                    self.meta_unlink(parent_ino, new_name).await?;
-                }
-            }
-        }
-
-        // Perform the rename
+        // Perform the rename (destination replacement is handled atomically by the store layer)
         self.meta_rename(parent_ino, old_name, parent_ino, new_name.to_string())
             .await?;
 
@@ -1229,59 +1219,15 @@ where
     /// Step 2: Handle destination replacement according to POSIX semantics
     async fn handle_destination_replacement(
         &self,
-        new_path: &str,
-        old_path: &str,
-        src_kind: FileType,
-        new_parent_ino: i64,
-        new_name: &str,
+        _new_path: &str,
+        _old_path: &str,
+        _src_kind: FileType,
+        _new_parent_ino: i64,
+        _new_name: &str,
     ) -> Result<(), VfsError> {
-        if let Some((dest_ino, dest_kind)) = self.meta_lookup_path(new_path).await? {
-            match (src_kind, dest_kind) {
-                // Directory → Directory: only if destination is empty
-                (FileType::Dir, FileType::Dir) => {
-                    let children = self.meta_readdir(dest_ino).await?;
-
-                    if !children.is_empty() {
-                        return Err(VfsError::DirectoryNotEmpty {
-                            path: PathHint::some(format!(
-                                "cannot replace non-empty directory '{}'",
-                                new_path
-                            )),
-                        });
-                    }
-
-                    self.meta_rmdir(new_parent_ino, new_name).await?;
-                }
-
-                // Directory → File/Symlink: not allowed
-                (FileType::Dir, FileType::File) | (FileType::Dir, FileType::Symlink) => {
-                    return Err(VfsError::IsADirectory {
-                        path: PathHint::some(format!(
-                            "cannot replace file '{}' with directory '{}'",
-                            new_path, old_path
-                        )),
-                    });
-                }
-
-                // File/Symlink → Directory: not allowed
-                (FileType::File, FileType::Dir) | (FileType::Symlink, FileType::Dir) => {
-                    return Err(VfsError::IsADirectory {
-                        path: PathHint::some(format!(
-                            "cannot replace directory '{}' with file '{}'",
-                            new_path, old_path
-                        )),
-                    });
-                }
-
-                // File/Symlink → File/Symlink: allowed, remove destination
-                (FileType::File, FileType::File)
-                | (FileType::File, FileType::Symlink)
-                | (FileType::Symlink, FileType::File)
-                | (FileType::Symlink, FileType::Symlink) => {
-                    self.meta_unlink(new_parent_ino, new_name).await?;
-                }
-            }
-        }
+        // Destination replacement (unlink/rmdir) is handled atomically by the store-layer
+        // rename Lua script.  Performing pre-deletion here would introduce a TOCTOU race
+        // under concurrent renames to the same target.
         Ok(())
     }
 
@@ -1305,7 +1251,7 @@ where
         Ok(())
     }
 
-    #[tracing::instrument(level = "trace", skip(self), fields(old, new))]
+    #[tracing::instrument(level = "debug", skip(self), fields(old, new))]
     pub async fn rename(&self, old: &str, new: &str) -> Result<(), VfsError> {
         // Step 1: Normalize and parse paths
         let old = Self::norm_path(old);
@@ -1699,7 +1645,32 @@ where
 
         tracing::trace!(fh, ino = handle.ino, offset, len = data.len(), "vfs.write");
 
-        let written = handle.write(offset, data).await?;
+        let (write_offset, written) = if handle.flags.append {
+            let append_lock = self.state.append_lock(handle.ino);
+            let _append_guard = append_lock.lock().await;
+            let _handle_guard = handle.lock_write().await;
+
+            self.state.writer.flush_if_exists(handle.ino as u64).await;
+            let attr =
+                self.meta_stat_fresh(handle.ino)
+                    .await?
+                    .ok_or_else(|| VfsError::NotFound {
+                        path: PathHint::none(),
+                    })?;
+            let append_offset = attr.size;
+            let written = handle.write_unlocked(append_offset, data).await?;
+            tracing::debug!(
+                fh,
+                ino = handle.ino,
+                append_offset,
+                len = data.len(),
+                written,
+                "vfs.append_write"
+            );
+            (append_offset, written)
+        } else {
+            (offset, handle.write(offset, data).await?)
+        };
 
         // Invalidate reader cache for the written range so subsequent reads
         // (including FUSE reads on kernel page-cache miss) see committed data
@@ -1707,13 +1678,48 @@ where
         let _ = self
             .state
             .reader
-            .invalidate(handle.ino as u64, offset, data.len())
+            .invalidate(handle.ino as u64, write_offset, data.len())
             .await;
 
         self.update_mtime_ctime(handle.ino).await?;
+
+        // Keep the metadata-store file size in sync after an extending write.
+        // Otherwise O_APPEND writes from other file handles rely on getattr for
+        // the current size, and a stale size causes them to land at the wrong
+        // offset and silently overwrite existing data.
+        let new_end = write_offset + written as u64;
+        if new_end > handle.attr().size {
+            let _ = self
+                .meta_extend_file_size(handle.ino, new_end)
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        ino = handle.ino,
+                        offset = write_offset,
+                        written,
+                        new_end,
+                        "vfs.write: failed to extend file size: {e}"
+                    );
+                });
+            handle.extend_size(new_end);
+            // Also bump size on other open handles for the same inode
+            for other in self.file_handles_for_inode(handle.ino) {
+                if other.fh != handle.fh {
+                    other.extend_size(new_end);
+                }
+            }
+        }
+
         self.state.modified.touch(handle.ino).await;
 
-        tracing::trace!(fh, ino = handle.ino, written, "vfs.write_done");
+        tracing::trace!(
+            fh,
+            ino = handle.ino,
+            offset = write_offset,
+            written,
+            new_end,
+            "vfs.write_done"
+        );
         Ok(written)
     }
 
@@ -1757,6 +1763,30 @@ where
             .await;
 
         self.update_mtime_ctime(ino).await?;
+
+        // Keep the metadata-store file size in sync (same rationale as the
+        // write() handler above — see that comment for details).
+        let new_end = offset + written as u64;
+        if new_end > attr.size {
+            let _ = self
+                .meta_extend_file_size(ino, new_end)
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        ino,
+                        offset,
+                        written,
+                        new_end,
+                        "vfs.write_ino: failed to extend file size: {e}"
+                    );
+                });
+            // Propagate the new size to all open handles for this inode
+            // so that subsequent O_APPEND writes from other handles see it.
+            for handle in self.file_handles_for_inode(ino) {
+                handle.extend_size(new_end);
+            }
+        }
+
         self.state.modified.touch(ino).await;
         drop(guards);
         Ok(written)
@@ -1827,6 +1857,24 @@ where
         Ok(written)
     }
 
+    /// Copy a byte range between two inodes by opening temporary handles.
+    pub async fn copy_file_range_inodes(
+        &self,
+        src_ino: i64,
+        off_in: u64,
+        dst_ino: i64,
+        off_out: u64,
+        length: u64,
+    ) -> Result<usize, VfsError> {
+        let src_attr = self.meta_stat_required(src_ino, PathHint::none()).await?;
+        let dst_attr = self.meta_stat_required(dst_ino, PathHint::none()).await?;
+        let src_guard = self.open_guard(src_ino, src_attr, true, false).await?;
+        let dst_guard = self.open_guard(dst_ino, dst_attr, false, true).await?;
+
+        self.copy_file_range(src_guard.fh(), off_in, dst_guard.fh(), off_out, length)
+            .await
+    }
+
     /// Allocate a per-file handle, returning the opaque fh id.
     #[tracing::instrument(level = "trace", skip(self), fields(ino, read, write))]
     pub async fn open(
@@ -1835,6 +1883,7 @@ where
         attr: FileAttr,
         read: bool,
         write: bool,
+        append: bool,
     ) -> Result<u64, VfsError> {
         let mut latest_attr = attr;
 
@@ -1858,10 +1907,10 @@ where
         }
 
         let inode = guard.clone();
-        let handle = self
-            .state
-            .handles
-            .allocate(ino, latest_attr, HandleFlags::new(read, write));
+        let handle =
+            self.state
+                .handles
+                .allocate(ino, latest_attr, HandleFlags::new(read, write, append));
 
         let reader = self.state.reader.open_for_handle(inode.clone(), handle.fh);
         handle.reader(reader);
@@ -1880,7 +1929,7 @@ where
         read: bool,
         write: bool,
     ) -> Result<FileGuard<S, M>, VfsError> {
-        let fh = self.open(ino, attr, read, write).await?;
+        let fh = self.open(ino, attr, read, write, false).await?;
         Ok(FileGuard::new(self.clone(), fh))
     }
 
@@ -2110,7 +2159,7 @@ where
     }
 
     /// Resolves a normalized path to its inode number, returning NotFound if absent.
-    async fn lookup_path_to_ino(&self, path: &str) -> Result<i64, VfsError> {
+    pub(crate) async fn lookup_path_to_ino(&self, path: &str) -> Result<i64, VfsError> {
         let (inode, _) = self.meta_lookup_path_required(path).await?;
         Ok(inode)
     }
