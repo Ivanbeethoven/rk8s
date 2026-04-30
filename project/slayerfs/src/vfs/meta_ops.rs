@@ -256,6 +256,13 @@ where
             .map_err(meta_err_to_vfs)
     }
 
+    pub(super) async fn meta_extend_file_size(&self, ino: i64, size: u64) -> Result<(), VfsError> {
+        self.meta_layer()
+            .extend_file_size(ino, size)
+            .await
+            .map_err(meta_err_to_vfs)
+    }
+
     // ------------------------------------------------------------------
     // Symlink content
     // ------------------------------------------------------------------

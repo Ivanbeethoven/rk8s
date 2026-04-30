@@ -989,4 +989,24 @@ pub trait MetaStore: Send + Sync {
         let _ = (inode, owner, lock_type, pid, block, range);
         Err(MetaError::NotImplemented)
     }
+
+    /// Gets BSD flock status for an inode / owner pair.
+    /// Returns UnLock when no flock is held by that owner.
+    async fn get_flock(&self, inode: i64, owner: i64) -> Result<FileLockType, MetaError> {
+        let _ = (inode, owner);
+        Err(MetaError::NotImplemented)
+    }
+
+    /// Sets or clears a BSD flock (whole-file advisory lock).
+    /// When `block` is true the call polls until the lock is acquired.
+    async fn set_flock(
+        &self,
+        inode: i64,
+        owner: i64,
+        block: bool,
+        lock_type: FileLockType,
+    ) -> Result<(), MetaError> {
+        let _ = (inode, owner, block, lock_type);
+        Err(MetaError::NotImplemented)
+    }
 }

@@ -8,6 +8,14 @@ use crate::vfs::io::{FileReader, FileWriter};
 use anyhow::anyhow;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::SystemTime;
+
+fn current_time_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::pin;
@@ -170,6 +178,7 @@ where
 {
     attr: FileAttr,
     last_offset: u64,
+    last_check: i64,
     reader: Option<Arc<FileReader<B, M>>>,
     writer: Option<Arc<FileWriter<B, M>>>,
 }
@@ -188,6 +197,9 @@ where
     state: StdMutex<FileHandleState<B, M>>,
 }
 
+/// Default attribute cache TTL for open files (seconds).
+const ATTR_CACHE_TTL: i64 = 1;
+
 impl<B, M> FileHandle<B, M>
 where
     B: BlockStore + Send + Sync + 'static,
@@ -203,6 +215,7 @@ where
             state: StdMutex::new(FileHandleState {
                 attr,
                 last_offset: 0,
+                last_check: current_time_secs(),
                 reader: None,
                 writer: None,
             }),
@@ -219,12 +232,56 @@ where
         guard.writer = Some(writer);
     }
 
+    /// Return the cached attr regardless of TTL (used for handle-level access).
     pub(crate) fn attr(&self) -> FileAttr {
         self.state.lock().unwrap().attr.clone()
     }
 
     pub(crate) fn update_attr(&self, attr: &FileAttr) {
-        self.state.lock().unwrap().attr = attr.clone();
+        let mut guard = self.state.lock().unwrap();
+        guard.attr = attr.clone();
+        guard.last_check = current_time_secs();
+    }
+
+    /// JuiceFS-style Check: returns the cached attr if within TTL.
+    /// Used to avoid a metadata-store round-trip for getattr.
+    pub(crate) fn check_attr(&self) -> Option<FileAttr> {
+        let guard = self.state.lock().unwrap();
+        let now = current_time_secs();
+        if now - guard.last_check < ATTR_CACHE_TTL {
+            Some(guard.attr.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Update the cached attr, invalidating if mtime changed.
+    /// Returns true if the attr was updated in-place.
+    pub(crate) fn update_attr_if_changed(&self, new_attr: &FileAttr) -> bool {
+        let mut guard = self.state.lock().unwrap();
+        let changed = new_attr.mtime != guard.attr.mtime;
+        if changed {
+            guard.attr = new_attr.clone();
+            guard.last_check = current_time_secs();
+            true
+        } else if new_attr.size > guard.attr.size {
+            guard.attr.size = new_attr.size;
+            guard.last_check = current_time_secs();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Force the cached size to at least `min_size`.  This is called after
+    /// every extending write so that O_APPEND from other handles sees the
+    /// most recent file size via check_attr/attr.
+    pub(crate) fn extend_size(&self, min_size: u64) {
+        let mut guard = self.state.lock().unwrap();
+        if min_size > guard.attr.size {
+            guard.attr.size = min_size;
+        }
+        guard.last_check = current_time_secs();
     }
 
     pub(crate) fn update_offset(&self, offset: u64) {
@@ -253,6 +310,11 @@ where
 
     pub(crate) async fn write(&self, offset: u64, data: &[u8]) -> anyhow::Result<usize> {
         let _guard = self.gate.write_lock().await;
+        self.write_unlocked(offset, data).await
+    }
+
+    /// Write while the caller already holds the required handle write locks.
+    pub(crate) async fn write_unlocked(&self, offset: u64, data: &[u8]) -> anyhow::Result<usize> {
         let writer = {
             let guard = self.state.lock().unwrap();
             guard
@@ -296,11 +358,16 @@ pub(crate) struct FileHandleWriteGuard {
 pub(crate) struct HandleFlags {
     pub(crate) read: bool,
     pub(crate) write: bool,
+    pub(crate) append: bool,
 }
 
 impl HandleFlags {
-    pub(crate) const fn new(read: bool, write: bool) -> Self {
-        Self { read, write }
+    pub(crate) const fn new(read: bool, write: bool, append: bool) -> Self {
+        Self {
+            read,
+            write,
+            append,
+        }
     }
 }
 

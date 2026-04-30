@@ -6,9 +6,10 @@ use crate::meta::config::{
 use crate::meta::file_lock::{FileLockQuery, FileLockRange, FileLockType};
 use crate::meta::store::{LockName, MetaError, SetAttrFlags, SetAttrRequest};
 use crate::meta::stores::RedisMetaStore;
+use redis::AsyncCommands;
 use serial_test::serial;
 use std::sync::Arc;
-use tokio::time;
+use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 async fn cleanup_test_data() -> Result<(), MetaError> {
@@ -73,7 +74,23 @@ async fn new_test_store() -> RedisMetaStore {
 /// Create a new test store with pre-configured session ID
 async fn new_test_store_with_session(session_id: Uuid) -> RedisMetaStore {
     let store = new_test_store().await;
-    store.set_sid(session_id).expect("Failed to set session ID");
+    store.set_sid(session_id);
+    store
+}
+
+/// Create a fully-initialized test store with both session ID and plating epoch.
+/// This is required for any lock-related tests.
+async fn new_test_store_with_epoch() -> RedisMetaStore {
+    let store = new_test_store().await;
+    // Initialize the fencing-token epoch via INCR (same as start_session does)
+    let mut conn = store.conn.clone();
+    let epoch: i64 = conn
+        .incr("plock_epoch", 1)
+        .await
+        .expect("Failed to incr plock epoch");
+    store.set_epoch(epoch);
+    let session_id = Uuid::now_v7();
+    store.set_sid(session_id);
     store
 }
 
@@ -112,9 +129,7 @@ impl TestSessionManager {
             .expect("Failed to create shared test database store");
 
         let first_session_id = Uuid::now_v7();
-        first_store
-            .set_sid(first_session_id)
-            .expect("Failed to set session ID");
+        first_store.set_sid(first_session_id);
 
         stores.push(first_store);
         session_ids.push(first_session_id);
@@ -125,7 +140,7 @@ impl TestSessionManager {
                 .expect("Failed to create shared test database store");
 
             let session_id = Uuid::now_v7();
-            store.set_sid(session_id).expect("Failed to set session ID");
+            store.set_sid(session_id);
 
             stores.push(store);
             session_ids.push(session_id);
@@ -245,7 +260,7 @@ async fn test_basic_read_lock() {
     let owner: i64 = 1001;
 
     // Set session
-    store.set_sid(session_id).unwrap();
+    store.set_sid(session_id);
 
     // Create a file first
     let parent = store.root_ino();
@@ -2868,5 +2883,388 @@ async fn test_cleanup_orphan_uncommitted_slice_fallback() {
     assert!(
         orphans3.is_empty(),
         "should be fully cleaned after delete_uncommitted_slices"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent file lock tests — simulates generic/089 (t_mtab) scenario
+// ---------------------------------------------------------------------------
+
+/// Helper: acquire a write lock on the given file, optionally blocking.
+async fn acquire_write_lock(
+    store: &RedisMetaStore,
+    inode: i64,
+    owner: i64,
+    block: bool,
+    pid: u32,
+) -> Result<(), MetaError> {
+    store
+        .set_plock(
+            inode,
+            owner,
+            block,
+            FileLockType::Write,
+            FileLockRange { start: 0, end: 1 },
+            pid,
+        )
+        .await
+}
+
+/// Helper: release a lock on the given file.
+async fn release_lock(
+    store: &RedisMetaStore,
+    inode: i64,
+    owner: i64,
+    pid: u32,
+) -> Result<(), MetaError> {
+    store
+        .set_plock(
+            inode,
+            owner,
+            false,
+            FileLockType::UnLock,
+            FileLockRange { start: 0, end: 1 },
+            pid,
+        )
+        .await
+}
+
+/// Simulate the t_mtab lock pattern: N concurrent tasks each doing
+/// `iterations` lock-acquire-release cycles on the same file.
+async fn run_concurrent_lock_tasks(
+    store: Arc<RedisMetaStore>,
+    inode: i64,
+    num_tasks: usize,
+    iterations: usize,
+) -> Vec<usize> {
+    let mut handles = Vec::with_capacity(num_tasks);
+
+    for task_id in 0..num_tasks {
+        let store = store.clone();
+        let owner: i64 = 1001 + task_id as i64;
+        let pid: u32 = 500 + task_id as u32;
+
+        handles.push(tokio::spawn(async move {
+            let mut completed: usize = 0;
+            for _ in 0..iterations {
+                // Acquire write lock (blocking, like F_SETLKW)
+                acquire_write_lock(&store, inode, owner, true, pid)
+                    .await
+                    .expect("failed to acquire write lock");
+
+                // Simulate work: write temp file + rename
+                tokio::time::sleep(Duration::from_micros(50)).await;
+
+                // Release lock
+                release_lock(&store, inode, owner, pid)
+                    .await
+                    .expect("failed to release lock");
+
+                completed += 1;
+            }
+            completed
+        }));
+    }
+
+    let mut results = Vec::with_capacity(num_tasks);
+    for handle in handles {
+        match handle.await {
+            Ok(n) => results.push(n),
+            Err(e) => panic!("concurrent lock task panicked: {e}"),
+        }
+    }
+    results
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_concurrent_write_lock_three_tasks_50_iterations() {
+    let store = Arc::new(new_test_store_with_epoch().await);
+    let parent = store.root_ino();
+    let file_ino = store
+        .create_file(parent, "lockfile_mtab".to_string())
+        .await
+        .expect("failed to create lock file");
+
+    // 3 tasks × 50 iterations each = t_mtab 50 pattern
+    let results = run_concurrent_lock_tasks(store, file_ino, 3, 50).await;
+
+    assert_eq!(results.len(), 3, "all 3 tasks must complete");
+    for (i, &completed) in results.iter().enumerate() {
+        assert_eq!(
+            completed, 50,
+            "task {i} completed {completed}/50 iterations"
+        );
+    }
+}
+
+/// Verify that after all locks are released, get_plock returns UnLock (no conflict).
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_write_lock_acquire_release_getlk() {
+    let store = Arc::new(new_test_store_with_epoch().await);
+    let parent = store.root_ino();
+    let file_ino = store
+        .create_file(parent, "lockfile_getlk".to_string())
+        .await
+        .expect("failed to create file");
+
+    // Acquire write lock
+    acquire_write_lock(&store, file_ino, 1001, false, 500)
+        .await
+        .expect("should acquire write lock");
+
+    // get_plock should see the lock
+    let query = FileLockQuery {
+        owner: 1001,
+        lock_type: FileLockType::Read,
+        range: FileLockRange { start: 0, end: 1 },
+    };
+    let info = store.get_plock(file_ino, &query).await.unwrap();
+    // Since the stored lock is a Write lock, querying with Read on the same
+    // range should report the Write lock holder.
+    assert_eq!(
+        info.lock_type,
+        FileLockType::Write,
+        "get_plock should see the write lock"
+    );
+    assert_eq!(info.pid, 500, "pid should match");
+
+    // Release
+    release_lock(&store, file_ino, 1001, 500)
+        .await
+        .expect("should release lock");
+
+    // After release, get_plock should return UnLock
+    let info2 = store.get_plock(file_ino, &query).await.unwrap();
+    assert_eq!(
+        info2.lock_type,
+        FileLockType::UnLock,
+        "no lock should remain after release"
+    );
+}
+
+/// Verify that write locks are mutually exclusive:
+/// Task B should not acquire the lock while Task A holds it.
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_write_lock_mutual_exclusion() {
+    let store = Arc::new(new_test_store_with_epoch().await);
+    let parent = store.root_ino();
+    let file_ino = store
+        .create_file(parent, "lockfile_mutex".to_string())
+        .await
+        .expect("failed to create file");
+
+    // Task A acquires write lock
+    acquire_write_lock(&store, file_ino, 1001, false, 500)
+        .await
+        .expect("task A should acquire write lock");
+
+    // Task B tries non-blocking write lock — must fail with conflict
+    let result = acquire_write_lock(&store, file_ino, 1002, false, 501).await;
+    assert!(
+        matches!(result, Err(MetaError::LockConflict { .. })),
+        "task B should get LockConflict but got: {result:?}"
+    );
+
+    // Task A releases
+    release_lock(&store, file_ino, 1001, 500)
+        .await
+        .expect("task A should release");
+
+    // Now Task B should succeed
+    acquire_write_lock(&store, file_ino, 1002, false, 501)
+        .await
+        .expect("task B should acquire after A releases");
+
+    release_lock(&store, file_ino, 1002, 501)
+        .await
+        .expect("task B should release");
+}
+
+/// Verify that read locks can be shared concurrently (read-read no conflict).
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_read_lock_shared() {
+    let store = Arc::new(new_test_store_with_epoch().await);
+    let parent = store.root_ino();
+    let file_ino = store
+        .create_file(parent, "lockfile_shared".to_string())
+        .await
+        .expect("failed to create file");
+
+    // Task A acquires read lock
+    store
+        .set_plock(
+            file_ino,
+            1001,
+            false,
+            FileLockType::Read,
+            FileLockRange { start: 0, end: 100 },
+            500,
+        )
+        .await
+        .expect("task A should acquire read lock");
+
+    // Task B acquires read lock on same range — should succeed (read-read OK)
+    store
+        .set_plock(
+            file_ino,
+            1002,
+            false,
+            FileLockType::Read,
+            FileLockRange { start: 0, end: 100 },
+            501,
+        )
+        .await
+        .expect("task B should also acquire read lock (read-read is shared)");
+
+    // Task C tries write lock — must fail (read-write conflict)
+    let result = store
+        .set_plock(
+            file_ino,
+            1003,
+            false,
+            FileLockType::Write,
+            FileLockRange { start: 0, end: 100 },
+            502,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(MetaError::LockConflict { .. })),
+        "write should conflict with held read locks"
+    );
+}
+
+#[serial]
+#[tokio::test]
+async fn test_set_plock_succeeds_on_nonexistent_inode() {
+    let store = new_test_store_with_epoch().await;
+
+    // set_plock on a non-existent inode must succeed because POSIX
+    // advisory locks (plocks) are stored independently of node data.
+    // The Lua script only reads/writes plock keys; it never references
+    // the node.  Returning NotFound here would cause fcntl(F_SETLKW)
+    // to fail when a lock-file inode has been unlinked by the lock
+    // holder before a waiter can acquire the lock.
+    let result = store
+        .set_plock(
+            99999, // non-existent inode
+            1001,  // owner
+            false, // non-blocking
+            FileLockType::Write,
+            FileLockRange { start: 0, end: 100 },
+            1234,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "set_plock on non-existent inode should succeed (plocks are indep of node), got: {:?}",
+        result
+    );
+}
+
+#[serial]
+#[tokio::test]
+async fn test_set_plock_succeeds_on_deleted_inode_via_unlink() {
+    let store = new_test_store_with_epoch().await;
+    let parent = store.root_ino();
+
+    // Create a file, then unlink it so nlink drops to 0 and the node
+    // is tombstoned.  set_plock on the tombstoned inode must still
+    // succeed — the Lua script for ReadLock/WriteLock only touches
+    // plock hashes.
+    let file_ino = store
+        .create_file(parent, "lockfile".to_string())
+        .await
+        .unwrap();
+    store.unlink(parent, "lockfile").await.unwrap();
+
+    let result = store
+        .set_plock(
+            file_ino,
+            1001,
+            false,
+            FileLockType::Write,
+            FileLockRange { start: 0, end: 100 },
+            1234,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "set_plock on unlinked (tombstoned) inode should succeed, got: {:?}",
+        result
+    );
+}
+
+#[serial]
+#[tokio::test]
+async fn test_blocking_set_plock_succeeds_after_unlink_releases_lock() {
+    let store_a = new_test_store_with_epoch().await;
+    let parent = store_a.root_ino();
+
+    let file_ino = store_a
+        .create_file(parent, "lockfile".to_string())
+        .await
+        .unwrap();
+
+    // Session A acquires the write lock
+    store_a
+        .set_plock(
+            file_ino,
+            1001, // owner A
+            false,
+            FileLockType::Write,
+            FileLockRange { start: 0, end: 100 },
+            1234,
+        )
+        .await
+        .unwrap();
+
+    // A releases its lock via UnLock (simulating close(fd) → release → unlock_owner_locks)
+    store_a
+        .set_plock(
+            file_ino,
+            1001,
+            false,
+            FileLockType::UnLock,
+            FileLockRange {
+                start: 0,
+                end: u64::MAX,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+
+    // A unlinks the lock file (simulating unlock_mtab)
+    store_a.unlink(parent, "lockfile").await.unwrap();
+
+    // Session B now tries to acquire the lock on the tombstoned inode.
+    // This must succeed — the plock from A was cleared, and node
+    // existence is irrelevant for plock semantics.
+    let store_b = new_test_store_with_epoch().await;
+    let result = store_b
+        .set_plock(
+            file_ino,
+            2002, // owner B
+            false,
+            FileLockType::Write,
+            FileLockRange { start: 0, end: 100 },
+            5678,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "set_plock on tombstoned inode after unlock should succeed, got: {:?}",
+        result
     );
 }
