@@ -46,7 +46,6 @@ const DELETED_SET_KEY: &str = "delslices";
 const ALL_SESSIONS_KEY: &str = "allsessions";
 const SESSION_INFOS_KEY: &str = "sessioninfos";
 const PLOCK_PREFIX: &str = "plock";
-const FLOCK_PREFIX: &str = "flock";
 const PLOCK_EPOCH_KEY: &str = "plock_epoch";
 const LOCKS_KEY: &str = "locks";
 const LOCKED_KEY: &str = "locked";
@@ -95,7 +94,9 @@ const CLEANUP_SESSION_LUA: &str = r#"
 // Lua script for atomic BSD flock (whole-file advisory lock).
 // Each lock value is a simple string: "R" (shared/read) or "W" (exclusive/write).
 // Follows the same fencing pattern as SET_PLOCK_LUA.
-const FLOCK_LUA: &str = r#"
+macro_rules! flock_lua {
+    () => {
+        r#"
     local cjson = cjson
 
     local flock_key = KEYS[1]
@@ -153,7 +154,9 @@ const FLOCK_LUA: &str = r#"
                 cjson.encode({epoch = epoch, val = val}))
     redis.call('SADD', locked_key, inode_str)
     return cjson.encode({ok=true})
-"#;
+"#
+    };
+}
 
 // Lua script for atomically setting or releasing a POSIX advisory lock.
 // Each lock value is a JSON object {epoch, records} where epoch is the
@@ -1557,83 +1560,6 @@ impl RedisMetaStore {
 
     fn plock_field(&self, sid: &Uuid, owner: i64) -> String {
         format!("{}:{}", sid, owner)
-    }
-
-    fn flock_key(&self, inode: i64) -> String {
-        format!("{}:{}", FLOCK_PREFIX, inode)
-    }
-
-    /// Atomically set or release a BSD flock.
-    ///
-    /// Uses FLOCK_LUA for atomic read-check-write inside Redis.
-    /// Returns LockConflict when a blocking caller should retry.
-    async fn try_set_flock(
-        &self,
-        inode: i64,
-        owner: i64,
-        lock_type: FileLockType,
-    ) -> Result<(), MetaError> {
-        let sid = self.get_sid()?;
-        let epoch = self.get_epoch()?;
-        let flock_key = self.flock_key(inode);
-        let locked_key = Self::locked_key(sid);
-        let field = self.plock_field(&sid, owner);
-
-        let lock_type_num = lock_type.as_u32();
-
-        let script = redis::Script::new(FLOCK_LUA);
-        let result: String = script
-            .key(&flock_key)
-            .key(&locked_key)
-            .arg(&field)
-            .arg(lock_type_num)
-            .arg(inode)
-            .arg(epoch)
-            .invoke_async(&mut self.conn.clone())
-            .await
-            .map_err(redis_err)?;
-
-        let response: LuaResponse = serde_json::from_str(&result)
-            .map_err(|e| MetaError::Internal(format!("flock Lua response parse error: {e}")))?;
-
-        match response.error.as_deref() {
-            Some("lock_conflict") => Err(MetaError::LockConflict {
-                inode,
-                owner,
-                range: FileLockRange {
-                    start: 0,
-                    end: u64::MAX,
-                },
-            }),
-            Some(other) => Err(MetaError::Internal(format!("flock Lua error: {other}"))),
-            None if response.ok => Ok(()),
-            None => Err(MetaError::Internal("unexpected flock Lua response".into())),
-        }
-    }
-
-    async fn get_flock_inner(&self, inode: i64, owner: i64) -> Result<FileLockType, MetaError> {
-        let sid = self.get_sid()?;
-        let field = self.plock_field(&sid, owner);
-        let flock_key = self.flock_key(inode);
-
-        let raw: Option<String> = redis::cmd("HGET")
-            .arg(&flock_key)
-            .arg(&field)
-            .query_async(&mut self.conn.clone())
-            .await
-            .map_err(redis_err)?;
-
-        Ok(match raw {
-            Some(v) => {
-                let parsed: serde_json::Value = serde_json::from_str(&v).unwrap_or_default();
-                match parsed.get("val").and_then(|v| v.as_str()) {
-                    Some("W") => FileLockType::Write,
-                    Some("R") => FileLockType::Read,
-                    _ => FileLockType::UnLock,
-                }
-            }
-            None => FileLockType::UnLock,
-        })
     }
 
     /// Atomically set or release a POSIX advisory lock.
@@ -3818,7 +3744,42 @@ impl MetaStore for RedisMetaStore {
         }
 
         loop {
-            match self.try_set_flock(inode, owner, lock_type).await {
+            let sid = self.get_sid()?;
+            let epoch = self.get_epoch()?;
+            let flock_key = format!("flock:{inode}");
+            let locked_key = Self::locked_key(sid);
+            let field = self.plock_field(&sid, owner);
+
+            let script = redis::Script::new(flock_lua!());
+            let result: String = script
+                .key(&flock_key)
+                .key(&locked_key)
+                .arg(&field)
+                .arg(lock_type.as_u32())
+                .arg(inode)
+                .arg(epoch)
+                .invoke_async(&mut self.conn.clone())
+                .await
+                .map_err(redis_err)?;
+
+            let response: LuaResponse = serde_json::from_str(&result)
+                .map_err(|e| MetaError::Internal(format!("flock Lua response parse error: {e}")))?;
+
+            let result = match response.error.as_deref() {
+                Some("lock_conflict") => Err(MetaError::LockConflict {
+                    inode,
+                    owner,
+                    range: FileLockRange {
+                        start: 0,
+                        end: u64::MAX,
+                    },
+                }),
+                Some(other) => Err(MetaError::Internal(format!("flock Lua error: {other}"))),
+                None if response.ok => Ok(()),
+                None => Err(MetaError::Internal("unexpected flock Lua response".into())),
+            };
+
+            match result {
                 Ok(()) => return Ok(()),
                 Err(MetaError::LockConflict { .. }) if block => {
                     let delay_ms: u64 = if lock_type == FileLockType::Write {
@@ -3836,7 +3797,7 @@ impl MetaStore for RedisMetaStore {
     async fn get_flock(&self, inode: i64, owner: i64) -> Result<FileLockType, MetaError> {
         let sid = self.get_sid()?;
         let field = self.plock_field(&sid, owner);
-        let flock_key = self.flock_key(inode);
+        let flock_key = format!("flock:{inode}");
 
         let raw: Option<String> = redis::cmd("HGET")
             .arg(&flock_key)

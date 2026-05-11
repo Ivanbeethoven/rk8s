@@ -337,7 +337,7 @@ where
         let Some(vattr) = self.stat_ino(child_ino).await else {
             return Err(libc::ENOENT.into());
         };
-        let attr = vfs_to_fuse_attr(&vattr, &req);
+        let attr = vfs_to_fuse_attr(&vattr, &req, self.blocks_for_attr(&vattr));
         // Keep generation at 0 and set TTL to 1s (tunable)
         Ok(ReplyEntry {
             ttl: FUSE_CACHE_TTL,
@@ -501,7 +501,7 @@ where
                 write_flags,
                 "fuse.write -> write_ino (cache)"
             );
-            self.write_ino(ino as i64, offset, data)
+            self.write_cached_ino(ino as i64, offset, data)
                 .await
                 .map_err(Into::<Errno>::into)? as u32
         } else if fh != 0 {
@@ -557,7 +557,7 @@ where
             return Err(libc::ENOENT.into());
         };
 
-        let attr = vfs_to_fuse_attr(&vattr, &req);
+        let attr = vfs_to_fuse_attr(&vattr, &req, self.blocks_for_attr(&vattr));
         Ok(ReplyAttr {
             ttl: FUSE_CACHE_TTL,
             attr,
@@ -584,7 +584,7 @@ where
             let Some(vattr) = self.stat_ino(ino as i64).await else {
                 return Err(libc::ENOENT.into());
             };
-            let attr = vfs_to_fuse_attr(&vattr, &req);
+            let attr = vfs_to_fuse_attr(&vattr, &req, self.blocks_for_attr(&vattr));
             return Ok(ReplyAttr {
                 ttl: FUSE_CACHE_TTL,
                 attr,
@@ -597,7 +597,7 @@ where
             .await
             .map_err(Into::<Errno>::into)?;
 
-        let attr = vfs_to_fuse_attr(&vattr, &req);
+        let attr = vfs_to_fuse_attr(&vattr, &req, self.blocks_for_attr(&vattr));
 
         // When a truncate (size change) is involved, use TTL=0 so the kernel
         // does not cache a potentially stale size.  A wrong cached size can
@@ -742,7 +742,7 @@ where
 
         if fh != 0 && include_dot_entries {
             if let Some(attr) = self.stat_ino(ino as i64).await {
-                let fattr = vfs_to_fuse_attr(&attr, &req);
+                let fattr = vfs_to_fuse_attr(&attr, &req, self.blocks_for_attr(&attr));
                 all.push(DirectoryEntryPlus {
                     inode: ino,
                     generation: 0,
@@ -761,7 +761,7 @@ where
                 .await
                 .unwrap_or_else(|| self.root_ino()) as u64;
             if let Some(pattr) = self.stat_ino(parent_ino as i64).await {
-                let f = vfs_to_fuse_attr(&pattr, &req);
+                let f = vfs_to_fuse_attr(&pattr, &req, self.blocks_for_attr(&pattr));
                 all.push(DirectoryEntryPlus {
                     inode: parent_ino,
                     generation: 0,
@@ -779,7 +779,7 @@ where
                 .await
                 .unwrap_or_else(|| self.root_ino()) as u64;
             if let Some(pattr) = self.stat_ino(parent_ino as i64).await {
-                let f = vfs_to_fuse_attr(&pattr, &req);
+                let f = vfs_to_fuse_attr(&pattr, &req, self.blocks_for_attr(&pattr));
                 all.push(DirectoryEntryPlus {
                     inode: parent_ino,
                     generation: 0,
@@ -815,7 +815,7 @@ where
             let Some(cattr) = self.stat_ino(e.ino).await else {
                 continue;
             };
-            let fattr = vfs_to_fuse_attr(&cattr, &req);
+            let fattr = vfs_to_fuse_attr(&cattr, &req, self.blocks_for_attr(&cattr));
             all.push(DirectoryEntryPlus {
                 inode: e.ino as u64,
                 generation: 0,
@@ -897,26 +897,22 @@ where
             return Err(libc::EEXIST.into());
         }
 
-        // Build the full path
-        let Some(mut p) = self.path_of(parent as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
-        if p != "/" {
-            p.push('/');
-        }
-        p.push_str(&name);
-
         // Extract file type from mode
         let file_type = mode & libc::S_IFMT;
 
         let ino = match file_type {
-            libc::S_IFREG => {
-                // Regular file - use create_file
-                self.create_file(&p).await.map_err(Errno::from)?
+            // Linux accepts mknod(path, 0, 0) as a regular file with mode 000.
+            0 | libc::S_IFREG => {
+                // Regular file
+                self.create_file_at(parent as i64, &name, false)
+                    .await
+                    .map_err(Errno::from)?
             }
             libc::S_IFDIR => {
-                // Directory - use mkdir_p
-                self.mkdir_p(&p).await.map_err(Errno::from)?
+                // Directory
+                self.mkdir_at(parent as i64, &name)
+                    .await
+                    .map_err(Errno::from)?
             }
             libc::S_IFIFO | libc::S_IFSOCK | libc::S_IFCHR | libc::S_IFBLK => {
                 return Err(libc::ENOSYS.into());
@@ -934,7 +930,7 @@ where
             return Err(libc::ENOENT.into());
         };
 
-        let attr = vfs_to_fuse_attr(&vattr, &req);
+        let attr = vfs_to_fuse_attr(&vattr, &req, self.blocks_for_attr(&vattr));
         Ok(ReplyEntry {
             ttl: FUSE_CACHE_TTL,
             attr,
@@ -971,15 +967,10 @@ where
         if let Some(_child) = self.child_of(parent as i64, name.as_ref()).await {
             return Err(libc::EEXIST.into());
         }
-        // Build the path and create
-        let Some(mut p) = self.path_of(parent as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
-        if p != "/" {
-            p.push('/');
-        }
-        p.push_str(&name);
-        let _ino = self.mkdir_p(&p).await.map_err(Errno::from)?;
+        let _ino = self
+            .mkdir_at(parent as i64, &name)
+            .await
+            .map_err(Errno::from)?;
         // Strip setuid/setgid/sticky, then apply the caller's umask.
         let masked_mode = apply_creation_umask(mode, umask);
         let Some(vattr) = self
@@ -988,7 +979,7 @@ where
         else {
             return Err(libc::ENOENT.into());
         };
-        let attr = vfs_to_fuse_attr(&vattr, &req);
+        let attr = vfs_to_fuse_attr(&vattr, &req, self.blocks_for_attr(&vattr));
         Ok(ReplyEntry {
             ttl: FUSE_CACHE_TTL,
             attr,
@@ -1021,14 +1012,7 @@ where
         if !matches!(pattr.kind, VfsFileType::Dir) {
             return Err(libc::ENOTDIR.into());
         }
-        let Some(mut p) = self.path_of(parent as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
-        if p != "/" {
-            p.push('/');
-        }
-        p.push_str(&name);
-        let ino = match self.create_file(&p).await {
+        let ino = match self.create_file_at(parent as i64, &name, false).await {
             Ok(ino) => {
                 debug!(
                     ino,
@@ -1057,7 +1041,7 @@ where
         else {
             return Err(libc::ENOENT.into());
         };
-        let attr = vfs_to_fuse_attr(&vattr, &req);
+        let attr = vfs_to_fuse_attr(&vattr, &req, self.blocks_for_attr(&vattr));
 
         let accmode = flags & (libc::O_ACCMODE as u32);
         let read = accmode != (libc::O_WRONLY as u32);
@@ -1134,7 +1118,7 @@ where
                 }
             })?;
 
-        let fuse_attr = vfs_to_fuse_attr(&attr, &req);
+        let fuse_attr = vfs_to_fuse_attr(&attr, &req, self.blocks_for_attr(&attr));
         Ok(ReplyEntry {
             ttl: FUSE_CACHE_TTL,
             attr: fuse_attr,
@@ -1172,18 +1156,10 @@ where
             return Err(libc::EEXIST.into());
         }
 
-        let Some(mut parent_path) = self.path_of(parent as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
-        if parent_path != "/" {
-            parent_path.push('/');
-        }
-        parent_path.push_str(&name);
-
         let target = link.to_string_lossy();
 
         let (ino, vattr) = self
-            .create_symlink(&parent_path, target.as_ref())
+            .create_symlink_at(parent as i64, &name, target.as_ref())
             .await
             .map_err(Errno::from)?;
 
@@ -1194,7 +1170,7 @@ where
 
         Ok(ReplyEntry {
             ttl: FUSE_CACHE_TTL,
-            attr: vfs_to_fuse_attr(&attr, &req),
+            attr: vfs_to_fuse_attr(&attr, &req, self.blocks_for_attr(&attr)),
             generation: 0,
         })
     }
@@ -1220,14 +1196,9 @@ where
         if matches!(cattr.kind, VfsFileType::Dir) {
             return Err(libc::EISDIR.into());
         }
-        let Some(mut p) = self.path_of(parent as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
-        if p != "/" {
-            p.push('/');
-        }
-        p.push_str(&name);
-        self.unlink(&p).await.map_err(Errno::from)
+        self.unlink_at(parent as i64, &name)
+            .await
+            .map_err(Errno::from)
     }
 
     // Remove an empty directory
@@ -1250,14 +1221,9 @@ where
         if !matches!(cattr.kind, VfsFileType::Dir) {
             return Err(libc::ENOTDIR.into());
         }
-        let Some(mut p) = self.path_of(parent as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
-        if p != "/" {
-            p.push('/');
-        }
-        p.push_str(&name);
-        self.rmdir(&p).await.map_err(Errno::from)
+        self.rmdir_at(parent as i64, &name)
+            .await
+            .map_err(Errno::from)
     }
 
     // Rename (files or directories)
@@ -1293,20 +1259,15 @@ where
             return Err(libc::EINVAL.into());
         }
 
-        // Prevent renaming to the same location
+        // POSIX rename to the same location is a no-op.
         if parent == new_parent && name == new_name {
-            return Err(libc::EINVAL.into());
+            return Ok(());
         }
 
         // Ensure the source exists
-        let Some(src_ino) = self.child_of(parent as i64, name.as_ref()).await else {
+        if self.child_of(parent as i64, name.as_ref()).await.is_none() {
             return Err(libc::ENOENT.into());
-        };
-
-        // Get source attributes for validation
-        let Some(src_attr) = self.stat_ino(src_ino).await else {
-            return Err(libc::ENOENT.into());
-        };
+        }
 
         // Validate the destination parent
         let Some(pattr) = self.stat_ino(new_parent as i64).await else {
@@ -1316,43 +1277,23 @@ where
             return Err(libc::ENOTDIR.into());
         }
 
-        // Build full paths and perform the rename
-        let Some(mut oldp) = self.path_of(parent as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
-        if oldp != "/" {
-            oldp.push('/');
-        }
-        oldp.push_str(&name);
-
-        let Some(mut newp) = self.path_of(new_parent as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
-        if newp != "/" {
-            newp.push('/');
-        }
-        newp.push_str(&new_name);
-
-        // Check for circular rename at FUSE level
-        if newp.starts_with(&(oldp.clone() + "/")) && matches!(src_attr.kind, VfsFileType::Dir) {
-            return Err(libc::EINVAL.into());
-        }
-
-        VFS::rename(self, &oldp, &newp).await.map_err(|e| {
-            match e {
-                VfsError::NotFound { .. } => libc::ENOENT,
-                VfsError::AlreadyExists { .. } => libc::EEXIST,
-                VfsError::NotADirectory { .. } => libc::ENOTDIR,
-                VfsError::IsADirectory { .. } => libc::EISDIR,
-                VfsError::DirectoryNotEmpty { .. } => libc::ENOTEMPTY,
-                VfsError::PermissionDenied { .. } => libc::EACCES,
-                VfsError::CircularRename { .. } => libc::EINVAL,
-                VfsError::InvalidRenameTarget { .. } => libc::EINVAL,
-                VfsError::CrossesDevices => libc::EXDEV,
-                _ => libc::EIO,
-            }
-            .into()
-        })
+        self.rename_at(parent as i64, &name, new_parent as i64, &new_name)
+            .await
+            .map_err(|e| {
+                match e {
+                    VfsError::NotFound { .. } => libc::ENOENT,
+                    VfsError::AlreadyExists { .. } => libc::EEXIST,
+                    VfsError::NotADirectory { .. } => libc::ENOTDIR,
+                    VfsError::IsADirectory { .. } => libc::EISDIR,
+                    VfsError::DirectoryNotEmpty { .. } => libc::ENOTEMPTY,
+                    VfsError::PermissionDenied { .. } => libc::EACCES,
+                    VfsError::CircularRename { .. } => libc::EINVAL,
+                    VfsError::InvalidRenameTarget { .. } => libc::EINVAL,
+                    VfsError::CrossesDevices => libc::EXDEV,
+                    _ => libc::EIO,
+                }
+                .into()
+            })
     }
 
     // ===== Resource release & sync: stateless implementation, return success =====
@@ -1368,7 +1309,10 @@ where
     ) -> FuseResult<()> {
         debug!(fh, "fuse.release");
         self.unlock_owner_locks(inode, lock_owner).await;
-        let _ = self.close(fh).await;
+        if _flush {
+            self.flush(fh).await.map_err(Errno::from)?;
+        }
+        self.close(fh).await.map_err(Errno::from)?;
         Ok(())
     }
 
@@ -1854,9 +1798,8 @@ fn vfs_kind_to_fuse(k: VfsFileType) -> FuseFileType {
     }
 }
 
-fn vfs_to_fuse_attr(v: &VfsFileAttr, _req: &Request) -> rfuse3::raw::reply::FileAttr {
+fn vfs_to_fuse_attr(v: &VfsFileAttr, _req: &Request, blocks: u64) -> rfuse3::raw::reply::FileAttr {
     let perm = (v.mode & 0o7777) as u16;
-    let blocks = v.size.div_ceil(512);
     let atime = nanos_to_timestamp(v.atime);
     let mtime = nanos_to_timestamp(v.mtime);
     let ctime = nanos_to_timestamp(v.ctime);

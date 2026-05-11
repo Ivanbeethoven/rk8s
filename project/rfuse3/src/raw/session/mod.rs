@@ -190,13 +190,8 @@ struct MountHandleInner {
 
 impl MountHandleInner {
     async fn inner_unmount(self) -> IoResult<()> {
-        self.destroy_notify.notify();
-
         #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
         {
-            // wait destroy done
-            self.task.await?;
-
             // TODO: freebsd mount is unprivileged, then unmount is unprivileged too?
             #[cfg(target_os = "freebsd")]
             {
@@ -204,6 +199,8 @@ impl MountHandleInner {
                     mount::unmount(&self.mount_path, MntFlags::MNT_SYNCHRONOUS)
                 })
                 .await?;
+                self.destroy_notify.notify();
+                self.task.await?;
             }
 
             #[cfg(target_os = "macos")]
@@ -212,6 +209,8 @@ impl MountHandleInner {
                     mount::unmount(&self.mount_path, MntFlags::MNT_SYNCHRONOUS)
                 })
                 .await?;
+                self.destroy_notify.notify();
+                self.task.await?;
             }
 
             #[cfg(target_os = "linux")]
@@ -230,18 +229,19 @@ impl MountHandleInner {
                         ));
                     }
 
+                    self.destroy_notify.notify();
+                    self.task.await?;
                     return Ok(());
                 }
 
                 task::spawn_blocking(move || mount::umount(&self.mount_path)).await?;
+                self.destroy_notify.notify();
+                self.task.await?;
             }
         }
 
         #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
         {
-            // wait destroy done
-            self.task.await.unwrap()?;
-
             // TODO: freebsd mount is unprivileged, then unmount is unprivileged too?
             #[cfg(target_os = "freebsd")]
             {
@@ -250,6 +250,8 @@ impl MountHandleInner {
                 })
                 .await
                 .unwrap()?;
+                self.destroy_notify.notify();
+                self.task.await.unwrap()?;
             }
             #[cfg(target_os = "macos")]
             {
@@ -258,6 +260,8 @@ impl MountHandleInner {
                 })
                 .await
                 .unwrap()?;
+                self.destroy_notify.notify();
+                self.task.await.unwrap()?;
             }
 
             #[cfg(target_os = "linux")]
@@ -272,12 +276,16 @@ impl MountHandleInner {
                         return Err(IoError::other("call fusermount3 -u to unmount failed"));
                     }
 
+                    self.destroy_notify.notify();
+                    self.task.await.unwrap()?;
                     return Ok(());
                 }
 
                 task::spawn_blocking(move || mount::umount(&self.mount_path))
                     .await
                     .unwrap()?;
+                self.destroy_notify.notify();
+                self.task.await.unwrap()?;
             }
         }
 
@@ -1382,7 +1390,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             reply_flags |= FUSE_READDIRPLUS_AUTO;
         }
 
-        if init_in.flags & FUSE_ASYNC_DIO > 0 {
+        if init_in.flags & FUSE_ASYNC_DIO > 0 && self.mount_options.async_dio {
             debug!("enable FUSE_ASYNC_DIO");
 
             reply_flags |= FUSE_ASYNC_DIO;

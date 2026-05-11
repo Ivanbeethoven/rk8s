@@ -1,4 +1,4 @@
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::mem::take;
 use std::sync::Arc;
 
@@ -156,6 +156,44 @@ impl CacheSlice {
 
     pub(crate) fn len(&self) -> u64 {
         self.len
+    }
+
+    pub(crate) fn copy_into(&self, offset: u64, buf: &mut [u8]) -> anyhow::Result<usize> {
+        if buf.is_empty() || offset >= self.len {
+            return Ok(0);
+        }
+
+        let actual_len = buf.len().min((self.len - offset).as_usize());
+        let mut cursor = Cursor::new(&mut buf[..actual_len]);
+
+        let (chunk_size, block_size, page_size, pages_per_block) = (
+            self.config.layout.chunk_size,
+            self.config.layout.block_size as u64,
+            self.config.page_size as u64,
+            self.pages_per_block(),
+        );
+
+        let span = ChunkSpan::new(0, offset, actual_len as u64);
+
+        for block_span in span.split_into::<BlockTag>(chunk_size, block_size, true) {
+            let page_spans = block_span.split_into::<PageTag>(block_size, page_size, true);
+
+            for page_span in page_spans {
+                let (block_idx, page_idx) =
+                    (block_span.index.as_usize(), page_span.index.as_usize());
+                let flat_idx = self.flat_index(block_idx, page_idx, pages_per_block);
+                let start = page_span.offset.as_usize();
+                let end = (page_span.offset + page_span.len).as_usize();
+
+                if let Some(page) = self.pages[flat_idx].as_ref() {
+                    page.copy_slice(start, end, &mut cursor)?;
+                } else {
+                    cursor.write_all(&vec![0; end - start])?;
+                }
+            }
+        }
+
+        Ok(actual_len)
     }
 
     pub(crate) fn block_size(&self) -> u32 {
@@ -364,6 +402,19 @@ impl Page {
                 );
             }
         }
+    }
+
+    fn copy_slice(
+        &self,
+        start: usize,
+        end: usize,
+        cursor: &mut Cursor<&mut [u8]>,
+    ) -> anyhow::Result<()> {
+        match &self.data {
+            PageBuf::Frozen(buf) => cursor.write_all(&buf[start..end])?,
+            PageBuf::Mutable(buf) => cursor.write_all(&buf[start..end])?,
+        }
+        Ok(())
     }
 }
 

@@ -488,7 +488,7 @@ where
 
 async fn open_handle(fs: &SharedFs, path: &str, read: bool, write: bool) -> Result<u64> {
     let attr = fs.stat(path).await?;
-    Ok(fs.open(attr.ino, attr, read, write).await?)
+    Ok(fs.open(attr.ino, attr, read, write, false).await?)
 }
 
 async fn close_handle(fs: &SharedFs, fh: u64) -> Result<()> {

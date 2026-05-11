@@ -176,22 +176,40 @@ EOF
 
 install_mount_helper() {
     local helper="/usr/sbin/mount.fuse.slayerfs"
-    cat >"$helper" <<'EOF'
+    # 把运行时确定的路径直接硬写进 helper，避免 mount 调用时环境变量被清除
+    local baked_log_file="${log_file:-/artifacts/slayerfs.log}"
+    local baked_fuse_log_file="${fuse_log_file:-}"
+
+    cat >"$helper" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH"
 
-src="${1:-}"
-target="${2:-}"
+src="\${1:-}"
+target="\${2:-}"
 shift 2 || true
 
-config_path="${SLAYERFS_CONFIG_PATH:-/run/slayerfs/config.yaml}"
-log_file="${SLAYERFS_LOG_FILE:-/artifacts/slayerfs.log}"
+config_path="\${SLAYERFS_CONFIG_PATH:-/run/slayerfs/config.yaml}"
+log_file="${baked_log_file}"
 
-mkdir -p "$target" "$(dirname "$log_file")"
+mkdir -p "\$target" "\$(dirname "\$log_file")"
 
+EOF
+
+    if [[ -n "$baked_fuse_log_file" ]]; then
+        cat >>"$helper" <<EOF
+mkdir -p "\$(dirname "${baked_fuse_log_file}")"
+SLAYERFS_FUSE_OP_LOG=1 SLAYERFS_FUSE_LOG_FILE="${baked_fuse_log_file}" \\
+    /usr/local/bin/slayerfs mount --config "\$config_path" "\$target" >>"\$log_file" 2>&1 &
+EOF
+    else
+        cat >>"$helper" <<'EOF'
 /usr/local/bin/slayerfs mount --config "$config_path" "$target" >>"$log_file" 2>&1 &
+EOF
+    fi
+
+    cat >>"$helper" <<'EOF'
 sleep "${SLAYERFS_MOUNT_WAIT_SECS:-1}"
 exit 0
 EOF
@@ -217,6 +235,9 @@ copy_artifacts() {
     mkdir -p "$artifact_dir"
     if [[ -f "$log_file" && "$log_file" != "$artifact_dir/slayerfs.log" ]]; then
         cp -f "$log_file" "$artifact_dir/slayerfs.log" || true
+    fi
+    if [[ -n "${SLAYERFS_FUSE_LOG_FILE:-}" && -f "${SLAYERFS_FUSE_LOG_FILE}" && "${SLAYERFS_FUSE_LOG_FILE}" != "$artifact_dir/slayerfs_fuse_ops.log" ]]; then
+        cp -f "${SLAYERFS_FUSE_LOG_FILE}" "$artifact_dir/slayerfs_fuse_ops.log" || true
     fi
     if [[ -f "$config_path" ]]; then
         cp -f "$config_path" "$artifact_dir/backend.yml" || true
@@ -289,6 +310,8 @@ run_xfstests() {
 }
 
 main() {
+    local normalized_fuse_op_log
+
     if [[ -z "$artifact_dir" ]]; then
         ts="$(date +%s)-$RANDOM"
         artifact_dir="${artifact_root%/}/run-${ts}"
@@ -297,6 +320,15 @@ main() {
     chmod a+rwx "$artifact_dir" >/dev/null 2>&1 || true
     log_file="$artifact_dir/slayerfs.log"
     export SLAYERFS_LOG_FILE="$log_file"
+    normalized_fuse_op_log="${SLAYERFS_FUSE_OP_LOG:-0}"
+    normalized_fuse_op_log="${normalized_fuse_op_log,,}"
+    if [[ "$normalized_fuse_op_log" =~ ^(1|true|yes|on)$ ]]; then
+        fuse_log_file="$artifact_dir/slayerfs_fuse_ops.log"
+        export SLAYERFS_FUSE_LOG_FILE="$fuse_log_file"
+    else
+        fuse_log_file=""
+        unset SLAYERFS_FUSE_LOG_FILE || true
+    fi
 
     trap on_exit EXIT INT TERM
 

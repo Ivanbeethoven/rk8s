@@ -1521,6 +1521,13 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         // Validate name constraints
         Self::validate_entry_name(&new_name)?;
 
+        // Resolve destination inode before store rename so we can invalidate its
+        // cache entry afterwards.  When the store replaces an existing destination,
+        // its nlink is decremented (possibly to 0, which deletes the node).  The
+        // cache must reflect this, otherwise a subsequent stat on an fd that was
+        // open before the overwrite returns a stale (non-zero) nlink.
+        let dest_ino = self.cached_lookup(new_parent, &new_name).await?;
+
         // Execute the store-level rename with atomic cache updates
         self.store
             .rename(old_parent, old_name, new_parent, new_name.clone())
@@ -1564,6 +1571,19 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
                     } else if let Some(child_node) = self.inode_cache.get_node(child_ino).await {
                         child_node.clear_parent().await;
                     }
+                }
+            }
+
+            // Step 5: Keep an overwritten destination inode addressable while
+            // it may still be held open by the kernel, but expose it as
+            // unlinked.  This lets fstat() on an open-but-replaced directory
+            // succeed with nlink=0 instead of returning ENOENT.
+            if let Some(dest) = dest_ino {
+                if let Some(dest_node) = self.inode_cache.get_node(dest).await {
+                    dest_node.attr.write().await.nlink = 0;
+                    dest_node.clear_parent().await;
+                } else {
+                    self.inode_cache.invalidate_inode(dest).await;
                 }
             }
 

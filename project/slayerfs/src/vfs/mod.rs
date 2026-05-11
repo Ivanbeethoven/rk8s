@@ -31,6 +31,10 @@ pub(crate) use inode::Inode;
 
 const CHUNK_ID_BASE: u64 = 1_000_000_000u64;
 
+// Computes a unique chunk ID for a given inode number and chunk index.
+// The chunk ID is calculated as: `chunk_id = ino * CHUNK_ID_BASE + chunk_index`.
+// This design allows for up to `CHUNK_ID_BASE` chunks per inode, which should be sufficient for most use cases.
+// s3 ojbects'name = chunk_id, so we need to ensure uniqueness across inodes and their chunks.
 pub fn chunk_id_for(ino: i64, chunk_index: u64) -> std::io::Result<u64> {
     let ino_u64 = u64::try_from(ino).map_err(|_| {
         std::io::Error::new(

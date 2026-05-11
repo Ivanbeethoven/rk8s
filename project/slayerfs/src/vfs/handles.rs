@@ -323,15 +323,11 @@ where
                 .ok_or_else(|| anyhow!("file handle writer not initialized"))?
         };
         let written = writer.write_at(offset, data).await?;
-        // Keep write(2) close to POSIX visibility expectations: once the syscall
-        // returns, subsequent truncate/read/copy paths must observe the data.
-        writer.flush().await?;
         self.update_offset(offset + written as u64);
         Ok(written)
     }
 
     pub(crate) async fn flush(&self) -> anyhow::Result<()> {
-        let _guard = self.gate.write_lock().await;
         let writer = {
             let guard = self.state.lock().unwrap();
             guard
@@ -374,6 +370,7 @@ impl HandleFlags {
 /// Directory handle for caching directory listing during opendir-releasedir lifecycle
 pub struct DirHandle {
     pub(crate) ino: i64,
+    pub(crate) attr: Option<FileAttr>,
     pub(crate) entries: Vec<DirEntry>,
     #[allow(dead_code)]
     pub(crate) opened_at: Instant,
@@ -388,6 +385,7 @@ impl DirHandle {
     pub(crate) fn new(ino: i64, entries: Vec<DirEntry>) -> Self {
         Self {
             ino,
+            attr: None,
             entries,
             opened_at: Instant::now(),
             prefetch_task: None,
@@ -403,11 +401,17 @@ impl DirHandle {
     ) -> Self {
         Self {
             ino,
+            attr: None,
             entries,
             opened_at: Instant::now(),
             prefetch_task: Some(task),
             prefetch_done: done_flag,
         }
+    }
+
+    pub(crate) fn with_attr(mut self, attr: FileAttr) -> Self {
+        self.attr = Some(attr);
+        self
     }
 
     /// Get entries starting from offset, limited to MAX_READDIR_ENTRIES

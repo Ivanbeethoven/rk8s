@@ -119,18 +119,116 @@ fn init_tracing() {
 
 #[cfg(not(feature = "profiling"))]
 fn init_tracing() {
-    let env_filter = tracing_subscriber::EnvFilter::new(
-        std::env::var("RUST_LOG").unwrap_or_else(|_| "slayerfs=info".to_string()),
-    );
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::Registry;
 
-    tracing_subscriber::registry()
-        .with(
+    let rust_log =
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "slayerfs=info".to_string());
+
+    let fuse_log_path = std::env::var("SLAYERFS_FUSE_LOG_FILE").ok();
+    let main_log_path = std::env::var("SLAYERFS_LOG_FILE").ok();
+
+    if let Some(fuse_path) = fuse_log_path {
+        let mut layers: Vec<Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync>> =
+            Vec::new();
+
+        // --- logfs layer: only rfuse3::raw::logfs events ----------------------
+        let fuse_dir = std::path::Path::new(&fuse_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let fuse_name = std::path::Path::new(&fuse_path)
+            .file_name()
+            .unwrap_or(std::ffi::OsStr::new("fuse_ops.log"));
+        let fuse_appender = tracing_appender::rolling::never(fuse_dir, fuse_name);
+        let (fuse_writer, _fuse_guard) = tracing_appender::non_blocking(fuse_appender);
+        std::mem::forget(_fuse_guard);
+
+        let fuse_filter = tracing_subscriber::filter::Targets::new()
+            .with_target("rfuse3::raw::logfs", tracing::Level::TRACE);
+
+        layers.push(Box::new(
             tracing_subscriber::fmt::layer()
-                .pretty()
-                .with_span_events(FmtSpan::CLOSE),
-        )
-        .with(env_filter)
-        .init();
+                .with_writer(fuse_writer)
+                .with_ansi(false)
+                .with_filter(fuse_filter),
+        ));
+
+        // --- main layer: everything EXCEPT rfuse3::raw::logfs -----------------
+        let main_filter = tracing_subscriber::EnvFilter::new(&rust_log)
+            .add_directive("rfuse3::raw::logfs=off".parse().unwrap());
+
+        if let Some(ref main_path) = main_log_path {
+            let main_dir = std::path::Path::new(main_path.as_str())
+                .parent()
+                .unwrap_or(std::path::Path::new("."));
+            let main_name = std::path::Path::new(main_path.as_str())
+                .file_name()
+                .unwrap_or(std::ffi::OsStr::new("slayerfs.log"));
+            let main_appender = tracing_appender::rolling::never(main_dir, main_name);
+            let (main_writer, _main_guard) = tracing_appender::non_blocking(main_appender);
+            std::mem::forget(_main_guard);
+
+            layers.push(Box::new(
+                tracing_subscriber::fmt::layer()
+                    .pretty()
+                    .with_span_events(FmtSpan::CLOSE)
+                    .with_writer(main_writer)
+                    .with_ansi(false)
+                    .with_filter(main_filter),
+            ));
+        } else {
+            layers.push(Box::new(
+                tracing_subscriber::fmt::layer()
+                    .pretty()
+                    .with_span_events(FmtSpan::CLOSE)
+                    .with_filter(main_filter),
+            ));
+        }
+
+        tracing_subscriber::registry().with(layers).init();
+
+        eprintln!("[slayerfs] FUSE op log -> {fuse_path}");
+        if let Some(ref p) = main_log_path {
+            eprintln!("[slayerfs] main log -> {p}");
+        }
+    } else {
+        // No split: everything goes to stderr (or SLAYERFS_LOG_FILE).
+        let env_filter = tracing_subscriber::EnvFilter::new(&rust_log);
+
+        if let Some(main_path) = main_log_path {
+            let main_dir = std::path::Path::new(&main_path)
+                .parent()
+                .unwrap_or(std::path::Path::new("."));
+            let main_name = std::path::Path::new(&main_path)
+                .file_name()
+                .unwrap_or(std::ffi::OsStr::new("slayerfs.log"));
+            let main_appender = tracing_appender::rolling::never(main_dir, main_name);
+            let (main_writer, _main_guard) = tracing_appender::non_blocking(main_appender);
+            std::mem::forget(_main_guard);
+
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .pretty()
+                        .with_span_events(FmtSpan::CLOSE)
+                        .with_writer(main_writer)
+                        .with_ansi(false),
+                )
+                .with(env_filter)
+                .init();
+
+            eprintln!("[slayerfs] main log -> {main_path}");
+        } else {
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .pretty()
+                        .with_span_events(FmtSpan::CLOSE),
+                )
+                .with(env_filter)
+                .init();
+        }
+    }
 }
 
 async fn mount_cmd(args: MountConfig) -> anyhow::Result<()> {
@@ -241,9 +339,17 @@ where
     let handle = mount_vfs_unprivileged(fs, mount_point).await?;
 
     println!("mounted at {}", mount_point.display());
-    tokio::signal::ctrl_c().await?;
-    println!("unmounting...");
-    handle.unmount().await?;
+    let mut handle = handle;
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            println!("unmounting...");
+            handle.unmount().await?;
+        }
+        result = &mut handle => {
+            result?;
+        }
+    }
     meta_client.shutdown_runtime().await;
     Ok(())
 }

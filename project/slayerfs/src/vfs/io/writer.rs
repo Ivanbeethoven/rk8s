@@ -159,6 +159,17 @@ impl SliceState {
         Ok(())
     }
 
+    fn can_overlay_read(&self) -> bool {
+        matches!(
+            self.state,
+            SliceStatus::Writable
+                | SliceStatus::Readonly
+                | SliceStatus::Uploaded
+                | SliceStatus::Failed
+                | SliceStatus::Committed
+        )
+    }
+
     pub fn has_idle_block(&self) -> bool {
         let size = self.data.block_size();
         let pending_end = self
@@ -268,11 +279,14 @@ where
         })
     }
 
-    fn advance_upload(&self, len: u64, need_release: Vec<usize>) {
+    fn advance_upload(&self, len: u64, _uploaded_blocks: Vec<usize>) {
         self.with_mut(|s| {
             s.uploading = None;
             s.uploaded += len;
-            s.data.release_block(need_release);
+
+            // Keep uploaded pages resident until metadata commit removes the slice.
+            // Reads that arrive after upload but before commit still rely on
+            // overlay_dirty() to see the latest mmap/writeback data.
             s.usage.update_bytes(s.data.alloc_bytes());
 
             if matches!(s.state, SliceStatus::Readonly | SliceStatus::Failed) && !s.has_idle_block()
@@ -740,6 +754,52 @@ where
         Ok(buf.len())
     }
 
+    pub(crate) async fn overlay_dirty(&self, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        let layout = self.shared.config.layout;
+        let spans = split_chunk_spans(layout, offset, buf.len());
+        let guard = self.shared.inner.lock().await;
+
+        for span in spans {
+            let cid = chunk_id_for(self.shared.inode.ino(), span.index)?;
+            let Some(chunk) = guard.chunks.get(&cid) else {
+                continue;
+            };
+
+            let chunk_start = span.index * layout.chunk_size;
+            let span_start = span.offset;
+            let span_end = span.offset + span.len;
+
+            // Slices are append-only in creation order; later slices must win
+            // over earlier dirty data for overlapping rewrites.
+            for slice in &chunk.slices {
+                let state = slice.lock();
+                if !state.can_overlay_read() {
+                    continue;
+                }
+
+                let slice_start = state.offset;
+                let slice_end = state.offset + state.data.len();
+                let read_start = span_start.max(slice_start);
+                let read_end = span_end.min(slice_end);
+                if read_start >= read_end {
+                    continue;
+                }
+
+                let dst_start = (chunk_start + read_start - offset).as_usize();
+                let dst_end = (chunk_start + read_end - offset).as_usize();
+                state
+                    .data
+                    .copy_into(read_start - slice_start, &mut buf[dst_start..dst_end])?;
+            }
+        }
+
+        Ok(())
+    }
+
     // Flush: freeze all slices, upload them, and wait for commit threads to drain.
     // This blocks new writes until flushing completes (flush_waiting gate).
     #[tracing::instrument(level = "trace", skip(self))]
@@ -999,14 +1059,26 @@ where
                     continue;
                 }
 
-                // If the slice is too old, it will be frozen and flushed.
-                if !runtime.frozen && runtime.started.elapsed() > FLUSH_DURATION * 2 {
-                    let _span = tracing::trace_span!("commit_chunk.freeze").entered();
-                    let froze = SliceHandle {
-                        slice: &slice,
-                        shared: &shared,
+                let handle = SliceHandle {
+                    slice: &slice,
+                    shared: &shared,
+                };
+
+                // A frozen slice must eventually have an upload task.  Flush and
+                // auto-flush normally spawn it, but a race can leave commit
+                // waiting on a Readonly slice with no uploader.  Re-kick it here
+                // so FUSE flush/truncate cannot wait forever on commit progress.
+                if runtime.frozen {
+                    if handle.can_continue_upload() {
+                        Self::spawn_flush_slice(shared.clone(), slice.clone());
                     }
-                    .freeze();
+                    continue;
+                }
+
+                // If the slice is too old, it will be frozen and flushed.
+                if runtime.started.elapsed() > FLUSH_DURATION * 2 {
+                    let _span = tracing::trace_span!("commit_chunk.freeze").entered();
+                    let froze = handle.freeze();
 
                     if froze {
                         let _spawn_span =
@@ -1068,6 +1140,9 @@ where
                             shared: &shared,
                         }
                         .mark_committed();
+
+                        // Track committed bytes on the inode for accurate st_blocks.
+                        shared.inode.add_committed_bytes(desc.length.as_usize() as u64);
 
                         let _ = shared
                             .reader
@@ -1271,6 +1346,21 @@ where
         {
             let _ = writer.flush().await;
         }
+    }
+
+    pub(crate) async fn overlay_dirty_if_exists(
+        &self,
+        ino: u64,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> anyhow::Result<()> {
+        let writer = self.files.get(&ino).map(|entry| entry.value().clone());
+        if let Some(writer) = writer
+            && writer.has_pending().await
+        {
+            writer.overlay_dirty(offset, buf).await?;
+        }
+        Ok(())
     }
 
     /// Like `flush_if_exists` but propagates errors.  Used in truncate paths

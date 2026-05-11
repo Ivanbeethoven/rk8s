@@ -2666,7 +2666,6 @@ impl MetaStore for EtcdMetaStore {
             .max_retries(3)
             .run(|tx| {
                 let lock_key = lock_key.clone();
-                let nonce = nonce;
 
                 Box::pin(async move {
                     let now = Utc::now().timestamp_millis();

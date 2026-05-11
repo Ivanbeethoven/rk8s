@@ -6,6 +6,157 @@ use crate::chunk::store::InMemoryBlockStore;
 use crate::meta::MetaLayer;
 use crate::meta::factory::create_meta_store_from_url;
 use crate::vfs::fs::VFS;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Clone)]
+struct StressRng(u64);
+
+impl StressRng {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0
+    }
+
+    fn range(&mut self, end: u64) -> u64 {
+        if end == 0 { 0 } else { self.next() % end }
+    }
+}
+
+#[cfg(test)]
+mod fsstress_013_native_tests {
+    use super::*;
+
+    const OP_TIMEOUT: Duration = Duration::from_secs(5);
+
+    async fn op_timeout<T>(label: &'static str, fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(OP_TIMEOUT, fut)
+            .await
+            .unwrap_or_else(|_| panic!("native fsstress operation timed out: {label}"))
+    }
+
+    async fn run_native_fsstress_phase(
+        fs: Arc<VFS<InMemoryBlockStore, impl MetaLayer>>,
+        worker_count: usize,
+        ops_per_worker: usize,
+        seed: u64,
+    ) {
+        let root = fs.root_ino();
+        for i in 0..64 {
+            let _ = fs.create_file_at(root, &format!("f{i}"), false).await;
+        }
+        for i in 0..16 {
+            let _ = fs.mkdir_at(root, &format!("d{i}")).await;
+        }
+
+        let mut handles = Vec::with_capacity(worker_count);
+        for worker in 0..worker_count {
+            let fs = fs.clone();
+            handles.push(tokio::spawn(async move {
+                let worker_seed = (worker as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let mut rng = StressRng::new(seed ^ worker_seed);
+                let root = fs.root_ino();
+
+                for iter in 0..ops_per_worker {
+                    let slot = rng.range(128) as usize;
+                    let name = format!("f{slot}");
+                    let aux = format!("x{}_{}", worker, rng.range(128));
+                    let dir = format!("d{}", rng.range(32));
+
+                    match rng.range(100) {
+                        0..=9 => {
+                            op_timeout("mkdir_at", fs.mkdir_at(root, &dir)).await.ok();
+                        }
+                        10..=19 => {
+                            op_timeout("create_file_at", fs.create_file_at(root, &name, false))
+                                .await
+                                .ok();
+                        }
+                        20..=29 => {
+                            let src =
+                                op_timeout("lookup before link", fs.child_of(root, &name)).await;
+                            if let Some(ino) = src {
+                                op_timeout("link_by_ino", fs.link_by_ino(ino, root, &aux))
+                                    .await
+                                    .ok();
+                            }
+                        }
+                        30..=59 => {
+                            op_timeout("rename_at", fs.rename_at(root, &name, root, &aux))
+                                .await
+                                .ok();
+                            if rng.range(4) == 0 {
+                                op_timeout("rename_at back", fs.rename_at(root, &aux, root, &name))
+                                    .await
+                                    .ok();
+                            }
+                        }
+                        60..=69 => {
+                            op_timeout("unlink_at", fs.unlink_at(root, &name))
+                                .await
+                                .ok();
+                        }
+                        70..=79 => {
+                            op_timeout("rmdir_at", fs.rmdir_at(root, &dir)).await.ok();
+                        }
+                        80..=89 => {
+                            let target = if rng.range(2) == 0 { &name } else { &aux };
+                            let ino =
+                                op_timeout("lookup before truncate", fs.child_of(root, target))
+                                    .await;
+                            if let Some(ino) = ino {
+                                let size = rng.range(256 * 1024);
+                                op_timeout("truncate_inode", fs.truncate_inode(ino, size))
+                                    .await
+                                    .ok();
+                            }
+                        }
+                        _ => {
+                            let target = if rng.range(2) == 0 { &name } else { &aux };
+                            let ino =
+                                op_timeout("lookup before stat", fs.child_of(root, target)).await;
+                            if let Some(ino) = ino {
+                                op_timeout("stat_ino", fs.stat_ino(ino)).await;
+                            }
+                        }
+                    }
+
+                    if iter % 100 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("native fsstress worker panicked");
+        }
+
+        op_timeout("final readdir", fs.readdir_ino(root))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_native_fsstress_013_inode_ops() {
+        let layout = ChunkLayout::default();
+        let store = InMemoryBlockStore::new();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let fs = Arc::new(VFS::new(layout, store, meta_store).await.unwrap());
+
+        run_native_fsstress_phase(fs.clone(), 1, 1000, 0x0130_0001).await;
+        run_native_fsstress_phase(fs.clone(), 20, 1000, 0x0130_0002).await;
+        run_native_fsstress_phase(fs, 4, 1000, 0x0130_0003).await;
+    }
+}
 
 #[cfg(test)]
 mod rename_tests {
@@ -596,6 +747,53 @@ mod io_tests {
 
         assert!(!fs.state.writer.has_file(attr.ino as u64));
         assert!(!fs.state.inodes.contains_key(&attr.ino));
+    }
+
+    #[tokio::test]
+    async fn test_fs_sparse_pwrite_close_reopen_preserves_written_blocks() {
+        let layout = ChunkLayout {
+            chunk_size: 64 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = InMemoryBlockStore::new();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let fs = VFS::new(layout, store, meta_store).await.unwrap();
+
+        fs.create_file("/sparse.bin").await.unwrap();
+        let attr = fs.stat("/sparse.bin").await.unwrap();
+        let fh = fs
+            .open(attr.ino, attr.clone(), true, true, false)
+            .await
+            .unwrap();
+
+        let file_size = 64 * 1024u64;
+        let write_size = 512usize;
+        let step = 1024u64;
+
+        for offset in (0..file_size).step_by(step as usize) {
+            let value = ((offset / step) % 251) as u8;
+            let block = vec![value; write_size];
+            fs.write(fh, offset, &block).await.unwrap();
+        }
+
+        fs.close(fh).await.unwrap();
+
+        let reopened = fs.stat("/sparse.bin").await.unwrap();
+        assert!(reopened.size >= 16 * 1024 + write_size as u64);
+
+        let rfh = fs
+            .open(reopened.ino, reopened.clone(), true, false, false)
+            .await
+            .unwrap();
+
+        for offset in (0..file_size).step_by(step as usize) {
+            let value = ((offset / step) % 251) as u8;
+            let out = fs.read(rfh, offset, write_size).await.unwrap();
+            assert_eq!(out, vec![value; write_size], "offset={offset}");
+        }
+
+        fs.close(rfh).await.unwrap();
     }
 
     #[tokio::test]

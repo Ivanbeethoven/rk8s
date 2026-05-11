@@ -18,6 +18,7 @@ services:
       --auto-compaction-mode=revision
       --auto-compaction-retention=5000
       --quota-backend-bytes=17179869184
+      --log-level=warn
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
       interval: 2s
@@ -123,6 +124,8 @@ services:
       SLAYERFS_S3_FORCE_PATH_STYLE: ${SLAYERFS_S3_FORCE_PATH_STYLE:-true}
       SLAYERFS_CONFIG_PATH: /run/slayerfs/config.yaml
       SLAYERFS_LOG_FILE: /artifacts/slayerfs.log
+      SLAYERFS_FUSE_OP_LOG: ${SLAYERFS_FUSE_OP_LOG:-0}
+      SLAYERFS_FUSE_LOG_FILE: /artifacts/slayerfs_fuse_ops.log
       SLAYERFS_ARTIFACT_DIR: ${SLAYERFS_ARTIFACT_DIR:-}
       SLAYERFS_ARTIFACT_ROOT: /artifacts
       XFSTESTS_DIR: /opt/xfstests-dev
@@ -130,6 +133,7 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-rustfsadmin}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
       AWS_EC2_METADATA_DISABLED: ${AWS_EC2_METADATA_DISABLED:-true}
+      RUST_LOG: ${RUST_LOG:-error}
     entrypoint: ["/usr/bin/tini", "--", "/usr/local/bin/run_perf_in_container.sh"]
     privileged: true
     devices:

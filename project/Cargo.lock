@@ -8924,6 +8924,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-appender",
  "tracing-chrome",
  "tracing-flame",
  "tracing-subscriber",

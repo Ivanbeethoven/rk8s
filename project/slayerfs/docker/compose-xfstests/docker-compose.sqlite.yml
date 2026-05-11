@@ -70,6 +70,8 @@ services:
       SLAYERFS_S3_FORCE_PATH_STYLE: ${SLAYERFS_S3_FORCE_PATH_STYLE:-true}
       SLAYERFS_CONFIG_PATH: /run/slayerfs/config.yaml
       SLAYERFS_LOG_FILE: /artifacts/slayerfs.log
+      SLAYERFS_FUSE_OP_LOG: ${SLAYERFS_FUSE_OP_LOG:-0}
+      SLAYERFS_FUSE_LOG_FILE: /artifacts/slayerfs_fuse_ops.log
       SLAYERFS_ARTIFACT_DIR: ${SLAYERFS_ARTIFACT_DIR:-}
       SLAYERFS_ARTIFACT_ROOT: /artifacts
       XFSTESTS_CASES: ${XFSTESTS_CASES:-}

@@ -482,7 +482,11 @@ impl ObjectBackend for S3Backend {
             return self.put_object_simple(key, &[]).await;
         }
         if total_size <= self.config.part_size {
-            return self.put_object_vectored_simple(key, chunks).await;
+            let mut data = Vec::with_capacity(total_size);
+            for chunk in chunks {
+                data.extend_from_slice(&chunk);
+            }
+            return self.put_object_simple(key, &data).await;
         }
 
         self.multipart_upload_vectored(key, chunks).await
@@ -593,5 +597,92 @@ impl ObjectBackend for S3Backend {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_s3::Config;
+    use aws_sdk_s3::config::{Credentials, Region};
+    use tokio::time::timeout;
+
+    fn test_backend() -> S3Backend {
+        let endpoint = std::env::var("SLAYERFS_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+        let bucket =
+            std::env::var("SLAYERFS_S3_BUCKET").unwrap_or_else(|_| "slayerfs-data".to_string());
+        let region =
+            std::env::var("SLAYERFS_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+
+        let s3_config = Config::builder()
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .region(Region::new(region))
+            .credentials_provider(Credentials::new(
+                std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "rustfsadmin".to_string()),
+                std::env::var("AWS_SECRET_ACCESS_KEY")
+                    .unwrap_or_else(|_| "rustfsadmin".to_string()),
+                None,
+                None,
+                "rustfs-small-object-streaming-body-compat-test",
+            ))
+            .build();
+
+        S3Backend {
+            client: Client::from_conf(s3_config),
+            config: S3Config {
+                bucket,
+                region: None,
+                part_size: 8 * 1024 * 1024,
+                max_concurrency: 1,
+                max_retries: 1,
+                retry_base_delay: 1,
+                enable_md5: true,
+                endpoint: None,
+                force_path_style: true,
+            },
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live S3-compatible endpoint; set SLAYERFS_S3_ENDPOINT and SLAYERFS_S3_BUCKET"]
+    async fn rustfs_small_object_streaming_body_compat() {
+        let backend = test_backend();
+        let prefix = format!("diagnostics/rustfs-streaming-body/{}/", std::process::id());
+        let simple_key = format!("{prefix}simple");
+        let streaming_key = format!("{prefix}streaming");
+        let payload = b"small-object-streaming-body-compat-payload";
+        let chunks = vec![
+            Bytes::copy_from_slice(&payload[..7]),
+            Bytes::copy_from_slice(&payload[7..24]),
+            Bytes::copy_from_slice(&payload[24..]),
+        ];
+
+        backend
+            .put_object_simple(&simple_key, payload)
+            .await
+            .expect("contiguous put_object should succeed before testing streaming body");
+        assert_eq!(
+            backend.get_object(&simple_key).await.unwrap().as_deref(),
+            Some(payload.as_slice())
+        );
+
+        let streaming_put = timeout(
+            Duration::from_secs(10),
+            backend.put_object_vectored_simple(&streaming_key, chunks),
+        )
+        .await
+        .expect("streaming body put_object timed out; contiguous put_object already succeeded")
+        .expect("streaming body put_object returned an error");
+
+        assert_eq!(streaming_put, ());
+        assert_eq!(
+            backend.get_object(&streaming_key).await.unwrap().as_deref(),
+            Some(payload.as_slice())
+        );
+
+        let _ = backend.delete_object(&simple_key).await;
+        let _ = backend.delete_object(&streaming_key).await;
     }
 }

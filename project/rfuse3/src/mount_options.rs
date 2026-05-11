@@ -48,6 +48,7 @@ pub struct MountOptions {
     pub(crate) handle_killpriv: bool,
     pub(crate) write_back: bool,
     pub(crate) direct_io: bool,
+    pub(crate) async_dio: bool,
     pub(crate) force_readdir_plus: bool,
 
     // FUSE transfer size options
@@ -93,6 +94,7 @@ impl Default for MountOptions {
             handle_killpriv: false,
             write_back: false,
             direct_io: false,
+            async_dio: false,
             force_readdir_plus: false,
             max_write: NonZeroU32::new(DEFAULT_MAX_WRITE).unwrap(),
             max_readahead: None,
@@ -216,6 +218,16 @@ impl MountOptions {
     /// This maps to setting `FOPEN_DIRECT_IO` on `open`/`create` replies.
     pub fn direct_io(&mut self, direct_io: bool) -> &mut Self {
         self.direct_io = direct_io;
+
+        self
+    }
+
+    /// Enable kernel asynchronous direct I/O support.
+    ///
+    /// This is disabled by default because filesystems that complete writes only
+    /// after backend upload/metadata commit can stall AIO direct-write callers.
+    pub fn async_dio(&mut self, async_dio: bool) -> &mut Self {
+        self.async_dio = async_dio;
 
         self
     }

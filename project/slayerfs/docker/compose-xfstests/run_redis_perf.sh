@@ -25,17 +25,19 @@ usage() {
 
 选项:
   --s3                       使用 rustfs 作为对象存储（SLAYERFS_DATA_BACKEND=s3）
-  --tools "<tool...>"        指定压力工具列表，默认: "dirstress metaperf looptest"
+  --tools "<tool...>"        指定压力工具列表，默认: "dirstress metaperf looptest fio"
   --slayerfs-bench           额外运行一次宿主机 cargo bench --bench slayerfs_bench
   --bench-args "<args...>"   透传给 cargo bench 之后的 Criterion 参数
   --keep                     结束后不执行 compose down（便于调试）
   -h, --help                 显示帮助
 
 支持的 PERF_TOOLS:
-  dirstress dirperf metaperf looptest
+  dirstress dirperf metaperf looptest fio
 
 可通过环境变量覆盖各工具参数:
   PERF_DIRSTRESS_ARGS PERF_DIRPERF_ARGS PERF_METAPERF_ARGS PERF_LOOPTEST_ARGS
+  PERF_FIO_ARGS PERF_FIO_RUNTIME PERF_FIO_SIZE PERF_FIO_BS PERF_FIO_NUMJOBS
+  PERF_LOG_TO_CONSOLE=true 可恢复压测工具日志输出到终端（默认关闭）
 EOF
     exit 0
 }
@@ -52,7 +54,7 @@ require_value() {
 KEEP=false
 USE_S3=false
 RUN_SLAYERFS_BENCH=false
-PERF_TOOLS_VALUE="dirstress metaperf looptest"
+PERF_TOOLS_VALUE="dirstress metaperf looptest fio"
 BENCH_ARGS_VALUE=""
 
 while [[ $# -gt 0 ]]; do
@@ -177,6 +179,18 @@ docker compose -f "$COMPOSE_FILE" run --rm \
     -e PERF_METAPERF_BG_FILES \
     -e PERF_LOOPTEST_ITERS \
     -e PERF_LOOPTEST_BUF_SIZE \
+    -e PERF_FIO_ARGS \
+    -e PERF_FIO_NAME \
+    -e PERF_FIO_RW \
+    -e PERF_FIO_RWMIXREAD \
+    -e PERF_FIO_BS \
+    -e PERF_FIO_SIZE \
+    -e PERF_FIO_NUMJOBS \
+    -e PERF_FIO_IOENGINE \
+    -e PERF_FIO_IODEPTH \
+    -e PERF_FIO_DIRECT \
+    -e PERF_FIO_RUNTIME \
+    -e PERF_LOG_TO_CONSOLE \
     perf
 container_status=$?
 set -e
