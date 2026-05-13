@@ -52,6 +52,41 @@ const LOCKED_KEY: &str = "locked";
 const LINK_PARENT_KEY_PREFIX: &str = "lp:";
 const TRUNCATE_REWRITE_MAX_RETRIES: usize = 64;
 
+// Lua script for atomically replacing a chunk's slice list when the version
+// matches the caller's expectation.  Returns 1 on success, 0 on version mismatch.
+// KEYS[1] = chunk list key
+// KEYS[2] = chunk version key
+// ARGV[1] = expected version
+// ARGV[2] = new version
+// ARGV[3..N] = serialized slice data (may be empty to delete the chunk)
+const CHUNK_CAS_LUA: &str = r#"
+    local expected = tonumber(ARGV[1])
+    local new_ver  = tonumber(ARGV[2])
+
+    local current = redis.call('GET', KEYS[2])
+    local current_ver = 0
+    if current then
+        current_ver = tonumber(current)
+    end
+
+    if current_ver ~= expected then
+        return 0
+    end
+
+    redis.call('DEL', KEYS[1])
+    for i = 3, #ARGV do
+        redis.call('RPUSH', KEYS[1], ARGV[i])
+    end
+
+    if new_ver > 0 then
+        redis.call('SET', KEYS[2], new_ver)
+    else
+        redis.call('DEL', KEYS[2])
+    end
+
+    return 1
+"#;
+
 // Lua script for atomically releasing all locks held by a dead session.
 // Constructs plock keys dynamically from the locked set so the entire
 // cleanup is atomic — no TOCTOU window between reading locked_files and
@@ -1249,6 +1284,10 @@ impl RedisMetaStore {
         format!("{CHUNK_KEY_PREFIX}{inode}_{chunk_index}")
     }
 
+    fn chunk_version_key(&self, chunk_id: u64) -> String {
+        format!("{}:v", self.chunk_key(chunk_id))
+    }
+
     fn chunk_id(&self, ino: i64, chunk_index: u64) -> u64 {
         let ino_u64 = u64::try_from(ino).expect("inode must be non-negative");
         ino_u64
@@ -1619,41 +1658,53 @@ impl RedisMetaStore {
         chunk_id: u64,
         cutoff_offset: u64,
     ) -> Result<(), MetaError> {
-        let key = self.chunk_key(chunk_id);
+        let chunk_key = self.chunk_key(chunk_id);
+        let version_key = self.chunk_version_key(chunk_id);
+        let script = redis::Script::new(CHUNK_CAS_LUA);
 
         for _ in 0..TRUNCATE_REWRITE_MAX_RETRIES {
-            let mut conn = Self::create_connection(&self._config).await?;
+            let mut conn = self.conn.clone();
 
-            redis::cmd("WATCH")
-                .arg(&key)
-                .exec_async(&mut conn)
-                .await
-                .map_err(redis_err)?;
-
-            let raw: Vec<Vec<u8>> = redis::cmd("LRANGE")
-                .arg(&key)
+            // Read version and current slices in one round-trip.
+            let (version, raw): (Option<i64>, Vec<Vec<u8>>) = redis::pipe()
+                .cmd("GET")
+                .arg(&version_key)
+                .cmd("LRANGE")
+                .arg(&chunk_key)
                 .arg(0)
                 .arg(-1)
                 .query_async(&mut conn)
                 .await
                 .map_err(redis_err)?;
 
+            let current_version = version.unwrap_or(0);
+
             let mut slices = Vec::with_capacity(raw.len());
-            for entry in raw {
-                let desc: SliceDesc = crate::meta::serialization::deserialize_meta(&entry)?;
+            for entry in &raw {
+                let desc: SliceDesc = crate::meta::serialization::deserialize_meta(entry)?;
                 slices.push(desc);
             }
             trim_slices_in_place(&mut slices, cutoff_offset);
 
-            let mut pipe = redis::pipe();
-            pipe.atomic().cmd("DEL").arg(&key).ignore();
-            for slice in &slices {
-                let data = crate::meta::serialization::serialize_meta(slice)?;
-                pipe.cmd("RPUSH").arg(&key).arg(data).ignore();
-            }
+            let new_version = current_version + 1;
 
-            let rewritten: Option<()> = pipe.query_async(&mut conn).await.map_err(redis_err)?;
-            if rewritten.is_some() {
+            // Atomic CAS via Lua: replace list iff version still matches.
+            let ok: i32 = script
+                .key(&chunk_key)
+                .key(&version_key)
+                .arg(current_version)
+                .arg(new_version)
+                .arg(
+                    slices
+                        .iter()
+                        .map(|s| crate::meta::serialization::serialize_meta(s))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+                .invoke_async(&mut conn)
+                .await
+                .map_err(redis_err)?;
+
+            if ok == 1 {
                 return Ok(());
             }
         }
@@ -1711,9 +1762,16 @@ impl RedisMetaStore {
                 for idx in start..end {
                     let chunk_id = self.chunk_id(ino, idx);
                     let key = self.chunk_key(chunk_id);
+                    let version_key = self.chunk_version_key(chunk_id);
                     let mut conn = self.conn.clone();
-                    redis::cmd("DEL")
+                    redis::pipe()
+                        .atomic()
+                        .cmd("DEL")
                         .arg(&key)
+                        .ignore()
+                        .cmd("DEL")
+                        .arg(&version_key)
+                        .ignore()
                         .query_async::<()>(&mut conn)
                         .await
                         .map_err(redis_err)?;
@@ -2622,6 +2680,7 @@ impl MetaStore for RedisMetaStore {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
             let chunk_key = self.chunk_key(chunk_id);
+            let version_key = self.chunk_version_key(chunk_id);
 
             let raw: Vec<Vec<u8>> = redis::cmd("LRANGE")
                 .arg(&chunk_key)
@@ -2648,6 +2707,9 @@ impl MetaStore for RedisMetaStore {
                     .arg(&chunk_key)
                     .arg(0)
                     .arg(&entry_bytes)
+                    .ignore();
+                pipe.cmd("INCR")
+                    .arg(&version_key)
                     .ignore();
             }
 
@@ -2725,11 +2787,19 @@ impl MetaStore for RedisMetaStore {
     )]
     async fn append_slice(&self, chunk_id: u64, slice: SliceDesc) -> Result<(), MetaError> {
         let mut conn = self.conn.clone();
+        let chunk_key = self.chunk_key(chunk_id);
+        let version_key = self.chunk_version_key(chunk_id);
         let data = crate::meta::serialization::serialize_meta(&slice)?;
-        let _: () = redis::cmd("RPUSH")
-            .arg(self.chunk_key(chunk_id))
+        redis::pipe()
+            .atomic()
+            .cmd("RPUSH")
+            .arg(&chunk_key)
             .arg(data)
-            .query_async(&mut conn)
+            .ignore()
+            .cmd("INCR")
+            .arg(&version_key)
+            .ignore()
+            .query_async::<()>(&mut conn)
             .await
             .map_err(redis_err)?;
         Ok(())
@@ -2869,17 +2939,17 @@ impl MetaStore for RedisMetaStore {
             delayed_slices.iter().map(|(id, _, _)| *id).collect();
 
         let chunk_key = self.chunk_key(chunk_id);
+        let version_key = self.chunk_version_key(chunk_id);
+        let script = redis::Script::new(CHUNK_CAS_LUA);
 
         for _ in 0..COMPACT_RETRY_LIMIT {
-            let mut conn = Self::create_connection(&self._config).await?;
+            let mut conn = self.conn.clone();
 
-            redis::cmd("WATCH")
-                .arg(&chunk_key)
-                .exec_async(&mut conn)
-                .await
-                .map_err(redis_err)?;
-
-            let raw: Vec<Vec<u8>> = redis::cmd("LRANGE")
+            // Read version and current slices in one round-trip.
+            let (version, raw): (Option<i64>, Vec<Vec<u8>>) = redis::pipe()
+                .cmd("GET")
+                .arg(&version_key)
+                .cmd("LRANGE")
                 .arg(&chunk_key)
                 .arg(0)
                 .arg(-1)
@@ -2887,34 +2957,55 @@ impl MetaStore for RedisMetaStore {
                 .await
                 .map_err(redis_err)?;
 
+            let current_version = version.unwrap_or(0);
+
             let mut kept = Vec::new();
-            for entry in raw {
-                let desc: SliceDesc = crate::meta::serialization::deserialize_meta(&entry)?;
+            for entry in &raw {
+                let desc: SliceDesc = crate::meta::serialization::deserialize_meta(entry)?;
                 if !delayed_ids.contains(&desc.slice_id) {
-                    kept.push(entry);
+                    kept.push(entry.clone());
                 }
             }
 
-            let now = Utc::now().timestamp();
-
-            let mut pipe = redis::pipe();
-            pipe.atomic();
-
-            // Replace chunk slices: keep non-delayed existing, append new
-            pipe.cmd("DEL").arg(&chunk_key).ignore();
-            for entry in &kept {
-                pipe.cmd("RPUSH").arg(&chunk_key).arg(entry).ignore();
-            }
+            // Build new list: kept existing + new slices.
+            let mut final_data = kept;
             for slice in new_slices {
-                let data = crate::meta::serialization::serialize_meta(slice)?;
-                pipe.cmd("RPUSH").arg(&chunk_key).arg(data).ignore();
+                final_data.push(crate::meta::serialization::serialize_meta(slice)?);
             }
 
-            // Create delayed records for old slices
+            let new_version = current_version + 1;
+
+            // Atomic CAS via Lua: replace list iff version still matches.
+            let ok: i32 = script
+                .key(&chunk_key)
+                .key(&version_key)
+                .arg(current_version)
+                .arg(new_version)
+                .arg(&final_data)
+                .invoke_async(&mut conn)
+                .await
+                .map_err(redis_err)?;
+
+            if ok == 0 {
+                continue;
+            }
+
+            // CAS succeeded — create delayed records for removed slices.
             if !delayed_slices.is_empty() {
-                for (slice_id, offset, size) in &delayed_slices {
-                    let delayed_id: i64 =
-                        conn.incr(DELAYED_COUNTER_KEY, 1).await.map_err(redis_err)?;
+                let n = delayed_slices.len() as i64;
+                let last_id: i64 = redis::cmd("INCRBY")
+                    .arg(DELAYED_COUNTER_KEY)
+                    .arg(n)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(redis_err)?;
+                let first_id = last_id - n + 1;
+                let now = Utc::now().timestamp();
+
+                let mut pipe = redis::pipe();
+                pipe.atomic();
+                for (i, (slice_id, offset, size)) in delayed_slices.iter().enumerate() {
+                    let delayed_id = first_id + i as i64;
                     let ds_key = self.delayed_key(delayed_id);
                     pipe.hset(&ds_key, "sid", slice_id.to_string());
                     pipe.hset(&ds_key, "off", offset.to_string());
@@ -2928,12 +3019,12 @@ impl MetaStore for RedisMetaStore {
                         .arg(delayed_id)
                         .ignore();
                 }
+                pipe.query_async::<()>(&mut conn)
+                    .await
+                    .map_err(redis_err)?;
             }
 
-            let result: Option<()> = pipe.query_async(&mut conn).await.map_err(redis_err)?;
-            if result.is_some() {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         Err(MetaError::ContinueRetry)
@@ -2941,16 +3032,16 @@ impl MetaStore for RedisMetaStore {
 
     #[tracing::instrument(
         level = "trace",
-        skip(self, new_slices, old_slices_to_delay, expected_slices),
+        skip(self, new_slices, old_slices_to_delay, _expected_slices),
         fields(chunk_id)
     )]
-    // Versioned slice replacement: verify chunk state matches expectations before swapping slices.
+    // Versioned slice replacement: verify chunk version matches expectations before swapping slices.
     async fn replace_slices_for_compact_with_version(
         &self,
         chunk_id: u64,
         new_slices: &[SliceDesc],
         old_slices_to_delay: &[u8],
-        expected_slices: &[SliceDesc],
+        _expected_slices: &[SliceDesc],
     ) -> Result<(), MetaError> {
         if !old_slices_to_delay.is_empty() && !old_slices_to_delay.len().is_multiple_of(20) {
             tracing::warn!(
@@ -2967,17 +3058,17 @@ impl MetaStore for RedisMetaStore {
             .ok_or_else(|| MetaError::Internal("Invalid delayed data length".to_string()))?;
 
         let chunk_key = self.chunk_key(chunk_id);
+        let version_key = self.chunk_version_key(chunk_id);
+        let script = redis::Script::new(CHUNK_CAS_LUA);
 
         for _ in 0..COMPACT_RETRY_LIMIT {
-            let mut conn = Self::create_connection(&self._config).await?;
+            let mut conn = self.conn.clone();
 
-            redis::cmd("WATCH")
-                .arg(&chunk_key)
-                .exec_async(&mut conn)
-                .await
-                .map_err(redis_err)?;
-
-            let raw: Vec<Vec<u8>> = redis::cmd("LRANGE")
+            // Read version and current slices in one round-trip.
+            let (version, _raw): (Option<i64>, Vec<Vec<u8>>) = redis::pipe()
+                .cmd("GET")
+                .arg(&version_key)
+                .cmd("LRANGE")
                 .arg(&chunk_key)
                 .arg(0)
                 .arg(-1)
@@ -2985,74 +3076,46 @@ impl MetaStore for RedisMetaStore {
                 .await
                 .map_err(redis_err)?;
 
-            let mut current_slices = Vec::with_capacity(raw.len());
-            for entry in raw {
-                let desc: SliceDesc = crate::meta::serialization::deserialize_meta(&entry)?;
-                current_slices.push(desc);
-            }
+            let current_version = version.unwrap_or(0);
+            let new_version = current_version + 1;
 
-            if current_slices.len() != expected_slices.len() {
-                tracing::warn!(
-                    chunk_id = chunk_id,
-                    expected_count = expected_slices.len(),
-                    actual_count = current_slices.len(),
-                    "Concurrent modification detected: slice count mismatch"
-                );
-                continue;
-            }
-
-            let current_map: std::collections::HashMap<u64, (u64, u64)> = current_slices
-                .iter()
-                .map(|s| (s.slice_id, (s.offset, s.length)))
-                .collect();
-
-            let mut mismatch = false;
-            for expected in expected_slices {
-                match current_map.get(&expected.slice_id) {
-                    Some((offset, length)) => {
-                        if *offset != expected.offset || *length != expected.length {
-                            tracing::warn!(
-                                chunk_id = chunk_id,
-                                slice_id = expected.slice_id,
-                                "Concurrent modification detected: slice content changed"
-                            );
-                            mismatch = true;
-                            break;
-                        }
-                    }
-                    None => {
-                        tracing::warn!(
-                            chunk_id = chunk_id,
-                            slice_id = expected.slice_id,
-                            "Concurrent modification detected: slice missing"
-                        );
-                        mismatch = true;
-                        break;
-                    }
-                }
-            }
-
-            if mismatch {
-                continue;
-            }
-
-            let now = Utc::now().timestamp();
-
-            let mut pipe = redis::pipe();
-            pipe.atomic();
-
-            // Replace chunk slices
-            pipe.cmd("DEL").arg(&chunk_key).ignore();
+            // Serialize new slices for the CAS.
+            let mut final_data: Vec<Vec<u8>> = Vec::with_capacity(new_slices.len());
             for slice in new_slices {
-                let data = crate::meta::serialization::serialize_meta(slice)?;
-                pipe.cmd("RPUSH").arg(&chunk_key).arg(data).ignore();
+                final_data.push(crate::meta::serialization::serialize_meta(slice)?);
             }
 
-            // Create delayed records for old slices
+            // Atomic CAS via Lua: replace list iff version still matches.
+            let ok: i32 = script
+                .key(&chunk_key)
+                .key(&version_key)
+                .arg(current_version)
+                .arg(new_version)
+                .arg(&final_data)
+                .invoke_async(&mut conn)
+                .await
+                .map_err(redis_err)?;
+
+            if ok == 0 {
+                continue;
+            }
+
+            // CAS succeeded — create delayed records and clean up uncommitted entries.
             if !delayed_slices.is_empty() {
-                for (slice_id, offset, size) in &delayed_slices {
-                    let delayed_id: i64 =
-                        conn.incr(DELAYED_COUNTER_KEY, 1).await.map_err(redis_err)?;
+                let n = delayed_slices.len() as i64;
+                let last_id: i64 = redis::cmd("INCRBY")
+                    .arg(DELAYED_COUNTER_KEY)
+                    .arg(n)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(redis_err)?;
+                let first_id = last_id - n + 1;
+                let now = Utc::now().timestamp();
+
+                let mut pipe = redis::pipe();
+                pipe.atomic();
+                for (i, (slice_id, offset, size)) in delayed_slices.iter().enumerate() {
+                    let delayed_id = first_id + i as i64;
                     let ds_key = self.delayed_key(delayed_id);
                     pipe.hset(&ds_key, "sid", slice_id.to_string());
                     pipe.hset(&ds_key, "off", offset.to_string());
@@ -3066,26 +3129,46 @@ impl MetaStore for RedisMetaStore {
                         .arg(delayed_id)
                         .ignore();
                 }
+                // Clean up uncommitted records for new slices
+                for slice in new_slices {
+                    let uc_key = self.uncommitted_key(slice.slice_id);
+                    pipe.cmd("DEL").arg(&uc_key).ignore();
+                    pipe.cmd("ZREM")
+                        .arg(UNCOMMITTED_PENDING_INDEX_KEY)
+                        .arg(slice.slice_id.to_string())
+                        .ignore();
+                    pipe.cmd("ZREM")
+                        .arg(UNCOMMITTED_ORPHAN_INDEX_KEY)
+                        .arg(slice.slice_id.to_string())
+                        .ignore();
+                }
+                pipe.query_async::<()>(&mut conn)
+                    .await
+                    .map_err(redis_err)?;
+            } else {
+                // No delayed slices, still clean up uncommitted records.
+                for slice in new_slices {
+                    let uc_key = self.uncommitted_key(slice.slice_id);
+                    redis::pipe()
+                        .atomic()
+                        .cmd("DEL")
+                        .arg(&uc_key)
+                        .ignore()
+                        .cmd("ZREM")
+                        .arg(UNCOMMITTED_PENDING_INDEX_KEY)
+                        .arg(slice.slice_id.to_string())
+                        .ignore()
+                        .cmd("ZREM")
+                        .arg(UNCOMMITTED_ORPHAN_INDEX_KEY)
+                        .arg(slice.slice_id.to_string())
+                        .ignore()
+                        .query_async::<()>(&mut conn)
+                        .await
+                        .map_err(redis_err)?;
+                }
             }
 
-            // Clean up uncommitted records for new slices
-            for slice in new_slices {
-                let uc_key = self.uncommitted_key(slice.slice_id);
-                pipe.cmd("DEL").arg(&uc_key).ignore();
-                pipe.cmd("ZREM")
-                    .arg(UNCOMMITTED_PENDING_INDEX_KEY)
-                    .arg(slice.slice_id.to_string())
-                    .ignore();
-                pipe.cmd("ZREM")
-                    .arg(UNCOMMITTED_ORPHAN_INDEX_KEY)
-                    .arg(slice.slice_id.to_string())
-                    .ignore();
-            }
-
-            let result: Option<()> = pipe.query_async(&mut conn).await.map_err(redis_err)?;
-            if result.is_some() {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         Err(MetaError::ContinueRetry)

@@ -1571,6 +1571,12 @@ where
             });
         }
 
+        // Flush pending writer data before reading so the reader sees committed
+        // results.  Without this, commit_chunk can pop a dirty slice between
+        // handle.read() and overlay_dirty_if_exists(), causing the overlay to
+        // miss data that was not yet committed when the reader fetched it.
+        self.state.writer.flush_if_exists(handle.ino as u64).await;
+
         let mut data = handle.read(offset, len).await.map_err(VfsError::from)?;
         self.state
             .writer
@@ -1801,8 +1807,9 @@ where
         let data = src_guard.read(off_in, len).await?;
         let written = dst_guard.write(off_out, &data).await?;
 
-        drop(dst_guard);
-        drop(src_guard);
+        // Close guards to flush and commit before releasing locks.
+        dst_guard.close().await.map_err(|_| VfsError::Other)?;
+        src_guard.close().await.map_err(|_| VfsError::Other)?;
         drop(locked);
         drop(mutation_guards);
 
@@ -1822,9 +1829,16 @@ where
         let dst_attr = self.meta_stat_required(dst_ino, PathHint::none()).await?;
         let src_guard = self.open_guard(src_ino, src_attr, true, false).await?;
         let dst_guard = self.open_guard(dst_ino, dst_attr, false, true).await?;
+        let fh_in = src_guard.fh();
+        let fh_out = dst_guard.fh();
 
-        self.copy_file_range(src_guard.fh(), off_in, dst_guard.fh(), off_out, length)
-            .await
+        let result = self.copy_file_range(fh_in, off_in, fh_out, off_out, length).await;
+
+        // Close guards to ensure handles are released cleanly.
+        dst_guard.close().await.map_err(|_| VfsError::Other)?;
+        src_guard.close().await.map_err(|_| VfsError::Other)?;
+
+        result
     }
 
     /// Allocate a per-file handle, returning the opaque fh id.

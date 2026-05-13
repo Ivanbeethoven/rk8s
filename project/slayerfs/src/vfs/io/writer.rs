@@ -800,8 +800,16 @@ where
         Ok(())
     }
 
-    // Flush: freeze all slices, upload them, and wait for commit threads to drain.
+    // Flush: freeze all slices, upload them, and wait for those slices to commit.
     // This blocks new writes until flushing completes (flush_waiting gate).
+    //
+    // We track *specific slices* rather than waiting for chunks to drain.
+    // Waiting for chunks is incorrect under continuous writes: for small files
+    // where all writes target the same chunk, new slices keep arriving in that
+    // chunk, so it never becomes empty and flush never returns.  By freezing
+    // every slice present at the start and then waiting only for those slices
+    // to reach Committed (or Failed), we guarantee forward progress regardless
+    // of concurrent write traffic.
     #[tracing::instrument(level = "trace", skip(self))]
     pub(crate) async fn flush(&self) -> anyhow::Result<()> {
         {
@@ -810,48 +818,68 @@ where
         }
 
         let start = Instant::now();
-        let result = loop {
-            let chunk_ids = {
+        let result = 'outer: loop {
+            // Snapshot every slice that exists right now.
+            let slices: Vec<Arc<ParkingMutex<SliceState>>> = {
                 let guard = self.shared.inner.lock().await;
-                guard.chunk_ids()
-            };
-
-            if chunk_ids.is_empty() {
-                break Ok(());
-            }
-
-            let mut to_flush = Vec::new();
-            {
-                let guard = self.shared.inner.lock().await;
-                let slices: Vec<Arc<ParkingMutex<SliceState>>> = guard
+                if !guard.has_chunks() {
+                    break Ok(());
+                }
+                guard
                     .chunks
                     .values()
                     .flat_map(|chunk| chunk.slices.iter().cloned())
-                    .collect();
+                    .collect()
+            };
 
-                drop(guard);
-
-                for slice in slices {
-                    let handle = SliceHandle {
-                        slice: &slice,
-                        shared: &self.shared,
-                    };
-                    if handle.freeze() {
-                        to_flush.push(slice);
-                    }
+            // Freeze any that are still writable and kick off their uploads.
+            for slice in &slices {
+                let handle = SliceHandle {
+                    slice,
+                    shared: &self.shared,
+                };
+                if handle.freeze() {
+                    Self::spawn_flush_slice(self.shared.clone(), slice.clone());
                 }
             }
 
-            for slice in to_flush {
-                Self::spawn_flush_slice(self.shared.clone(), slice);
-            }
+            // Wait for every slice we captured to be committed or failed.
+            // New slices created after the snapshot are for the *next* flush.
+            loop {
+                let all_done = slices.iter().all(|s| {
+                    matches!(
+                        s.lock().state,
+                        SliceStatus::Committed | SliceStatus::Failed
+                    )
+                });
 
-            if timeout(FLUSH_WAIT, self.shared.flush_notify.notified())
-                .await
-                .is_err()
-                && start.elapsed() > FLUSH_DEADLINE
-            {
-                break Err(anyhow::anyhow!("flush timeout after {:?}", FLUSH_DEADLINE));
+                if all_done {
+                    break 'outer Ok(());
+                }
+
+                if timeout(FLUSH_WAIT, self.shared.flush_notify.notified())
+                    .await
+                    .is_err()
+                    && start.elapsed() > FLUSH_DEADLINE
+                {
+                    break 'outer Err(anyhow::anyhow!(
+                        "flush timeout after {:?}",
+                        FLUSH_DEADLINE
+                    ));
+                }
+
+                // If the notify fired spuriously or for a different chunk,
+                // re-poll the slice statuses inline so that a continuous
+                // stream of commit completions doesn't keep us sleeping
+                // for the full FLUSH_WAIT interval.
+                if slices.iter().all(|s| {
+                    matches!(
+                        s.lock().state,
+                        SliceStatus::Committed | SliceStatus::Failed
+                    )
+                }) {
+                    break 'outer Ok(());
+                }
             }
         };
 
