@@ -1,7 +1,6 @@
 services:
   redis:
     image: docker.io/library/redis:7.2-alpine
-    container_name: redis-slayerfs-xfstests
     command: >
       redis-server
       --appendonly yes
@@ -16,7 +15,6 @@ services:
 
   rustfs:
     image: rustfs/rustfs:latest
-    container_name: rustfs-slayerfs-xfstests
     expose:
       - "9000"
       - "9001"
@@ -40,6 +38,10 @@ services:
       - rustfs-data:/data
     networks:
       - slayerfs-xfstests
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
   rustfs-init:
     image: amazon/aws-cli:latest
@@ -111,6 +113,10 @@ services:
       - slayerfs-state:/var/lib/slayerfs
     networks:
       - slayerfs-xfstests
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
 networks:
   slayerfs-xfstests:

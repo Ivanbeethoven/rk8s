@@ -691,6 +691,49 @@ mod io_tests {
     }
 
     #[tokio::test]
+    async fn test_fs_write_cached_ino_defers_flush_until_reader_needs_data() {
+        let layout = ChunkLayout::default();
+        let store = InMemoryBlockStore::new();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let fs = VFS::new(layout, store, meta_store).await.unwrap();
+
+        fs.create_file("/cached.bin").await.unwrap();
+        let attr = fs.stat("/cached.bin").await.unwrap();
+        let data = b"cached-writeback-data";
+
+        fs.write_cached_ino(attr.ino, 0, data).await.unwrap();
+
+        let inode = fs.ensure_inode_registered(attr.ino).await.unwrap();
+        let writer = fs.state.writer.ensure_file(inode);
+        assert!(writer.has_pending().await);
+
+        let out = read_path(&fs, "/cached.bin", 0, data.len()).await;
+        assert_eq!(out, data);
+        assert!(!writer.has_pending().await);
+    }
+
+    #[tokio::test]
+    async fn test_fs_fallocate_ino_extends_file_and_zero_fills() {
+        let layout = ChunkLayout::default();
+        let store = InMemoryBlockStore::new();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let fs = VFS::new(layout, store, meta_store).await.unwrap();
+
+        fs.create_file("/falloc.bin").await.unwrap();
+        let attr = fs.stat("/falloc.bin").await.unwrap();
+
+        fs.fallocate_ino(attr.ino, 128, 64).await.unwrap();
+
+        let st = fs.stat("/falloc.bin").await.unwrap();
+        assert_eq!(st.size, 192);
+
+        let out = read_path(&fs, "/falloc.bin", 0, st.size as usize).await;
+        assert_eq!(out, vec![0u8; st.size as usize]);
+    }
+
+    #[tokio::test]
     async fn test_fs_truncate_prunes_chunks_and_zero_fills() {
         let layout = ChunkLayout {
             chunk_size: 8 * 1024,

@@ -4,4 +4,16 @@
 generic/426 # File handle operations: open_by_handle_at() returns ESTALE
 generic/467 # File handle operations: open_by_handle_at() 
 generic/477 # File handle operations: open_by_handle_at()
+generic/192 # atime: FUSE default mount options (relatime/noatime) prevent reliable atime updates
+generic/504 # BSD flock(2): /proc/locks not visible (FUSE kernel limitation, see doc/bugfix/504-flock.md)
+generic/632 # Shared mountpoint required: FUSE mounts are private, no mount propagation support
 generic/633 # Device files (mknod with S_IFCHR/S_IFBLK): not supported by object storage filesystem
+# Stress/soak tests: 10x fsstress with cycle_mount, unsuited for FUSE+Redis (>hours)
+generic/650 # all-writes fsstress with CPU hotplug, 25000+ ops over 10 iterations
+# O_DIRECT (direct I/O) from holes: FUSE does not properly handle DIO on sparse regions
+generic/647 # mmap-rw-fault: O_DIRECT pread from hole returns wrong data
+generic/729 # same as 647, different test variant
+# Fallocate insert range: slayerfs fallocate only supports mode=0 (alloc)
+generic/735 # xfs_io finsert requires FALLOC_FL_INSERT_RANGE
+# Test binary buffer overflow triggered by FUSE readdir behavior
+generic/736 # readdir-while-renames buffer overflow (test binary issue with FUSE)

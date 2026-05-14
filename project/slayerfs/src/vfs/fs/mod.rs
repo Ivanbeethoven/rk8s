@@ -205,6 +205,17 @@ where
         self.dir_handles.remove(&fh).map(|(_, handle)| handle)
     }
 
+    /// Replace the DirHandle at an existing fh with a fresh one.
+    /// Used for rewinddir: keep the same fh but swap in new entries.
+    fn replace_dir(&self, fh: u64, handle: DirHandle) -> bool {
+        if self.dir_handles.contains_key(&fh) {
+            self.dir_handles.insert(fh, Arc::new(handle));
+            true
+        } else {
+            false
+        }
+    }
+
     fn get_dir(&self, fh: u64) -> Option<Arc<DirHandle>> {
         self.dir_handles
             .get(&fh)
@@ -1434,6 +1445,39 @@ where
         Ok(())
     }
 
+    /// Minimal fallocate support for buffered mmap tests.
+    ///
+    /// SlayerFS does not reserve backend space ahead of time, but `mode=0`
+    /// must still make the file logically extend to cover `offset + length`.
+    /// Unsupported punch/collapse/zero-range modes are rejected by the FUSE
+    /// adapter so callers get a clear error instead of falling back to slow
+    /// userspace emulation.
+    pub async fn fallocate_ino(&self, ino: i64, offset: u64, length: u64) -> Result<(), VfsError> {
+        let attr = self.meta_stat_required(ino, PathHint::none()).await?;
+        if matches!(attr.kind, FileType::Dir) {
+            return Err(VfsError::IsADirectory {
+                path: PathHint::none(),
+            });
+        }
+        if length == 0 {
+            return Ok(());
+        }
+
+        let end = offset.checked_add(length).ok_or(VfsError::FileTooLarge)?;
+        let current_size = self.inode_size_cached(ino).unwrap_or(attr.size);
+        if end <= current_size {
+            return Ok(());
+        }
+
+        let req = SetAttrRequest {
+            size: Some(end),
+            ..Default::default()
+        };
+        self.set_attr(ino, &req, SetAttrFlags::empty()).await?;
+        self.update_mtime_ctime(ino).await?;
+        Ok(())
+    }
+
     #[tracing::instrument(level = "trace", skip(self, req), fields(ino, flags = ?flags))]
     pub async fn set_attr(
         &self,
@@ -1661,25 +1705,15 @@ where
 
     /// Write back a kernel-cached page by inode. This uses the inode mutation
     /// lock so truncate/copy cannot interleave with a dirty writer commit.
+    /// Cached writeback must remain lightweight; fsync/flush/close and read paths
+    /// are responsible for forcing pending data visible when required.
     pub async fn write_cached_ino(
         &self,
         ino: i64,
         offset: u64,
         data: &[u8],
     ) -> Result<usize, VfsError> {
-        let written = self.write_ino_inner(ino, offset, data).await?;
-
-        // MAP_SHARED verification workloads can close and immediately reopen the
-        // file for readback. Make cached writeback visible before acknowledging
-        // the WRITE_CACHE request so post-close reads cannot race buffered
-        // uploader/commit state in userspace.
-        self.state
-            .writer
-            .flush_required(ino as u64)
-            .await
-            .map_err(|_| VfsError::Other)?;
-
-        Ok(written)
+        self.write_ino_inner(ino, offset, data).await
     }
 
     async fn write_ino_inner(&self, ino: i64, offset: u64, data: &[u8]) -> Result<usize, VfsError> {
@@ -2010,6 +2044,20 @@ where
         let fh = self.state.handles.allocate_dir(handle);
 
         Ok(fh)
+    }
+
+    /// Refresh a directory handle by re-reading entries from the meta layer.
+    /// Keeps the same fh — the old handle is replaced in-place.
+    /// Used for rewinddir(3): files created after opendir(3) must become
+    /// visible after rewinddir(3) + readdir(3).
+    pub async fn refresh_dir_handle(&self, fh: u64) -> Result<(), VfsError> {
+        let ino = self
+            .dir_handle(fh)
+            .ok_or(VfsError::StaleNetworkFileHandle)?
+            .ino;
+        let fresh = self.meta_opendir(ino).await?;
+        self.state.handles.replace_dir(fh, fresh);
+        Ok(())
     }
 
     /// Close a directory handle

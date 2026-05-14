@@ -20,10 +20,10 @@ usage() {
 
 说明:
   - 使用 docker compose 在容器内运行 xfstests（FUSE），元数据库为 redis
+  - 对象存储固定使用 rustfs（SLAYERFS_DATA_BACKEND=s3）
   - 测试产物输出到: $ARTIFACTS_DIR
 
 选项:
-  --s3                       使用 rustfs 作为对象存储（SLAYERFS_DATA_BACKEND=s3）
   --cases "<case...>"        只跑指定用例，例如: "generic/001 generic/002"
   --skip-cases <N>           全量模式下跳过默认测试序列中的前 N 个用例
   --check-args "<args...>"   直接透传给 xfstests ./check 的参数
@@ -52,17 +52,12 @@ require_non_negative_integer() {
 }
 
 KEEP=false
-USE_S3=false
 XFSTESTS_CASES_VALUE=""
 XFSTESTS_CHECK_ARGS_VALUE=""
 XFSTESTS_SKIP_CASES_VALUE="0"
 
 while [[ $# -gt 0 ]]; do
     case "${1:-}" in
-        --s3)
-            USE_S3=true
-            shift
-            ;;
         --cases)
             require_value "$1" "${2:-}"
             XFSTESTS_CASES_VALUE="${2:-}"
@@ -110,36 +105,34 @@ cleanup() {
         info "跳过 compose down (--keep)"
         return 0
     fi
-    docker compose -f "$COMPOSE_FILE" down -v >/dev/null 2>&1 || true
+    docker compose "${COMPOSE_ARGS[@]}" down -v >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
 info "构建宿主机 slayerfs release 二进制（供镜像 COPY）"
 bash "$DOCKER_DIR/build_slayerfs_host_binary.sh"
 
-info "构建 xfstests runner 镜像"
-docker compose -f "$COMPOSE_FILE" build xfstests
-
 ts="$(date +%s)-$RANDOM"
+PROJECT_NAME="slayerfs-${ts}"
+COMPOSE_ARGS=(-f "$COMPOSE_FILE" -p "$PROJECT_NAME")
+
+info "构建 xfstests runner 镜像"
+docker compose "${COMPOSE_ARGS[@]}" build xfstests
 export SLAYERFS_ARTIFACT_DIR="/artifacts/run-${ts}"
 export XFSTESTS_CASES="$XFSTESTS_CASES_VALUE"
 export XFSTESTS_CHECK_ARGS="$XFSTESTS_CHECK_ARGS_VALUE"
 export XFSTESTS_SKIP_CASES="$XFSTESTS_SKIP_CASES_VALUE"
-if [[ "$USE_S3" == true ]]; then
-    export SLAYERFS_DATA_BACKEND="s3"
-else
-    export SLAYERFS_DATA_BACKEND="local-fs"
-fi
+export SLAYERFS_DATA_BACKEND="s3"
 
 info "启动依赖服务: redis + rustfs"
-docker compose -f "$COMPOSE_FILE" up -d redis rustfs
+docker compose "${COMPOSE_ARGS[@]}" up -d redis rustfs
 
 info "初始化 rustfs bucket（一次性容器）"
-docker compose -f "$COMPOSE_FILE" run --rm rustfs-init
+docker compose "${COMPOSE_ARGS[@]}" run --rm rustfs-init
 
 info "运行 xfstests（退出码由 xfstests 容器决定）"
 set +e
-docker compose -f "$COMPOSE_FILE" run --rm xfstests
+docker compose "${COMPOSE_ARGS[@]}" run --rm xfstests
 status=$?
 set -e
 

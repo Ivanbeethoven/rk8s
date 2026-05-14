@@ -8,7 +8,15 @@ use crate::utils::NumCastExt;
 use crate::vfs::backend::Backend;
 use anyhow::Result;
 use bytes::Bytes;
-use futures_util::future::join_all;
+use std::sync::LazyLock;
+use tokio::sync::Semaphore;
+
+/// Maximum concurrent block uploads across the entire process.  Each upload
+/// opens an HTTP connection (S3 backend); without a bound the S3 server runs
+/// out of file descriptors under heavy writeback/fysnc workloads.
+const MAX_CONCURRENT_UPLOADS: usize = 256;
+
+static UPLOAD_SEM: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_UPLOADS));
 
 struct ChunkCursor<'a> {
     chunks: &'a [Bytes],
@@ -91,7 +99,16 @@ where
             futures.push(future);
         }
 
-        for res in join_all(futures).await {
+        // Bound total concurrent block uploads so that neither the S3
+        // server nor the local machine exhausts file descriptors.
+        let futures: Vec<_> = futures
+            .into_iter()
+            .map(|f| async move {
+                let _p = UPLOAD_SEM.acquire().await;
+                f.await
+            })
+            .collect();
+        for res in futures_util::future::join_all(futures).await {
             res?;
         }
         Ok(())

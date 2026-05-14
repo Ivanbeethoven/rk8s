@@ -620,6 +620,13 @@ where
         offset: i64,
     ) -> FuseResult<ReplyDirectory<BoxStream<'a, FuseResult<DirectoryEntry>>>> {
         debug!(ino, fh, offset, "fuse.readdir");
+        // Rewinddir: offset ≤ 0 means restart from the beginning.
+        // Replace the cached handle with a fresh snapshot from the meta
+        // layer so that entries created after opendir(3) are visible.
+        if fh != 0 && offset <= 0 {
+            let _ = self.refresh_dir_handle(fh).await;
+        }
+
         // Try to use handle first. FUSE directory offsets identify the next
         // entry to read: 0=start, 1=after ".", 2=after "..", and 3+=child index+1.
         let (entries, entries_offset, include_dot_entries, include_dotdot_only) = if fh != 0 {
@@ -719,6 +726,11 @@ where
         debug!(unique = req.unique, ino, fh, offset, "fuse.readdirplus");
         let ttl = FUSE_CACHE_TTL;
         let mut all: Vec<DirectoryEntryPlus> = Vec::new();
+
+        // Rewinddir: same logic as readdir().
+        if fh != 0 && offset <= 0 {
+            let _ = self.refresh_dir_handle(fh).await;
+        }
 
         // Try to use handle first with the same offset mapping as readdir().
         let (entries_from_handle, entries_offset, include_dot_entries, include_dotdot_only) =
@@ -1327,6 +1339,24 @@ where
     async fn fsync(&self, _req: Request, _inode: u64, fh: u64, datasync: bool) -> FuseResult<()> {
         debug!(fh, datasync, "fuse.fsync");
         self.fsync(fh, datasync).await.map_err(Errno::from)
+    }
+
+    async fn fallocate(
+        &self,
+        _req: Request,
+        inode: u64,
+        fh: u64,
+        offset: u64,
+        length: u64,
+        mode: u32,
+    ) -> FuseResult<()> {
+        debug!(inode, fh, offset, length, mode, "fuse.fallocate");
+        if mode != 0 {
+            return Err(libc::EOPNOTSUPP.into());
+        }
+        self.fallocate_ino(inode as i64, offset, length)
+            .await
+            .map_err(Errno::from)
     }
 
     async fn lseek(

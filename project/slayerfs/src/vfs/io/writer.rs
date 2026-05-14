@@ -43,10 +43,21 @@ const FLUSH_DEADLINE: Duration = Duration::from_secs(300);
 const UPLOAD_MAX_RETRIES: u64 = 5;
 const COMMIT_RETRY_BASE_MS: u64 = 20;
 const COMMIT_RETRY_MAX_MS: u64 = 2000;
+/// Maximum age of a Writable slice before auto_flush freezes it and starts
+/// background upload, regardless of idle time.  A short threshold lets the
+/// background path pre-empt foreground fsync so that explicit flushes mostly
+/// wait for work that is already in flight rather than kicking off a full
+/// upload+commit round from scratch.
+const AUTO_FLUSH_MAX_AGE: Duration = Duration::from_millis(5);
 
 const MAX_UNFLUSHED_SLICES: usize = 3;
 const MAX_SLICES_THRESHOLD: usize = 800;
 const WRITE_MAX_WAIT: Duration = Duration::from_secs(30);
+/// Minimum number of bytes a Writable slice must hold before `should_freeze`
+/// returns true on a size basis.  This lets single-page (4 KiB) writeback
+/// from the kernel trigger an immediate freeze so that the background
+/// upload+commit path can pre-empt a subsequent fsync.
+const SHOULD_FREEZE_MIN_BYTES: u64 = 4096;
 
 fn commit_retry_backoff(failures: u32) -> Duration {
     let exp = failures.saturating_sub(1).min(16);
@@ -301,7 +312,12 @@ where
     fn should_freeze(&self) -> bool {
         self.with_ref(|s| {
             let end = s.offset + s.data.len();
+            // Freeze when the slice fills the chunk, or when enough data
+            // has accumulated that a background upload cycle is worthwhile.
+            // The size-based check lets the write path itself trigger
+            // uploads without waiting for auto_flush's next poll interval.
             end >= self.shared.config.layout.chunk_size
+                || s.data.len() >= SHOULD_FREEZE_MIN_BYTES
         })
     }
 
@@ -573,6 +589,12 @@ struct Shared<B, M> {
     flush_notify: Notify,
     backend: Arc<Backend<B, M>>,
     reader: Arc<DataReader<B, M>>,
+    /// Monotonically incremented on each write.  Used together with
+    /// `last_flushed_gen` to let `has_pending()` avoid a lock acquisition
+    /// when no new data has arrived since the last successful flush.
+    write_gen: AtomicU64,
+    /// Snapshot of `write_gen` taken after a flush completes successfully.
+    last_flushed_gen: AtomicU64,
 }
 
 impl<B, M> Shared<B, M>
@@ -600,6 +622,8 @@ where
             flush_notify: Notify::new(),
             backend,
             reader,
+            write_gen: AtomicU64::new(0),
+            last_flushed_gen: AtomicU64::new(0),
         }
     }
 }
@@ -751,6 +775,7 @@ where
         if new_len > self.shared.inode.file_size() {
             self.shared.inode.update_size(new_len);
         }
+        self.shared.write_gen.fetch_add(1, Ordering::Release);
         Ok(buf.len())
     }
 
@@ -890,6 +915,13 @@ where
         }
         if guard.flush_waiting == 0 && guard.write_waiting > 0 {
             self.shared.write_notify.notify_waiters();
+        }
+
+        // Let has_pending() short-circuit when no new writes arrived since we finished.
+        if result.is_ok() {
+            self.shared
+                .last_flushed_gen
+                .store(self.shared.write_gen.load(Ordering::Acquire), Ordering::Release);
         }
 
         result
@@ -1237,6 +1269,7 @@ where
     /// Use `Weak` to stop it when the `FileWriter` was dropped.
     async fn auto_flush(shared: Weak<Shared<B, M>>) {
         let idle = Duration::from_secs(1);
+        let mut tick: u64 = 0;
 
         loop {
             let Some(shared) = shared.upgrade() else {
@@ -1283,9 +1316,16 @@ where
                             continue;
                         }
 
-                        // age > FLUSH_DURATION means the slices are too old and (idle_time > idle && age > idle)
-                        // represents it's been too long since last flushed.
-                        let mut should = age > FLUSH_DURATION || (idle_time > idle && age > idle);
+                        // Freeze Writable slices that have existed long enough
+                        // for a background upload cycle to be worthwhile.
+                        // The short AUTO_FLUSH_MAX_AGE threshold lets the
+                        // background path pre-empt foreground fsync: by the
+                        // time fsync calls flush(), auto_flush has usually
+                        // already frozen the slice and kicked off the upload,
+                        // so flush only waits for in-flight work to land.
+                        let mut should = age > AUTO_FLUSH_MAX_AGE
+                            || (idle_time > idle && age > idle)
+                            || age > FLUSH_DURATION;
                         if !should && too_many {
                             // idx <= half represents older slices.
                             if chunk_idx % 2 == pick_bit && idx <= half {
@@ -1294,6 +1334,11 @@ where
                         }
 
                         if should && handle.freeze() {
+                            tracing::info!(
+                                age_ms = age.as_millis(),
+                                idle_ms = idle_time.as_millis(),
+                                "auto_flush: freezing slice"
+                            );
                             to_flush.push(slice.clone());
                         }
                     }
@@ -1304,7 +1349,13 @@ where
                 Self::spawn_flush_slice(shared.clone(), slice);
             }
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Heartbeat every ~30s so we can see auto_flush is alive.
+            // The tick counter is only for diagnostics and wraps harmlessly.
+            tick += 1;
+            if tick % 3000 == 0 {
+                tracing::info!(iteration = tick, "auto_flush: alive");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }
@@ -1398,7 +1449,12 @@ where
         if let Some(writer) = writer
             && writer.has_pending().await
         {
+            let start = std::time::Instant::now();
             writer.flush().await?;
+            let ms = start.elapsed().as_millis();
+            if ms > 100 {
+                tracing::info!(ino, elapsed_ms = ms, "flush_required: slow flush");
+            }
         }
         Ok(())
     }
@@ -1647,7 +1703,10 @@ mod tests {
 
         let cid = chunk_id_for(inode.ino(), 0).unwrap();
         let slices = meta_store.get_slices(cid).await.unwrap();
-        assert_eq!(slices.len(), 1);
+        // With SHOULD_FREEZE_MIN_BYTES the first 1 MiB slice is frozen
+        // immediately, so the second write goes to a fresh slice.
+        // Both are committed by flush.
+        assert_eq!(slices.len(), 2);
 
         let mut reader = DataFetcher::new(layout, cid, backend.as_ref());
         reader.prepare_slices().await.unwrap();
