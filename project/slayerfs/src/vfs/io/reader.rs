@@ -1190,6 +1190,7 @@ mod tests {
             backend.clone(),
             reader,
             Arc::new(AtomicU64::new(0)),
+            None,
         ));
 
         let write_task = {

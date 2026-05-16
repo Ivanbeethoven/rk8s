@@ -276,6 +276,7 @@ where
             config.write.clone(),
             backend,
             reader.clone(),
+            None,
         ));
         writer.start_flush_background();
         Self {

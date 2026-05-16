@@ -20,6 +20,7 @@ use crate::vfs::Inode;
 use crate::vfs::backend::Backend;
 use crate::vfs::cache::page::CacheSlice;
 use crate::vfs::cache::page::WriteAction as PageWriteAction;
+use crate::vfs::cache::write_back::WriteBackCache;
 use crate::vfs::chunk_id_for;
 use crate::vfs::config::WriteConfig;
 use crate::vfs::extract_ino_and_chunk_index;
@@ -637,6 +638,8 @@ struct Shared<B, M> {
     flush_notify: Notify,
     backend: Arc<Backend<B, M>>,
     reader: Arc<DataReader<B, M>>,
+    /// Local SSD write-back cache for persisting frozen slices before upload.
+    write_back: Option<Arc<crate::vfs::cache::write_back::FsWriteBackCache>>,
     /// Monotonically incremented on each write.  Used together with
     /// `last_flushed_gen` to let `has_pending()` avoid a lock acquisition
     /// when no new data has arrived since the last successful flush.
@@ -658,6 +661,7 @@ where
         backend: Arc<Backend<B, M>>,
         reader: Arc<DataReader<B, M>>,
         buffer_usage: Arc<AtomicU64>,
+        write_back: Option<Arc<crate::vfs::cache::write_back::FsWriteBackCache>>,
     ) -> Self {
         Self {
             inode,
@@ -672,6 +676,7 @@ where
             flush_notify: Notify::new(),
             backend,
             reader,
+            write_back,
             write_gen: AtomicU64::new(0),
             last_flushed_gen: AtomicU64::new(0),
             writeback_error: ParkingMutex::new(None),
@@ -785,8 +790,16 @@ where
         backend: Arc<Backend<B, M>>,
         reader: Arc<DataReader<B, M>>,
         buffer_usage: Arc<AtomicU64>,
+        write_back: Option<Arc<crate::vfs::cache::write_back::FsWriteBackCache>>,
     ) -> Self {
-        let shared = Arc::new(Shared::new(inode, config, backend, reader, buffer_usage));
+        let shared = Arc::new(Shared::new(
+            inode,
+            config,
+            backend,
+            reader,
+            buffer_usage,
+            write_back,
+        ));
         let flush_shared = Arc::downgrade(&shared);
         tokio::spawn(async move { Self::auto_flush(flush_shared).await });
         Self { shared }
@@ -1128,6 +1141,21 @@ where
                     for chunk in chunks {
                         data_len += chunk.len();
                         all_chunks.push(chunk);
+                    }
+                }
+
+                // Best-effort persist to local SSD for crash recovery.
+                // Upload proceeds from memory regardless of SSD persist result.
+                if let Some(wb) = &shared.write_back {
+                    let ino = shared.inode.ino() as i64;
+                    let key = crate::vfs::cache::keys::DirtySliceKey {
+                        ino,
+                        chunk_id,
+                        local_seq: wb.next_seq(),
+                        epoch: 0,
+                    };
+                    if let Err(e) = wb.persist_slice(key, all_chunks.clone()).await {
+                        tracing::debug!(ino, chunk_id, error = ?e, "SSD persist skipped");
                     }
                 }
 
@@ -1604,6 +1632,7 @@ pub(crate) struct DataWriter<B, M> {
     reader: Arc<DataReader<B, M>>,
     files: DashMap<u64, Arc<FileWriter<B, M>>>,
     buffer_usage: Arc<AtomicU64>,
+    write_back: Option<Arc<crate::vfs::cache::write_back::FsWriteBackCache>>,
 }
 
 impl<B, M> DataWriter<B, M>
@@ -1615,6 +1644,7 @@ where
         config: Arc<WriteConfig>,
         backend: Arc<Backend<B, M>>,
         reader: Arc<DataReader<B, M>>,
+        write_back: Option<Arc<crate::vfs::cache::write_back::FsWriteBackCache>>,
     ) -> Self {
         Self {
             config,
@@ -1622,6 +1652,7 @@ where
             reader,
             files: DashMap::new(),
             buffer_usage: Arc::new(AtomicU64::new(0)),
+            write_back,
         }
     }
 
@@ -1635,6 +1666,7 @@ where
                     self.backend.clone(),
                     self.reader.clone(),
                     self.buffer_usage.clone(),
+                    self.write_back.clone(),
                 ))
             })
             .clone()
@@ -1949,6 +1981,7 @@ mod tests {
             backend.clone(),
             reader,
             Arc::new(AtomicU64::new(0)),
+            None,
         );
 
         let len = (layout.block_size / 2) as usize;
@@ -1995,6 +2028,7 @@ mod tests {
             backend.clone(),
             reader,
             Arc::new(AtomicU64::new(0)),
+            None,
         );
 
         let len = (layout.block_size / 4) as usize;
@@ -2044,6 +2078,7 @@ mod tests {
             backend.clone(),
             reader.clone(),
             Arc::new(AtomicU64::new(0)),
+            None,
         );
 
         let len = layout.chunk_size as usize + 1024;
@@ -2085,6 +2120,7 @@ mod tests {
             backend.clone(),
             reader,
             Arc::new(AtomicU64::new(0)),
+            None,
         );
 
         let cid = chunk_id_for(inode.ino(), 0).unwrap();
@@ -2136,6 +2172,7 @@ mod tests {
             backend.clone(),
             reader,
             Arc::new(AtomicU64::new(0)),
+            None,
         ));
 
         let data = vec![3u8; 2048];
@@ -2195,6 +2232,7 @@ mod tests {
             backend.clone(),
             reader,
             Arc::new(AtomicU64::new(0)),
+            None,
         );
 
         writer.write_at(0, &[9u8; 2048]).await.unwrap();
@@ -2249,6 +2287,7 @@ mod tests {
             backend.clone(),
             reader,
             Arc::new(AtomicU64::new(0)),
+            None,
         );
 
         let cid = chunk_id_for(ino, 0).unwrap();
@@ -2309,7 +2348,7 @@ mod tests {
                 .page_size(4 * 1024)
                 .flush_all_interval(Duration::from_millis(50)),
         );
-        let writer_pool = Arc::new(DataWriter::new(write_cfg, backend.clone(), reader));
+        let writer_pool = Arc::new(DataWriter::new(write_cfg, backend.clone(), reader, None));
         writer_pool.start_flush_background();
 
         let ino = meta
