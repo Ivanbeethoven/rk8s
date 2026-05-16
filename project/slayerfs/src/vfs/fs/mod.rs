@@ -272,11 +272,22 @@ where
 {
     fn new(config: Arc<VFSConfig>, backend: Arc<Backend<S, M>>) -> Self {
         let reader = Arc::new(DataReader::new(config.read.clone(), backend.clone()));
+
+        let write_back = {
+            let cache_root = dirs::cache_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join("slayerfs");
+            let _ = std::fs::create_dir_all(&cache_root);
+            Some(Arc::new(
+                crate::vfs::cache::write_back::FsWriteBackCache::new(cache_root),
+            ))
+        };
+
         let writer = Arc::new(DataWriter::new(
             config.write.clone(),
             backend,
             reader.clone(),
-            None,
+            write_back,
         ));
         writer.start_flush_background();
         Self {
