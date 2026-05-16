@@ -14,8 +14,8 @@ use crate::meta::file_lock::{
     FileLockInfo, FileLockQuery, FileLockRange, FileLockType, PlockRecord,
 };
 use crate::meta::store::{
-    DirEntry, FileAttr, FileType, LockName, MetaError, MetaStore, SetAttrFlags, SetAttrRequest,
-    StatFsSnapshot,
+    DirEntry, FileAttr, FileType, LockName, MetaError, MetaStore, RetryReason, SetAttrFlags,
+    SetAttrRequest, StatFsSnapshot,
 };
 use crate::meta::{INODE_ID_KEY, SLICE_ID_KEY};
 use async_trait::async_trait;
@@ -2327,7 +2327,7 @@ impl MetaStore for RedisMetaStore {
         let response: LuaResponse = serde_json::from_str(&result)
             .map_err(|e| MetaError::Internal(format!("Failed to parse Lua response: {e}")))?;
         match response.error.as_deref() {
-            Some("stale_conflict") => Err(MetaError::ContinueRetry),
+            Some("stale_conflict") => Err(MetaError::ContinueRetry(RetryReason::VersionConflict)),
             Some("not_found") => Err(MetaError::NotFound(response.ino.unwrap_or(old_parent))),
             Some("internal") => {
                 let msg = response.msg.unwrap_or_else(|| "unknown error".to_string());
@@ -3027,7 +3027,7 @@ impl MetaStore for RedisMetaStore {
             return Ok(());
         }
 
-        Err(MetaError::ContinueRetry)
+        Err(MetaError::ContinueRetry(RetryReason::CompactConflict))
     }
 
     #[tracing::instrument(
@@ -3171,7 +3171,7 @@ impl MetaStore for RedisMetaStore {
             return Ok(());
         }
 
-        Err(MetaError::ContinueRetry)
+        Err(MetaError::ContinueRetry(RetryReason::CompactConflict))
     }
 
     #[tracing::instrument(

@@ -268,6 +268,33 @@ pub trait Visitor<T>: Send {
     fn visit(&mut self, item: T) -> Result<(), MetaError>;
 }
 
+/// Categorizes why a retryable conflict occurred, enabling callers to choose
+/// appropriate backoff strategies and produce better diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryReason {
+    /// Chunk version mismatch — a concurrent write or compact changed the
+    /// chunk between our read and our commit attempt.
+    VersionConflict,
+    /// Compaction conflict — another compact or write landed while we were
+    /// compacting the same chunk.
+    CompactConflict,
+    /// Generic CAS / transaction conflict (etcd txn, Redis WATCH, etc.).
+    TransactionConflict,
+    /// A global or per-inode lock is held by another operation.
+    LockContention,
+}
+
+impl std::fmt::Display for RetryReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VersionConflict => write!(f, "version_conflict"),
+            Self::CompactConflict => write!(f, "compact_conflict"),
+            Self::TransactionConflict => write!(f, "transaction_conflict"),
+            Self::LockContention => write!(f, "lock_contention"),
+        }
+    }
+}
+
 /// Metadata operation errors
 #[derive(Debug, thiserror::Error)]
 pub enum MetaError {
@@ -306,8 +333,11 @@ pub enum MetaError {
     #[error("Internal error: {0}")]
     Internal(String),
 
-    #[error("continue retry")]
-    ContinueRetry,
+    /// A retryable conflict — the caller should back off and retry.
+    /// The `RetryReason` helps commit_chunk choose an appropriate backoff
+    /// strategy and provides better observability in logs.
+    #[error("continue retry: {0}")]
+    ContinueRetry(RetryReason),
 
     #[error("error: max retries exceeded")]
     MaxRetriesExceeded,

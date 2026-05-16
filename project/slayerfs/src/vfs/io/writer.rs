@@ -13,7 +13,7 @@ use super::reader::DataReader;
 use crate::chunk::writer::DataUploader;
 use crate::chunk::{BlockStore, SliceDesc};
 use crate::meta::backoff::backoff;
-use crate::meta::store::MetaError;
+use crate::meta::store::{MetaError, RetryReason};
 use crate::meta::{MetaLayer, SLICE_ID_KEY};
 use crate::utils::{NumCastExt, UsageGuard};
 use crate::vfs::Inode;
@@ -92,7 +92,7 @@ fn looks_retryable_backend_error(err: &impl Display) -> bool {
 
 fn should_retry_meta_write(err: &MetaError) -> bool {
     match err {
-        MetaError::ContinueRetry => true,
+        MetaError::ContinueRetry(_) => true,
         MetaError::Database(err) => looks_retryable_backend_error(err),
         MetaError::Io(err) => matches!(
             err.kind(),
@@ -1144,7 +1144,7 @@ where
                                 error = ?err,
                                 "upload failed, retrying"
                             );
-                            Err(MetaError::ContinueRetry)
+                            Err(MetaError::ContinueRetry(RetryReason::VersionConflict))
                         }
                     }
                 })
@@ -1365,6 +1365,10 @@ where
                             should_pop = true;
                         } else {
                             let backoff = commit_retry_backoff(commit_failures);
+                            let reason = match &err {
+                                MetaError::ContinueRetry(r) => r.to_string(),
+                                _ => "backend_error".to_string(),
+                            };
                             warn!(
                                 ino,
                                 chunk_id = desc.chunk_id,
@@ -1374,6 +1378,7 @@ where
                                 new_size,
                                 retry_failures = commit_failures,
                                 retry_backoff_ms = backoff.as_millis() as u64,
+                                %reason,
                                 error = ?err,
                                 "commit_chunk meta write failed, retrying"
                             );
@@ -1855,6 +1860,31 @@ mod tests {
         let blocks = slice.data.collect_pages(start, end).unwrap();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks_len(&blocks), data.len());
+    }
+
+    #[test]
+    fn test_should_retry_meta_write_classifies_errors_correctly() {
+        use crate::meta::store::RetryReason;
+
+        // All ContinueRetry variants are retryable regardless of reason.
+        assert!(should_retry_meta_write(&MetaError::ContinueRetry(
+            RetryReason::VersionConflict
+        )));
+        assert!(should_retry_meta_write(&MetaError::ContinueRetry(
+            RetryReason::CompactConflict
+        )));
+        assert!(should_retry_meta_write(&MetaError::ContinueRetry(
+            RetryReason::TransactionConflict
+        )));
+        assert!(should_retry_meta_write(&MetaError::ContinueRetry(
+            RetryReason::LockContention
+        )));
+
+        // Non-retryable errors.
+        assert!(!should_retry_meta_write(&MetaError::NotFound(1)));
+        assert!(!should_retry_meta_write(&MetaError::Internal(
+            "fatal".into()
+        )));
     }
 
     #[test]

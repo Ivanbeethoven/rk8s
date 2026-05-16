@@ -33,10 +33,11 @@
 
 ## P2：错误分类和事务退避
 
-- [ ] 拆分 `MetaError::ContinueRetry`。
-  - 建议至少区分：全局锁占用、chunk compact 冲突、版本冲突、后端超时、永久配置错误。
+- [x] 拆分 `MetaError::ContinueRetry`。
+  - 代码：`src/meta/store.rs`
+  - 当前策略：`ContinueRetry(RetryReason)` 区分 VersionConflict、CompactConflict、TransactionConflict、LockContention。
 - [ ] 让 `commit_chunk` 根据错误类型选择重试、快速失败或降级。
-  - 当前状态：已有最大次数预算，但还不能识别哪些错误适合更长等待。
+  - 当前状态：已有最大次数预算和 reason 日志，但还不能根据 reason 选择不同退避策略。
 - [x] metadata write 遇到非 `ContinueRetry` 错误时快速失败。
   - 当前策略：`MetaError::ContinueRetry`、数据库 deadlock/locked/busy/serialization/timeout、部分瞬时 IO 错误会进入重试预算；永久错误直接记录 writeback failure。
 - [ ] 为数据库/etcd/Redis backend 统一 rename、write、compact 冲突的条件事务错误语义。

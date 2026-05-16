@@ -17,7 +17,7 @@ use crate::meta::file_lock::{
 };
 use crate::meta::store::{
     CHUNK_LOCK_CHECK_TTL_SECS, DirEntry, FileAttr, LockName, MetaError, MetaStore, OpenFlags,
-    SetAttrFlags, SetAttrRequest, StatFsSnapshot,
+    RetryReason, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
 };
 use crate::meta::{INODE_ID_KEY, Permission, SLICE_ID_KEY};
 
@@ -2692,7 +2692,7 @@ impl MetaStore for DatabaseMetaStore {
             )
             .await
         {
-            return Err(MetaError::ContinueRetry);
+            return Err(MetaError::ContinueRetry(RetryReason::VersionConflict));
         }
 
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
@@ -3131,7 +3131,7 @@ impl MetaStore for DatabaseMetaStore {
                 "Concurrent modification detected: slice count mismatch"
             );
             txn.rollback().await.map_err(MetaError::Database)?;
-            return Err(MetaError::ContinueRetry);
+            return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
         }
 
         let current_map: HashMap<i64, (i64, i64)> = current_slices
@@ -3154,7 +3154,7 @@ impl MetaStore for DatabaseMetaStore {
                             "Concurrent modification detected: slice content changed"
                         );
                         txn.rollback().await.map_err(MetaError::Database)?;
-                        return Err(MetaError::ContinueRetry);
+                        return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
                     }
                 }
                 None => {
@@ -3164,7 +3164,7 @@ impl MetaStore for DatabaseMetaStore {
                         "Concurrent modification detected: slice missing"
                     );
                     txn.rollback().await.map_err(MetaError::Database)?;
-                    return Err(MetaError::ContinueRetry);
+                    return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
                 }
             }
         }

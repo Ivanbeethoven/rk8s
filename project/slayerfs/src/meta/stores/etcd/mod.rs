@@ -17,7 +17,7 @@ use crate::meta::file_lock::{
     FileLockInfo, FileLockQuery, FileLockRange, FileLockType, PlockRecord,
 };
 use crate::meta::store::{
-    DirEntry, FileAttr, LockName, MetaError, MetaStore, SetAttrFlags, SetAttrRequest,
+    DirEntry, FileAttr, LockName, MetaError, MetaStore, RetryReason, SetAttrFlags, SetAttrRequest,
 };
 use crate::meta::stores::pool::IdPool;
 use crate::meta::{INODE_ID_KEY, Permission};
@@ -2563,7 +2563,7 @@ impl MetaStore for EtcdMetaStore {
                     if let Some(locked_at) = tx.get_typed_json::<i64>(&lock_key).await?
                         && now <= locked_at + lock_ttl_millis
                     {
-                        return Err(MetaError::ContinueRetry);
+                        return Err(MetaError::ContinueRetry(RetryReason::VersionConflict));
                     }
 
                     let mut slices: Vec<SliceDesc> =
@@ -2998,7 +2998,7 @@ impl MetaStore for EtcdMetaStore {
                     let current_slices: Vec<SliceDesc> =
                         tx.get_typed(&slice_key).await?.unwrap_or_default();
                     if current_slices != expected_slices {
-                        return Err(MetaError::ContinueRetry);
+                        return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
                     }
 
                     if new_slices.is_empty() {

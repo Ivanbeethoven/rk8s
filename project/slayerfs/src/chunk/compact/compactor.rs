@@ -233,7 +233,7 @@ where
                 }
                 Ok(new_slice_id)
             }
-            Err(MetaError::ContinueRetry) => {
+            Err(MetaError::ContinueRetry(reason)) => {
                 warn!(
                     chunk_id,
                     new_slice_id, "Compact heavy conflict detected, retry needed"
@@ -249,7 +249,7 @@ where
                         "Failed to cleanup uncommitted slice after conflict"
                     );
                 }
-                Err(CompactorError::MetaError(MetaError::ContinueRetry))
+                Err(CompactorError::MetaError(MetaError::ContinueRetry(reason)))
             }
             Err(e) => {
                 if let Err(cleanup_err) = self
