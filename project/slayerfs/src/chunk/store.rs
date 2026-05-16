@@ -125,7 +125,6 @@ impl BlockStore for InMemoryBlockStore {
 /// BlockStore backed by cadapter::client (key space `chunks/{chunk_id}/{block_index}`).
 pub struct ObjectBlockStore<B: ObjectBackend> {
     client: ObjectClient<B>,
-    #[allow(dead_code)]
     block_cache: ChunksCache,
     /// SingleFlight controller for coalescing concurrent reads to the same block
     /// Thread-safe and shared across the store lifetime so concurrent requests can coalesce.
@@ -311,54 +310,61 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
     // Caller is responsible for zero-filling buf; this method only overwrites existing bytes.
     async fn read_range(&self, key: BlockKey, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         let len = buf.len();
+        let key_str = Self::key_for(key);
+
+        // Try cache first — blocks are immutable once committed, so a cache
+        // hit is always valid regardless of read size or offset.
+        if let Some(cached) = self.block_cache.get(&key_str).await {
+            tracing::Span::current().record("strategy", "cache_hit");
+            let offset_usize = offset as usize;
+            let end = (offset_usize + len).min(cached.len());
+            if offset_usize < cached.len() {
+                let copy_len = end - offset_usize;
+                buf[..copy_len].copy_from_slice(&cached[offset_usize..end]);
+                tracing::Span::current().record("read_len", copy_len);
+            }
+            return Ok(());
+        }
+
         let range_size_threshold = self.config.range_size_threshold();
 
-        // Boundary: len == threshold still uses direct range read; threshold is floor-casted usize.
-
-        // Smart strategy selection:
-        // 1. If the requested range is small (< threshold), use direct range read
-        // 2. If the range is large, use SingleFlight to potentially coalesce with other requests
         if len <= range_size_threshold {
-            // Strategy 1: Direct range read for small ranges (efficient for random access)
+            // Small range read — fetch only the requested range, don't cache
+            // partial blocks (not worth the complexity).
             tracing::Span::current().record("strategy", "direct_range");
-
-            let key_str = Self::key_for(key);
             let read_len = self
                 .client
                 .get_object_range(&key_str, offset, buf)
                 .await
                 .map_err(|e| anyhow::anyhow!("object store range read failed: {key_str}, {e:?}"))?;
-
             tracing::Span::current().record("read_len", read_len);
             return Ok(());
         }
 
-        // Strategy 2: Full block read with SingleFlight (efficient for large reads and concurrent access)
+        // Large read — fetch full block via SingleFlight, then cache it.
         tracing::Span::current().record("strategy", "coalesced_full");
-
-        // Use SingleFlight to coalesce concurrent reads to the same block.
-        // We read the entire block and then extract the requested range.
         let client = &self.client;
 
         let block_data =
             self.read_flight
                 .execute(key, || async move {
-                    // Read the entire block
                     let key_str = Self::key_for(key);
-
                     let data = client.get_object(&key_str).await.map_err(|e| {
                         anyhow::anyhow!("object store get failed: {key_str}, {e:?}")
                     })?;
-
                     Ok::<_, anyhow::Error>(Bytes::from(data.unwrap_or_default()))
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("SingleFlight read failed: {e}"))?;
 
-        // Extract the requested range from the block data
+        // Populate cache with the full block for future reads.
+        let _ = self
+            .block_cache
+            .insert(&key_str, &block_data.to_vec())
+            .await;
+
         let offset_usize = offset as usize;
         let end = offset_usize + len;
-
         let mut copy_len = 0;
         if offset_usize < block_data.len() {
             let copy_end = end.min(block_data.len());
