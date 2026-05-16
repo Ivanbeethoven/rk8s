@@ -20,7 +20,7 @@ impl CleanBlockKey {
 }
 
 /// Key for a dirty (uncommitted) slice in the write-back cache.
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DirtySliceKey {
     pub ino: i64,
     pub chunk_id: u64,
@@ -28,8 +28,26 @@ pub struct DirtySliceKey {
     pub epoch: u64,
 }
 
+impl DirtySliceKey {
+    pub fn dir_path(&self, root: &std::path::Path) -> std::path::PathBuf {
+        root.join("dirty")
+            .join(self.ino.to_string())
+            .join(self.chunk_id.to_string())
+    }
+
+    pub fn slice_path(&self, root: &std::path::Path) -> std::path::PathBuf {
+        self.dir_path(root).join(format!("{}.slice", self.local_seq))
+    }
+
+    pub fn meta_path(&self, root: &std::path::Path) -> std::path::PathBuf {
+        self.dir_path(root).join(format!("{}.meta", self.local_seq))
+    }
+}
+
 /// State machine for a dirty slice in the write-back cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
 pub enum DirtySliceState {
     /// Slice is still being written to in memory.
     Open,
