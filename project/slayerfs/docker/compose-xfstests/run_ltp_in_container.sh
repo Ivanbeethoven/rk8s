@@ -23,6 +23,10 @@ artifact_dir="${SLAYERFS_ARTIFACT_DIR:-}"
 ltp_scenarios="${LTP_SCENARIOS:-fs}"
 ltp_extra_args="${LTP_EXTRA_ARGS:-}"
 ltp_skip_files="${LTP_SKIP_FILES:-}"
+ltp_skip_tests="${LTP_SKIP_TESTS:-}"
+ltp_skip_tests_file="${LTP_SKIP_TESTS_FILE:-}"
+ltp_default_skip_tests_file="${LTP_DEFAULT_SKIP_TESTS_FILE:-/usr/local/share/slayerfs/ltp_skip_tests.txt}"
+ltp_tmp_dir=""
 
 write_config() {
     mkdir -p "$(dirname "$config_path")" "$mount_dir"
@@ -187,7 +191,116 @@ copy_artifacts() {
     chmod -R a+rwX "$artifact_dir" >/dev/null 2>&1 || true
 }
 
+trim_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+resolve_ltp_cmdfile() {
+    local cmdfile="$1"
+
+    if [[ -f "$cmdfile" ]]; then
+        realpath "$cmdfile"
+        return 0
+    fi
+
+    if [[ -f "$ltp_dir/runtest/$cmdfile" ]]; then
+        realpath "$ltp_dir/runtest/$cmdfile"
+        return 0
+    fi
+
+    err "unable to resolve LTP command file: $cmdfile"
+    exit 1
+}
+
+prepare_ltp_skiplist() {
+    local merged_skipfile="$ltp_tmp_dir/skip-tests.raw"
+    local normalized_skipfile="$ltp_tmp_dir/skip-tests.txt"
+    local skip_source
+
+    : >"$merged_skipfile"
+
+    if [[ -f "$ltp_default_skip_tests_file" ]]; then
+        cat "$ltp_default_skip_tests_file" >>"$merged_skipfile"
+        printf '\n' >>"$merged_skipfile"
+    fi
+
+    if [[ -n "$ltp_skip_tests_file" ]]; then
+        if [[ ! -f "$ltp_skip_tests_file" ]]; then
+            err "custom LTP skip file not found: $ltp_skip_tests_file"
+            exit 1
+        fi
+        cat "$ltp_skip_tests_file" >>"$merged_skipfile"
+        printf '\n' >>"$merged_skipfile"
+    fi
+
+    if [[ -n "$ltp_skip_tests" ]]; then
+        for skip_source in $ltp_skip_tests; do
+            printf '%s\n' "$skip_source" >>"$merged_skipfile"
+        done
+    fi
+
+    awk '
+        /^[[:space:]]*(#|$)/ { next }
+        { print $1 }
+    ' "$merged_skipfile" | sort -u >"$normalized_skipfile"
+
+    printf '%s' "$normalized_skipfile"
+}
+
+prepare_ltp_cmdfiles() {
+    local skipfile="$1"
+    local scenario_list="$2"
+    local scenario
+    local source_cmdfile
+    local filtered_cmdfile
+    local skipped_count
+    local -a selected_scenarios=()
+    local -a filtered_cmdfiles=()
+
+    IFS=',' read -r -a selected_scenarios <<<"$scenario_list"
+
+    for scenario in "${selected_scenarios[@]}"; do
+        scenario="$(trim_whitespace "$scenario")"
+        [[ -z "$scenario" ]] && continue
+
+        source_cmdfile="$(resolve_ltp_cmdfile "$scenario")"
+        filtered_cmdfile="$ltp_tmp_dir/$(basename "$source_cmdfile").filtered"
+
+        awk '
+            NR == FNR {
+                skip[$1] = 1
+                next
+            }
+            /^[[:space:]]*#/ || NF == 0 {
+                print
+                next
+            }
+            !($1 in skip) {
+                print
+            }
+        ' "$skipfile" "$source_cmdfile" >"$filtered_cmdfile"
+
+        filtered_cmdfiles+=("$filtered_cmdfile")
+    done
+
+    if [[ "${#filtered_cmdfiles[@]}" -eq 0 ]]; then
+        err "no LTP command files selected"
+        exit 1
+    fi
+
+    skipped_count="$(wc -l <"$skipfile" | tr -d '[:space:]')"
+    info "prepared ${#filtered_cmdfiles[@]} LTP command file(s); skip list entries: ${skipped_count:-0}" >&2
+
+    IFS=',' printf '%s' "${filtered_cmdfiles[*]}"
+}
+
 cleanup() {
+    if [[ -n "$ltp_tmp_dir" && -d "$ltp_tmp_dir" ]]; then
+        rm -rf "$ltp_tmp_dir" >/dev/null 2>&1 || true
+    fi
     while mount | grep -q " on $mount_dir "; do
         fusermount3 -u "$mount_dir" >/dev/null 2>&1 \
             || umount -f "$mount_dir" >/dev/null 2>&1 \
@@ -209,11 +322,18 @@ on_exit() {
 }
 
 run_ltp() {
-    local -a ltp_args=(-S "$ltp_scenarios" -d "$mount_dir" -q)
+    local skipfile
+    local filtered_cmdfiles
+    local -a ltp_args
 
     if [[ -n "$ltp_skip_files" ]]; then
-        ltp_args+=(-s "$ltp_skip_files")
+        info "LTP_SKIP_FILES is deprecated and ignored; use LTP_SKIP_TESTS or LTP_SKIP_TESTS_FILE"
     fi
+
+    ltp_tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/slayerfs-ltp.XXXXXX")"
+    skipfile="$(prepare_ltp_skiplist)"
+    filtered_cmdfiles="$(prepare_ltp_cmdfiles "$skipfile" "$ltp_scenarios")"
+    ltp_args=(-f "$filtered_cmdfiles" -d "$mount_dir" -q)
 
     if [[ -n "$ltp_extra_args" ]]; then
         read -r -a extra <<<"$ltp_extra_args"

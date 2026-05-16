@@ -21,6 +21,28 @@ bash compose-xfstests/run_redis_xfstests.sh --s3 --cases "generic/001"
 - `slayerfs.log`：SlayerFS 日志（按 run 独立保存）
 - `report.md`：汇总报告
 
+## 容器内跑 LTP 文件系统测试
+
+入口：
+- `compose-xfstests/run_redis_ltp.sh`
+- `compose-xfstests/run_sqlite_ltp.sh`
+- `compose-xfstests/run_etcd_ltp.sh`
+
+```bash
+cd project/slayerfs/docker
+
+# 默认只跑 LTP fs suite，并自动应用内置跳过名单
+bash compose-xfstests/run_redis_ltp.sh
+
+# 额外跳过指定 testcase
+bash compose-xfstests/run_redis_ltp.sh --skip-tests "fanotify01 fanotify03"
+```
+
+说明：
+- 内置跳过名单位于 `compose-xfstests/ltp_skip_tests.txt`
+- `--skip-tests` 用于追加按 testcase 名称跳过
+- `--extra-args` 会继续透传给容器内 `runltp`
+
 ## 容器内跑 xfstests 压力工具 / perf
 
 入口：

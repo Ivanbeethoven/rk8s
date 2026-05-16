@@ -24,7 +24,7 @@ description:
   - artifacts output to: $ARTIFACTS_DIR
 
 options:
-  --skip-files "<pattern>"      skip test files matching pattern
+  --skip-tests "<case...>"      extra testcase names to skip
   --extra-args "<args...>"      extra arguments passed to runltp
   --keep                        do not run compose down after exit (for debugging)
   -h, --help                    show help
@@ -33,13 +33,13 @@ EOF
 }
 
 KEEP=false
-LTP_SKIP_FILES_VALUE=""
+LTP_SKIP_TESTS_VALUE=""
 LTP_EXTRA_ARGS_VALUE=""
 
 while [[ $# -gt 0 ]]; do
     case "${1:-}" in
-        --skip-files)
-            LTP_SKIP_FILES_VALUE="${2:-}"
+        --skip-tests)
+            LTP_SKIP_TESTS_VALUE="${2:-}"
             shift 2
             ;;
         --extra-args)
@@ -81,7 +81,7 @@ COMPOSE_ARGS=(-f "$COMPOSE_FILE" -p "$PROJECT_NAME")
 info "build LTP runner image"
 docker compose "${COMPOSE_ARGS[@]}" build ltp
 export SLAYERFS_ARTIFACT_DIR="/artifacts/run-${ts}"
-export LTP_SKIP_FILES="${LTP_SKIP_FILES_VALUE:-}"
+export LTP_SKIP_TESTS="${LTP_SKIP_TESTS_VALUE:-}"
 export LTP_EXTRA_ARGS="${LTP_EXTRA_ARGS_VALUE:-}"
 
 info "start dependency services: rustfs"
