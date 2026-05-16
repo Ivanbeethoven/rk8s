@@ -60,6 +60,12 @@ pub trait BlockStore {
 
     /// Delete `block_count` blocks starting from `key.1` (block_index) for slice `key.0`.
     async fn delete_range(&self, key: BlockKey, block_count: u64) -> anyhow::Result<()>;
+
+    /// Proactively insert a block into the read cache after upload.
+    /// Default is a no-op; ObjectBlockStore overrides to populate ChunksCache.
+    async fn cache_block(&self, _key: BlockKey, _data: &[u8]) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 pub type BlockKey = (u64 /*slice_id*/, u32 /*block_index*/);
@@ -387,6 +393,12 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
                 .await
                 .map_err(|e| anyhow::anyhow!("object store delete failed: {key_str}, {e:?}"))?;
         }
+        Ok(())
+    }
+
+    async fn cache_block(&self, key: BlockKey, data: &[u8]) -> anyhow::Result<()> {
+        let key_str = Self::key_for(key);
+        let _ = self.block_cache.insert(&key_str, &data.to_vec()).await;
         Ok(())
     }
 }

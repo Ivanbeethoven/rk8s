@@ -1446,6 +1446,17 @@ where
                             .inode
                             .add_estimated_allocated_bytes(desc.length.as_usize() as u64);
 
+                        // Clean up local SSD dirty copy now that data is committed.
+                        if let Some(wb) = &shared.write_back {
+                            let key = crate::vfs::cache::keys::DirtySliceKey {
+                                ino: ino as i64,
+                                chunk_id: desc.chunk_id,
+                                local_seq: desc.slice_id,
+                                epoch: 0,
+                            };
+                            let _ = wb.remove(&key).await;
+                        }
+
                         let _ = shared
                             .reader
                             .invalidate(ino as u64, file_offset, desc.length.as_usize())
