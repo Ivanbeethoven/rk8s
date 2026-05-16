@@ -592,12 +592,20 @@ where
                 .map_err(|e| meta_error_to_io(path, e))?
         };
 
-        let attr = self
+        let mut attr = self
             .meta_layer()
             .stat(ino)
             .await
             .map_err(|e| meta_error_to_io(path, e))?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{path}: not found")))?;
+
+        // Close-to-open: if there is a local inode with a more recent size
+        // (e.g. from an uncommitted write), prefer it over the metadata value.
+        if let Some(size) = self.vfs.inode_size_cached(ino) {
+            if size > attr.size {
+                attr.size = size;
+            }
+        }
 
         let name = path.rsplit('/').next().unwrap_or("");
         Ok(FileStat::new(name.to_string(), attr.ino, attr))

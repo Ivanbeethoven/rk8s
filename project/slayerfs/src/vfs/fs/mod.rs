@@ -541,7 +541,7 @@ where
         if let Some(inode) = self.state.inodes.get(&ino)
             && min_size > inode.file_size()
         {
-            inode.update_size(min_size);
+            inode.extend_size(min_size);
         }
 
         for handle in self.file_handles_for_inode(ino) {
@@ -591,10 +591,13 @@ where
 
     pub(crate) fn blocks_for_attr(&self, attr: &FileAttr) -> u64 {
         if let Some(inode) = self.state.inodes.get(&attr.ino) {
-            inode.committed_bytes().div_ceil(512)
-        } else {
-            attr.size.div_ceil(512)
+            if let Some(blocks) = inode.allocated_blocks_512() {
+                return blocks;
+            }
         }
+        // Fall back to the metadata-provided value.  For backends that haven't
+        // implemented accurate block tracking yet, this is `size.div_ceil(512)`.
+        attr.blocks
     }
 
     /// Returns the current time as nanoseconds since UNIX_EPOCH.
@@ -1406,7 +1409,7 @@ where
             .writer
             .flush_required(ino as u64)
             .await
-            .map_err(|_| VfsError::Other)?;
+            .map_err(VfsError::from)?;
 
         let mutation_lock = self.state.append_lock(ino);
         let _mutation_guard = mutation_lock.lock_owned().await;
@@ -1429,11 +1432,13 @@ where
             .lock_inode(ino)
             .or_insert_with(|| Inode::new(ino, size));
 
-        guard.update_size(size);
-        // Reset committed-bytes so st_blocks reflects actual data, not the old
-        // (now-truncated) file size.  Slices committed after this point will
-        // re-accumulate the counter via add_committed_bytes in commit_chunk.
-        guard.reset_committed_bytes(size);
+        guard.set_size(size);
+        // After truncate the allocated-bytes estimate is stale — we cannot
+        // simply set it to `size` because extending truncates create holes
+        // and shrinking truncates may or may not free blocks.  Mark it
+        // unknown so st_blocks falls back to the metadata-provided value.
+        guard.invalidate_allocated_blocks();
+        guard.bump_data_epoch();
 
         if let Some(mut attr) = self.state.handles.attr_for_inode(ino) {
             attr.size = size;
@@ -1501,7 +1506,7 @@ where
                 .writer
                 .flush_required(ino as u64)
                 .await
-                .map_err(|_| VfsError::Other)?;
+                .map_err(VfsError::from)?;
 
             let mutation_lock = self.state.append_lock(ino);
             let _mutation_guard = mutation_lock.lock_owned().await;
@@ -1520,8 +1525,9 @@ where
             let guard = self
                 .lock_inode(ino)
                 .or_insert_with(|| Inode::new(ino, size));
-            guard.update_size(size);
-            guard.reset_committed_bytes(size);
+            guard.set_size(size);
+            guard.invalidate_allocated_blocks();
+            guard.bump_data_epoch();
 
             if let Some(mut attr) = self.state.handles.attr_for_inode(ino) {
                 attr.size = size;
@@ -1544,7 +1550,7 @@ where
         if let Some(size) = req.size {
             attr.size = size;
             if let Some(inode) = self.state.inodes.get(&ino) {
-                inode.update_size(size);
+                inode.set_size(size);
             }
         } else if let Some(size) = self.inode_size_cached(ino) {
             // Non-size setattr requests (for example mtime/ctime updates emitted
@@ -1615,12 +1621,19 @@ where
             });
         }
 
-        // Flush pending writer data before reading so the reader sees committed
-        // results.  Without this, commit_chunk can pop a dirty slice between
-        // handle.read() and overlay_dirty_if_exists(), causing the overlay to
-        // miss data that was not yet committed when the reader fetched it.
-        self.state.writer.flush_if_exists(handle.ino as u64).await;
-
+        // Read committed data from the reader cache first, then overlay any
+        // uncommitted dirty writes on top.  We intentionally do NOT call
+        // flush_if_exists here: blocking every read on a full flush+commit
+        // cycle turns random-read-heavy workloads into commit-bound traffic
+        // (adding tens of milliseconds of latency per 4 KiB read).
+        //
+        // There is a narrow race where commit_chunk pops a just-committed
+        // slice between handle.read() and overlay_dirty_if_exists().  In that
+        // window the reader may serve a stale cached page that has already
+        // been superseded.  The window is on the order of microseconds and a
+        // subsequent read will see the correct data, so this is an acceptable
+        // trade-off versus the 35+ ms read latency incurred by the
+        // synchronous flush.
         let mut data = handle.read(offset, len).await.map_err(VfsError::from)?;
         self.state
             .writer
@@ -1815,13 +1828,13 @@ where
             .writer
             .flush_required(src.ino as u64)
             .await
-            .map_err(|_| VfsError::Other)?;
+            .map_err(VfsError::from)?;
         if dst.ino != src.ino {
             self.state
                 .writer
                 .flush_required(dst.ino as u64)
                 .await
-                .map_err(|_| VfsError::Other)?;
+                .map_err(VfsError::from)?;
         }
 
         let src_attr = self.meta_stat_required(src.ino, PathHint::none()).await?;
@@ -1842,8 +1855,8 @@ where
         let written = dst_guard.write(off_out, &data).await?;
 
         // Close guards to flush and commit before releasing locks.
-        dst_guard.close().await.map_err(|_| VfsError::Other)?;
-        src_guard.close().await.map_err(|_| VfsError::Other)?;
+        dst_guard.close().await?;
+        src_guard.close().await?;
         drop(locked);
         drop(mutation_guards);
 
@@ -1866,11 +1879,13 @@ where
         let fh_in = src_guard.fh();
         let fh_out = dst_guard.fh();
 
-        let result = self.copy_file_range(fh_in, off_in, fh_out, off_out, length).await;
+        let result = self
+            .copy_file_range(fh_in, off_in, fh_out, off_out, length)
+            .await;
 
         // Close guards to ensure handles are released cleanly.
-        dst_guard.close().await.map_err(|_| VfsError::Other)?;
-        src_guard.close().await.map_err(|_| VfsError::Other)?;
+        dst_guard.close().await?;
+        src_guard.close().await?;
 
         result
     }
@@ -1903,7 +1918,7 @@ where
             .lock_inode(ino)
             .or_insert_with(|| Inode::new(ino, latest_attr.size));
         if latest_attr.size > guard.file_size() {
-            guard.update_size(latest_attr.size);
+            guard.extend_size(latest_attr.size);
         } else if guard.file_size() > latest_attr.size {
             latest_attr.size = guard.file_size();
         }
@@ -1947,11 +1962,13 @@ where
             "vfs.close"
         );
         if handle.flags.write {
+            let _handle_guard = handle.lock_write().await;
+
             self.state
                 .writer
-                .flush_required(handle.ino as u64)
+                .flush_for_close(handle.ino as u64)
                 .await
-                .map_err(|_| VfsError::Other)?;
+                .map_err(VfsError::from)?;
             self.update_mtime_ctime(handle.ino).await?;
         }
 
@@ -1964,7 +1981,7 @@ where
                 self.state.handles.release(fh);
                 self.state.reader.close_for_handle(handle.ino as u64, fh);
 
-                if !self.state.handles.has_write_handle(handle.ino) {
+                if handle.flags.write && !self.state.handles.has_write_handle(handle.ino) {
                     self.state.writer.release(handle.ino as u64);
                 }
 
@@ -1997,7 +2014,7 @@ where
             .writer
             .flush_required(handle.ino as u64)
             .await
-            .map_err(|_| VfsError::Other)?;
+            .map_err(VfsError::from)?;
         tracing::trace!(fh, ino = handle.ino, "vfs.flush_handle_done");
 
         self.update_timestamps_on_flush(handle.ino).await?;

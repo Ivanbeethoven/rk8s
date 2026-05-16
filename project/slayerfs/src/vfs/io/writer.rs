@@ -29,6 +29,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex as ParkingMutex;
 use rand::RngCore;
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt::Display;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -40,9 +41,14 @@ const FLUSH_DURATION: Duration = Duration::from_secs(5);
 const COMMIT_WAIT_SLICE: Duration = Duration::from_millis(100);
 const FLUSH_WAIT: Duration = Duration::from_secs(3);
 const FLUSH_DEADLINE: Duration = Duration::from_secs(300);
+/// Shorter deadline for close-triggered flushes.  FUSE already calls flush()
+/// before close(), so close() only needs to drain residual in-flight work.
+const CLOSE_FLUSH_DEADLINE: Duration = Duration::from_secs(5);
 const UPLOAD_MAX_RETRIES: u64 = 5;
 const COMMIT_RETRY_BASE_MS: u64 = 20;
 const COMMIT_RETRY_MAX_MS: u64 = 2000;
+const COMMIT_META_MAX_RETRIES: u32 = 15;
+const WRITE_SLICE_MAX_RETRIES: u32 = 64;
 /// Maximum age of a Writable slice before auto_flush freezes it and starts
 /// background upload, regardless of idle time.  A short threshold lets the
 /// background path pre-empt foreground fsync so that explicit flushes mostly
@@ -69,6 +75,37 @@ fn commit_retry_backoff(failures: u32) -> Duration {
     Duration::from_millis(base.saturating_add(jitter))
 }
 
+fn looks_retryable_backend_error(err: &impl Display) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    [
+        "deadlock",
+        "database is locked",
+        "database is busy",
+        "serialization",
+        "retry",
+        "timeout",
+        "timed out",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn should_retry_meta_write(err: &MetaError) -> bool {
+    match err {
+        MetaError::ContinueRetry => true,
+        MetaError::Database(err) => looks_retryable_backend_error(err),
+        MetaError::Io(err) => matches!(
+            err.kind(),
+            std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+        ),
+        _ => false,
+    }
+}
+
 struct UploadPlan {
     chunk_id: u64,
     data: Vec<(usize, Vec<Bytes>)>,
@@ -85,7 +122,7 @@ pub(crate) enum SliceStatus {
     Readonly,
     /// Uploaded: data uploaded successfully.
     Uploaded,
-    /// Failed: data upload failed.
+    /// Failed: upload or metadata commit exhausted its retry budget.
     Failed,
     /// Committed: metadata committed.
     Committed,
@@ -219,6 +256,9 @@ pub(crate) struct ChunkState {
     /// ID of the chunk.
     chunk_id: u64,
     slices: VecDeque<Arc<ParkingMutex<SliceState>>>,
+    /// Committed slices kept for a grace period so that overlay_dirty can
+    /// still serve their data after commit_chunk marks them Committed.
+    recently_committed: VecDeque<Arc<ParkingMutex<SliceState>>>,
     commit_started: bool,
 }
 
@@ -227,6 +267,7 @@ impl ChunkState {
         Self {
             chunk_id: id,
             slices: VecDeque::new(),
+            recently_committed: VecDeque::new(),
             commit_started: false,
         }
     }
@@ -316,8 +357,7 @@ where
             // has accumulated that a background upload cycle is worthwhile.
             // The size-based check lets the write path itself trigger
             // uploads without waiting for auto_flush's next poll interval.
-            end >= self.shared.config.layout.chunk_size
-                || s.data.len() >= SHOULD_FREEZE_MIN_BYTES
+            end >= self.shared.config.layout.chunk_size || s.data.len() >= SHOULD_FREEZE_MIN_BYTES
         })
     }
 
@@ -337,20 +377,23 @@ where
 
     // Mark data upload failure and wake commit waiters.
     fn mark_failed(&self, err: anyhow::Error) {
+        let message = err.to_string();
         self.with_mut(|s| {
             s.state = SliceStatus::Failed;
             s.uploading = None;
-
-            if s.err.is_none() {
-                s.err = Some(err.to_string());
-            }
+            s.err = Some(message.clone());
 
             s.notify.notify_waiters();
-        })
+        });
+        self.shared.record_writeback_error(message);
+        self.shared.flush_notify.notify_waiters();
     }
 
     fn prepare_upload(&self) -> anyhow::Result<Option<UploadPlan>> {
         self.with_mut(|s| {
+            if matches!(s.state, SliceStatus::Failed | SliceStatus::Committed) {
+                return Ok(None);
+            }
             if s.uploading.is_some() || !s.has_idle_block() {
                 return Ok(None);
             }
@@ -405,7 +448,9 @@ where
     fn mark_committed(&self) {
         self.with_mut(|s| {
             s.state = SliceStatus::Committed;
-        })
+            s.notify.notify_waiters();
+        });
+        self.shared.flush_notify.notify_waiters();
     }
 }
 
@@ -420,10 +465,7 @@ struct SliceRuntime {
 
 impl SliceRuntime {
     fn upload_done(&self) -> bool {
-        matches!(
-            self.status,
-            SliceStatus::Uploaded | SliceStatus::Failed | SliceStatus::Committed
-        )
+        matches!(self.status, SliceStatus::Uploaded | SliceStatus::Committed)
     }
 
     fn can_commit(&self) -> bool {
@@ -541,7 +583,7 @@ where
         // `find_slice_or_create` checks and returns a slice that can be appended, but after it selects the slice,
         // it releases the lock. `auto_flush` and `commit_chunk` can freeze a slice without holding the lock,
         // so when handle trying appending buf, the slice may have become readonly. This is highly unlikely to happen,
-        // therefore, it is ok to retry until success.
+        // therefore, it is ok to retry briefly, but not forever.
         let mut failed_cnt = 0;
 
         loop {
@@ -566,7 +608,7 @@ where
             }
 
             failed_cnt += 1;
-            if failed_cnt >= 10 {
+            if failed_cnt == 10 {
                 warn!(
                     chunk_id = self.chunk_id,
                     offset,
@@ -574,6 +616,12 @@ where
                     "write_at retried {failed_cnt} times due to concurrent slice freezing"
                 );
             }
+            if failed_cnt >= WRITE_SLICE_MAX_RETRIES {
+                return Err(anyhow::anyhow!(
+                    "write_at failed to append after {failed_cnt} retries due to concurrent slice freezing"
+                ));
+            }
+            std::thread::yield_now();
         }
     }
 }
@@ -595,6 +643,8 @@ struct Shared<B, M> {
     write_gen: AtomicU64,
     /// Snapshot of `write_gen` taken after a flush completes successfully.
     last_flushed_gen: AtomicU64,
+    /// First durable writeback error observed by background upload/commit.
+    writeback_error: ParkingMutex<Option<String>>,
 }
 
 impl<B, M> Shared<B, M>
@@ -624,6 +674,26 @@ where
             reader,
             write_gen: AtomicU64::new(0),
             last_flushed_gen: AtomicU64::new(0),
+            writeback_error: ParkingMutex::new(None),
+        }
+    }
+
+    fn record_writeback_error(&self, err: String) {
+        let mut guard = self.writeback_error.lock();
+        if guard.is_none() {
+            *guard = Some(err);
+        }
+        self.flush_notify.notify_waiters();
+    }
+
+    fn writeback_error(&self) -> Option<String> {
+        self.writeback_error.lock().clone()
+    }
+
+    fn writeback_result(&self) -> anyhow::Result<()> {
+        match self.writeback_error() {
+            Some(err) => Err(anyhow::anyhow!("writeback failed: {err}")),
+            None => Ok(()),
         }
     }
 }
@@ -726,6 +796,7 @@ where
     // trigger background flush/commit. Updates in-memory inode size at the end.
     #[tracing::instrument(level = "trace", skip(self, buf), fields(offset, len = buf.len()))]
     pub(crate) async fn write_at(&self, offset: u64, buf: &[u8]) -> anyhow::Result<usize> {
+        self.shared.writeback_result()?;
         self.back_pressure().await?;
         let mut guard = self.shared.inner.lock().await;
 
@@ -773,7 +844,7 @@ where
         drop(guard);
         let new_len = offset + buf.len() as u64;
         if new_len > self.shared.inode.file_size() {
-            self.shared.inode.update_size(new_len);
+            self.shared.inode.extend_size(new_len);
         }
         self.shared.write_gen.fetch_add(1, Ordering::Release);
         Ok(buf.len())
@@ -820,6 +891,31 @@ where
                     .data
                     .copy_into(read_start - slice_start, &mut buf[dst_start..dst_end])?;
             }
+
+            // Also check recently-committed slices.  These have been committed
+            // to metadata but are kept for a grace period so that readers who
+            // fetched from the reader cache before the commit can still see
+            // the latest data via this overlay pass.
+            for slice in &chunk.recently_committed {
+                let state = slice.lock();
+                if !state.can_overlay_read() {
+                    continue;
+                }
+
+                let slice_start = state.offset;
+                let slice_end = state.offset + state.data.len();
+                let read_start = span_start.max(slice_start);
+                let read_end = span_end.min(slice_end);
+                if read_start >= read_end {
+                    continue;
+                }
+
+                let dst_start = (chunk_start + read_start - offset).as_usize();
+                let dst_end = (chunk_start + read_end - offset).as_usize();
+                state
+                    .data
+                    .copy_into(read_start - slice_start, &mut buf[dst_start..dst_end])?;
+            }
         }
 
         Ok(())
@@ -833,12 +929,22 @@ where
     // where all writes target the same chunk, new slices keep arriving in that
     // chunk, so it never becomes empty and flush never returns.  By freezing
     // every slice present at the start and then waiting only for those slices
-    // to reach Committed (or Failed), we guarantee forward progress regardless
-    // of concurrent write traffic.
+    // to reach Committed, we guarantee forward progress regardless of
+    // concurrent write traffic. Failed writeback is returned to the caller
+    // instead of being treated as a successful flush.
     #[tracing::instrument(level = "trace", skip(self))]
     pub(crate) async fn flush(&self) -> anyhow::Result<()> {
+        self.flush_with_deadline(FLUSH_DEADLINE).await
+    }
+
+    pub(crate) async fn flush_with_deadline(&self, deadline: Duration) -> anyhow::Result<()> {
+        self.shared.writeback_result()?;
         {
             let mut guard = self.shared.inner.lock().await;
+            if !guard.has_chunks() {
+                return self.shared.writeback_result();
+            }
+
             guard.flush_waiting += 1;
         }
 
@@ -868,15 +974,16 @@ where
                 }
             }
 
-            // Wait for every slice we captured to be committed or failed.
+            // Wait for every slice we captured to be committed.
             // New slices created after the snapshot are for the *next* flush.
             loop {
-                let all_done = slices.iter().all(|s| {
-                    matches!(
-                        s.lock().state,
-                        SliceStatus::Committed | SliceStatus::Failed
-                    )
-                });
+                if let Some(err) = self.shared.writeback_error() {
+                    break 'outer Err(anyhow::anyhow!("writeback failed: {err}"));
+                }
+
+                let all_done = slices
+                    .iter()
+                    .all(|s| matches!(s.lock().state, SliceStatus::Committed));
 
                 if all_done {
                     break 'outer Ok(());
@@ -885,24 +992,22 @@ where
                 if timeout(FLUSH_WAIT, self.shared.flush_notify.notified())
                     .await
                     .is_err()
-                    && start.elapsed() > FLUSH_DEADLINE
+                    && start.elapsed() > deadline
                 {
-                    break 'outer Err(anyhow::anyhow!(
-                        "flush timeout after {:?}",
-                        FLUSH_DEADLINE
-                    ));
+                    break 'outer Err(anyhow::anyhow!("flush timeout after {:?}", deadline));
                 }
 
                 // If the notify fired spuriously or for a different chunk,
                 // re-poll the slice statuses inline so that a continuous
                 // stream of commit completions doesn't keep us sleeping
                 // for the full FLUSH_WAIT interval.
-                if slices.iter().all(|s| {
-                    matches!(
-                        s.lock().state,
-                        SliceStatus::Committed | SliceStatus::Failed
-                    )
-                }) {
+                if let Some(err) = self.shared.writeback_error() {
+                    break 'outer Err(anyhow::anyhow!("writeback failed: {err}"));
+                }
+                if slices
+                    .iter()
+                    .all(|s| matches!(s.lock().state, SliceStatus::Committed))
+                {
                     break 'outer Ok(());
                 }
             }
@@ -919,9 +1024,10 @@ where
 
         // Let has_pending() short-circuit when no new writes arrived since we finished.
         if result.is_ok() {
-            self.shared
-                .last_flushed_gen
-                .store(self.shared.write_gen.load(Ordering::Acquire), Ordering::Release);
+            self.shared.last_flushed_gen.store(
+                self.shared.write_gen.load(Ordering::Acquire),
+                Ordering::Release,
+            );
         }
 
         result
@@ -952,6 +1058,9 @@ where
     }
 
     pub(crate) async fn has_pending(&self) -> bool {
+        if self.shared.writeback_error().is_some() {
+            return true;
+        }
         let guard = self.shared.inner.lock().await;
         guard.has_chunks()
     }
@@ -1060,6 +1169,33 @@ where
         });
     }
 
+    async fn pop_front_slice(shared: &Arc<Shared<B, M>>, chunk_id: u64) -> bool {
+        let mut guard = shared
+            .inner
+            .lock()
+            .instrument(tracing::trace_span!("commit_chunk.pop_lock"))
+            .await;
+        if let Some(chunk) = guard.chunks.get_mut(&chunk_id) {
+            let _ = chunk.slices.pop_front();
+        }
+        if guard.flush_waiting > 0 {
+            shared.flush_notify.notify_waiters();
+        }
+
+        let empty = guard
+            .chunks
+            .get(&chunk_id)
+            .map(|c| c.slices.is_empty())
+            .unwrap_or(true);
+        if empty {
+            guard.chunks.remove(&chunk_id);
+            if !guard.has_chunks() && guard.flush_waiting > 0 {
+                shared.flush_notify.notify_waiters();
+            }
+        }
+        empty
+    }
+
     /// The background thread for committing a chunk.
     /// It waits for Uploaded slices, appends metadata, and marks them Committed.
     /// Each chunk will have a unique committing thread.
@@ -1084,7 +1220,16 @@ where
 
             let Some(slice) = slice else {
                 let mut guard = shared.inner.lock().await;
-                guard.chunks.remove(&chunk_id);
+                // Only remove the chunk if it has no recently_committed slices
+                // that overlay_dirty still needs to see.
+                let keep = guard
+                    .chunks
+                    .get(&chunk_id)
+                    .map(|c| !c.recently_committed.is_empty())
+                    .unwrap_or(false);
+                if !keep {
+                    guard.chunks.remove(&chunk_id);
+                }
 
                 if !guard.has_chunks() && guard.flush_waiting > 0 {
                     shared.flush_notify.notify_waiters();
@@ -1103,10 +1248,14 @@ where
             .runtime_snapshot();
 
             if matches!(runtime.status, SliceStatus::Failed) {
-                Self::spawn_flush_slice(shared.clone(), slice.clone());
-                tokio::time::sleep(COMMIT_WAIT_SLICE)
-                    .instrument(tracing::trace_span!("commit_chunk.wait_retry"))
-                    .await;
+                warn!(
+                    chunk_id,
+                    error = ?runtime.err,
+                    "commit_chunk dropping failed slice after retry budget exhausted"
+                );
+                if Self::pop_front_slice(&shared, chunk_id).await {
+                    return;
+                }
                 continue;
             }
 
@@ -1179,20 +1328,56 @@ where
                         .await;
 
                     if let Err(err) = result {
-                        commit_failures = commit_failures.saturating_add(1);
-                        let backoff = commit_retry_backoff(commit_failures);
-                        warn!(
-                            ino,
-                            chunk_id = desc.chunk_id,
-                            slice_id = desc.slice_id,
-                            offset = desc.offset,
-                            len = desc.length,
-                            new_size,
-                            retry_failures = commit_failures,
-                            retry_backoff_ms = backoff.as_millis() as u64,
-                            error = ?err,
-                            "commit_chunk meta write failed, retrying"
-                        );
+                        let retryable = should_retry_meta_write(&err);
+                        if retryable {
+                            commit_failures = commit_failures.saturating_add(1);
+                        }
+
+                        if !retryable || commit_failures >= COMMIT_META_MAX_RETRIES {
+                            let message = if retryable {
+                                format!(
+                                    "metadata commit failed after {commit_failures} attempts for ino {ino}, chunk {}, slice {}: {err}",
+                                    desc.chunk_id, desc.slice_id
+                                )
+                            } else {
+                                format!(
+                                    "metadata commit failed with non-retryable error for ino {ino}, chunk {}, slice {}: {err}",
+                                    desc.chunk_id, desc.slice_id
+                                )
+                            };
+                            warn!(
+                                ino,
+                                chunk_id = desc.chunk_id,
+                                slice_id = desc.slice_id,
+                                offset = desc.offset,
+                                len = desc.length,
+                                new_size,
+                                retry_failures = commit_failures,
+                                retryable,
+                                error = ?err,
+                                "commit_chunk meta write failed, giving up"
+                            );
+                            SliceHandle {
+                                slice: &slice,
+                                shared: &shared,
+                            }
+                            .mark_failed(anyhow::anyhow!(message));
+                            should_pop = true;
+                        } else {
+                            let backoff = commit_retry_backoff(commit_failures);
+                            warn!(
+                                ino,
+                                chunk_id = desc.chunk_id,
+                                slice_id = desc.slice_id,
+                                offset = desc.offset,
+                                len = desc.length,
+                                new_size,
+                                retry_failures = commit_failures,
+                                retry_backoff_ms = backoff.as_millis() as u64,
+                                error = ?err,
+                                "commit_chunk meta write failed, retrying"
+                            );
+                        }
                     } else {
                         commit_failures = 0;
                         SliceHandle {
@@ -1202,7 +1387,9 @@ where
                         .mark_committed();
 
                         // Track committed bytes on the inode for accurate st_blocks.
-                        shared.inode.add_committed_bytes(desc.length.as_usize() as u64);
+                        shared
+                            .inode
+                            .add_estimated_allocated_bytes(desc.length.as_usize() as u64);
 
                         let _ = shared
                             .reader
@@ -1240,25 +1427,26 @@ where
             // A completed front slice must not leak retry history to the next one.
             commit_failures = 0;
 
-            let mut guard = shared
-                .inner
-                .lock()
-                .instrument(tracing::trace_span!("commit_chunk.pop_lock"))
-                .await;
-            if let Some(chunk) = guard.chunks.get_mut(&chunk_id) {
-                let _ = chunk.slices.pop_front();
-            }
-
-            let empty = guard
-                .chunks
-                .get(&chunk_id)
-                .map(|c| c.slices.is_empty())
-                .unwrap_or(true);
-            if empty {
-                guard.chunks.remove(&chunk_id);
-                if !guard.has_chunks() && guard.flush_waiting > 0 {
+            // Move committed slices to recently_committed so overlay_dirty can
+            // still serve their data during the grace period.  Failed or empty
+            // slices are discarded immediately.
+            let committed = matches!(runtime.status, SliceStatus::Committed);
+            if committed {
+                // Move from slices to recently_committed.
+                let mut guard = shared
+                    .inner
+                    .lock()
+                    .instrument(tracing::trace_span!("commit_chunk.move_to_recently_committed"))
+                    .await;
+                if let Some(chunk) = guard.chunks.get_mut(&chunk_id) {
+                    if let Some(s) = chunk.slices.pop_front() {
+                        chunk.recently_committed.push_back(s);
+                    }
+                }
+                if guard.flush_waiting > 0 {
                     shared.flush_notify.notify_waiters();
                 }
+            } else if Self::pop_front_slice(&shared, chunk_id).await {
                 return;
             }
         }
@@ -1304,15 +1492,16 @@ where
                             shared: &shared,
                         };
 
-                        let (age, idle_time, writeable) = handle.with_ref(|s| {
+                        let (age, idle_time, data_len, writeable) = handle.with_ref(|s| {
                             (
                                 now.duration_since(s.started),
                                 now.duration_since(s.last_mod),
+                                s.data.len(),
                                 matches!(s.state, SliceStatus::Writable),
                             )
                         });
 
-                        if !writeable {
+                        if !writeable || data_len == 0 {
                             continue;
                         }
 
@@ -1347,6 +1536,28 @@ where
 
             for slice in to_flush {
                 Self::spawn_flush_slice(shared.clone(), slice);
+            }
+
+            // Periodically drain recently_committed slices that have been kept
+            // long enough for overlay_dirty to consume them.
+            if tick % 100 == 0 {
+                let mut guard = shared.inner.lock().await;
+                let mut emptied = Vec::new();
+                for (cid, chunk) in guard.chunks.iter_mut() {
+                    // Keep recently-committed slices for ~2 s.
+                    chunk.recently_committed.retain(|s| {
+                        s.lock().started.elapsed() < Duration::from_secs(2)
+                    });
+                    if chunk.slices.is_empty() && chunk.recently_committed.is_empty() {
+                        emptied.push(*cid);
+                    }
+                }
+                for cid in emptied {
+                    guard.chunks.remove(&cid);
+                }
+                if !guard.has_chunks() && guard.flush_waiting > 0 {
+                    shared.flush_notify.notify_waiters();
+                }
             }
 
             // Heartbeat every ~30s so we can see auto_flush is alive.
@@ -1459,6 +1670,19 @@ where
         Ok(())
     }
 
+    /// Flush for close: uses a shorter deadline because FUSE already called
+    /// flush() before close() for write handles.  This only drains residual
+    /// in-flight work that was already kicked off by the preceding flush.
+    pub(crate) async fn flush_for_close(&self, ino: u64) -> anyhow::Result<()> {
+        let writer = self.files.get(&ino).map(|entry| entry.value().clone());
+        if let Some(writer) = writer
+            && writer.has_pending().await
+        {
+            writer.flush_with_deadline(CLOSE_FLUSH_DEADLINE).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn clear(&self, ino: u64) {
         let writer = self.files.get(&ino).map(|entry| entry.value().clone());
         if let Some(writer) = writer {
@@ -1502,6 +1726,8 @@ mod tests {
     use crate::chunk::reader::DataFetcher;
     use crate::chunk::store::{BlockKey, BlockStore, InMemoryBlockStore};
     use crate::meta::MetaLayer;
+    use crate::meta::client::{MetaClient, MetaClientOptions};
+    use crate::meta::config::{CacheCapacity, CacheTtl};
     use crate::meta::factory::create_meta_store_from_url;
     use crate::meta::store::MetaStore;
     use crate::vfs::Inode;
@@ -1566,6 +1792,33 @@ mod tests {
 
         async fn delete_range(&self, key: BlockKey, block_count: u64) -> anyhow::Result<()> {
             self.inner.delete_range(key, block_count).await
+        }
+    }
+
+    struct FailingStore;
+
+    #[async_trait]
+    impl BlockStore for FailingStore {
+        async fn write_range(
+            &self,
+            _key: BlockKey,
+            _offset: u64,
+            _data: &[u8],
+        ) -> anyhow::Result<u64> {
+            anyhow::bail!("injected write failure")
+        }
+
+        async fn read_range(
+            &self,
+            _key: BlockKey,
+            _offset: u64,
+            _buf: &mut [u8],
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("injected read failure")
+        }
+
+        async fn delete_range(&self, _key: BlockKey, _block_count: u64) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 
@@ -1756,6 +2009,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_auto_flush_does_not_freeze_empty_slice() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
+        let ino = meta
+            .create_file(1, "empty_auto_flush.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = FileWriter::new(
+            inode.clone(),
+            test_config(layout),
+            backend.clone(),
+            reader,
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        let cid = chunk_id_for(inode.ino(), 0).unwrap();
+        let slice = Arc::new(ParkingMutex::new(SliceState::new(
+            cid,
+            0,
+            test_config(layout),
+            Arc::new(AtomicU64::new(0)),
+        )));
+        {
+            let mut guard = writer.shared.inner.lock().await;
+            let mut chunk = ChunkState::new(cid);
+            chunk.slices.push_back(slice.clone());
+            guard.chunks.insert(cid, chunk);
+        }
+
+        sleep(AUTO_FLUSH_MAX_AGE + Duration::from_millis(30)).await;
+
+        assert!(
+            matches!(slice.lock().state, SliceStatus::Writable),
+            "auto_flush must not freeze an empty slice before write_at appends data"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_flush_blocks_write_until_upload_done() {
         let layout = ChunkLayout {
             chunk_size: 8 * 1024,
@@ -1814,6 +2116,124 @@ mod tests {
             .expect("write should finish")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_reports_upload_failure() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(FailingStore);
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store, meta.clone()));
+        let ino = meta
+            .create_file(1, "flush_upload_failure.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = FileWriter::new(
+            inode,
+            test_config(layout),
+            backend.clone(),
+            reader,
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        writer.write_at(0, &[9u8; 2048]).await.unwrap();
+
+        let err = timeout(Duration::from_secs(2), writer.flush())
+            .await
+            .expect("flush should return the upload error promptly")
+            .expect_err("upload failure must not be reported as a successful flush");
+
+        assert!(
+            err.to_string().contains("writeback failed"),
+            "unexpected flush error: {err:?}"
+        );
+        assert!(
+            writer.has_pending().await,
+            "writeback error should remain observable by later flush/fsync/close calls"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_reports_non_retryable_meta_failure() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let writable_meta = meta_handle.layer();
+        let read_only_meta = MetaClient::with_options(
+            meta_handle.store(),
+            CacheCapacity::default(),
+            CacheTtl::for_sqlite(),
+            MetaClientOptions {
+                read_only: true,
+                no_background_jobs: true,
+                ..Default::default()
+            },
+        );
+        let backend = Arc::new(Backend::new(store, read_only_meta));
+        let ino = writable_meta
+            .create_file(1, "flush_meta_failure.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = FileWriter::new(
+            inode,
+            test_config(layout),
+            backend.clone(),
+            reader,
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        let cid = chunk_id_for(ino, 0).unwrap();
+        let slice = Arc::new(ParkingMutex::new(SliceState::new(
+            cid,
+            0,
+            test_config(layout),
+            Arc::new(AtomicU64::new(0)),
+        )));
+        {
+            let mut state = slice.lock();
+            state.data.append(&[5u8; 2048]).unwrap();
+            state.data.freeze();
+            state.slice_id = Some(7);
+            state.state = SliceStatus::Uploaded;
+        }
+        {
+            let mut guard = writer.shared.inner.lock().await;
+            let mut chunk = ChunkState::new(cid);
+            chunk.commit_started = true;
+            chunk.slices.push_back(slice);
+            guard.chunks.insert(cid, chunk);
+        }
+
+        let shared = writer.shared.clone();
+        tokio::spawn(async move { FileWriter::commit_chunk(shared, cid).await });
+
+        let err = timeout(Duration::from_secs(2), writer.flush())
+            .await
+            .expect("flush should return the metadata error promptly")
+            .expect_err("metadata commit failure must not be reported as a successful flush");
+
+        assert!(
+            err.to_string()
+                .contains("metadata commit failed with non-retryable error"),
+            "unexpected flush error: {err:?}"
+        );
     }
 
     #[tokio::test]

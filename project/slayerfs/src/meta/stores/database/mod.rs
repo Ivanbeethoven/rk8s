@@ -705,6 +705,7 @@ impl DatabaseMetaStore {
         FileAttr {
             ino: file_meta.inode,
             size,
+            blocks: size.div_ceil(512),
             kind,
             mode: permission.mode,
             uid: permission.uid,
@@ -722,6 +723,7 @@ impl DatabaseMetaStore {
         FileAttr {
             ino: access_meta.inode,
             size: 4096,
+            blocks: 4096_u64.div_ceil(512),
             kind: FileType::Dir,
             mode: permission.mode,
             uid: permission.uid,
@@ -2305,6 +2307,7 @@ impl MetaStore for DatabaseMetaStore {
             let out = FileAttr {
                 ino,
                 size: symlink_len.unwrap_or(size as u64),
+                blocks: symlink_len.unwrap_or(size as u64).div_ceil(512),
                 kind,
                 mode: permission.mode,
                 uid: permission.uid,
@@ -2488,6 +2491,7 @@ impl MetaStore for DatabaseMetaStore {
             let out = FileAttr {
                 ino,
                 size: 4096,
+                blocks: 4096_u64.div_ceil(512),
                 kind: FileType::Dir,
                 mode: out_perm.mode,
                 uid: out_perm.uid,

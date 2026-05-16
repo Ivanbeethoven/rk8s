@@ -36,6 +36,9 @@ impl From<EntryType> for FileType {
 pub struct FileAttr {
     pub ino: i64,
     pub size: u64,
+    /// Number of 512-byte blocks allocated on the backend for this inode.
+    /// For sparse files this is typically smaller than `size.div_ceil(512)`.
+    pub blocks: u64,
     pub kind: FileType,
     pub mode: u32,
     pub uid: u32,

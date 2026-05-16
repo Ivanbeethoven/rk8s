@@ -710,7 +710,14 @@ mod io_tests {
 
         let out = read_path(&fs, "/cached.bin", 0, data.len()).await;
         assert_eq!(out, data);
-        assert!(!writer.has_pending().await);
+        // Read no longer forces a synchronous flush.  The dirty slice is still
+        // pending, but the reader saw it via overlay_dirty (including the
+        // recently_committed grace period if it was committed during the read).
+        // Background auto_flush will eventually commit it.
+        assert!(
+            writer.has_pending().await,
+            "dirty slice must still be present after read (read no longer flushes)"
+        );
     }
 
     #[tokio::test]

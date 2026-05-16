@@ -6,7 +6,6 @@ use std::time::Duration;
 use crate::chunk::SliceDesc;
 use crate::meta::entities::etcd::EtcdEntryInfo;
 use crate::meta::store::{DirEntry, FileAttr, MetaError, MetaStore};
-use crate::vfs::fs::FileType;
 use dashmap::{DashMap, Entry};
 use moka::future::Cache;
 use moka::notification::RemovalCause;
@@ -278,11 +277,10 @@ impl InodeCache {
         let mut entries = Vec::new();
 
         for (name, child_ino) in children_map.iter() {
-            let kind = if let Some(child) = self.ttl_manager.get(child_ino).await {
-                child.attr.read().await.kind
-            } else {
-                FileType::File
+            let Some(child) = self.ttl_manager.get(child_ino).await else {
+                return None;
             };
+            let kind = child.attr.read().await.kind;
 
             entries.push(DirEntry {
                 ino: *child_ino,
@@ -381,5 +379,48 @@ impl InodeCache {
                 .children_generation
                 .fetch_add(1, Ordering::AcqRel);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::store::{FileAttr, FileType};
+
+    fn attr(ino: i64, kind: FileType) -> FileAttr {
+        FileAttr {
+            ino,
+            size: 0,
+            blocks: 0,
+            kind,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            nlink: if kind == FileType::Dir { 2 } else { 1 },
+        }
+    }
+
+    #[tokio::test]
+    async fn readdir_returns_none_when_child_attr_is_missing() {
+        let cache = InodeCache::new(8, Duration::from_secs(60));
+        cache.insert_node(1, attr(1, FileType::Dir), None).await;
+        cache.insert_node(2, attr(2, FileType::Dir), Some(1)).await;
+        cache
+            .load_children_if_fresh(1, vec![("subdir".to_string(), 2)], 0)
+            .await;
+
+        let entries = cache.readdir(1).await.expect("complete cache");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, FileType::Dir);
+
+        cache.invalidate_inode(2).await;
+
+        assert!(
+            cache.readdir(1).await.is_none(),
+            "missing child attrs must force a backend readdir instead of reporting File"
+        );
     }
 }

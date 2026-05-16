@@ -1544,6 +1544,7 @@ impl MetaStore for EtcdMetaStore {
                     results[result_idx] = Some(FileAttr {
                         ino: 1,
                         size: 4096,
+                        blocks: 4096_u64.div_ceil(512),
                         kind: FileType::Dir,
                         mode: 0o40755,
                         uid: 0,
@@ -2888,6 +2889,7 @@ impl MetaStore for EtcdMetaStore {
                     Ok(FileAttr {
                         ino,
                         size,
+                        blocks: size.div_ceil(512),
                         kind,
                         mode: entry_info.permission.mode,
                         uid: entry_info.permission.uid,

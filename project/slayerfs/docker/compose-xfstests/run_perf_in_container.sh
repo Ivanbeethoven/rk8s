@@ -214,6 +214,7 @@ run_logged_tool() {
 
     start="$(date +%s)"
     info "运行压力工具: $tool"
+    info "  命令: $*"
     set +e
     if [[ "${PERF_LOG_TO_CONSOLE:-false}" == "true" ]]; then
         "$@" 2>&1 | tee "$log_path"
@@ -226,12 +227,22 @@ run_logged_tool() {
     end="$(date +%s)"
     elapsed="$((end - start))"
 
+    local log_size
+    log_size=$(wc -c < "$log_path" 2>/dev/null || echo 0)
+
     if [[ "$status" -eq 0 ]]; then
-        ok "压力工具完成: $tool (${elapsed}s)"
+        ok "压力工具完成: $tool (${elapsed}s, log=${log_size} bytes)"
         printf '%s\tpass\t%s\t%s\n' "$tool" "$elapsed" "$log_path" >>"$artifact_dir/perf-summary.tsv"
     else
-        err "压力工具失败: $tool (exit=$status, ${elapsed}s)"
+        err "压力工具失败: $tool (exit=$status, ${elapsed}s, log=${log_size} bytes)"
         printf '%s\tfail(%s)\t%s\t%s\n' "$tool" "$status" "$elapsed" "$log_path" >>"$artifact_dir/perf-summary.tsv"
+        # Show last 5 non-empty lines of the log to help diagnose failures
+        if [[ -s "$log_path" ]]; then
+            err "  最后几行日志:"
+            grep -v '^$' "$log_path" | tail -5 | while read -r line; do
+                err "    $line"
+            done
+        fi
     fi
 
     return "$status"
@@ -259,6 +270,17 @@ run_dirstress() {
     fi
 
     run_logged_tool dirstress "$bin" "${args[@]}"
+
+    # Summarize dirstress errors (File exists errors are expected under concurrency)
+    local dirstress_log="$artifact_dir/tools/dirstress.log"
+    if [[ -f "$dirstress_log" ]]; then
+        local total_errs mkdir_errs symlink_errs mknod_errs
+        total_errs=$(grep -c '!!' "$dirstress_log" 2>/dev/null || echo 0)
+        mkdir_errs=$(grep -c 'mkdir.*File exists' "$dirstress_log" 2>/dev/null || echo 0)
+        symlink_errs=$(grep -c 'symlink.*File exists' "$dirstress_log" 2>/dev/null || echo 0)
+        mknod_errs=$(grep -c "mknod.*Function not implemented" "$dirstress_log" 2>/dev/null || echo 0)
+        info "dirstress 错误汇总: total=$total_errs mkdir_EEXIST=$mkdir_errs symlink_EEXIST=$symlink_errs mknod_ENOSYS=$mknod_errs"
+    fi
 }
 
 run_dirperf() {
@@ -339,12 +361,22 @@ run_looptest() {
             -t
             -f
             -s
+            -v
             -b "${PERF_LOOPTEST_BUF_SIZE:-1048576}"
             "$loop_file"
         )
     fi
 
     run_logged_tool looptest "$bin" "${args[@]}"
+
+    # Post-validation: verify the test file was created and modified
+    if [[ -f "$loop_file" ]]; then
+        local looptest_size
+        looptest_size=$(stat -c%s "$loop_file" 2>/dev/null || echo 0)
+        info "looptest 测试文件: $loop_file (size=$looptest_size)"
+    else
+        err "looptest 未能创建测试文件: $loop_file"
+    fi
 }
 
 run_fio() {
@@ -383,6 +415,26 @@ run_fio() {
 
     args+=(--output-format=json --output="$json_path")
     run_logged_tool fio fio "${args[@]}"
+
+    # Append a human-readable summary to the log (the main output is in results/fio.json)
+    local fio_log="$artifact_dir/tools/fio.log"
+    if [[ -f "$json_path" ]] && command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+import json, sys
+with open('$json_path') as f:
+    data = json.load(f)
+jobs = data.get('jobs', [])
+if not jobs:
+    sys.exit(1)
+read = jobs[0].get('read', {})
+write = jobs[0].get('write', {})
+opts = jobs[0].get('job options', {})
+print(f\"fio: {opts.get('rw','?')} bs={opts.get('bs','?')} numjobs={opts.get('numjobs','?')} runtime={opts.get('runtime','?')}s\")
+print(f\"  read:  bw={read.get('bw','?')} KiB/s  iops={read.get('iops','?'):.1f}  lat_avg={read.get('clat_ns',{}).get('mean',0)/1e6:.2f}ms  lat_p99={read.get('clat_ns',{}).get('percentile',{}).get('99.000000',0)/1e6:.2f}ms\")
+print(f\"  write: bw={write.get('bw','?')} KiB/s  iops={write.get('iops','?'):.1f}  lat_avg={write.get('clat_ns',{}).get('mean',0)/1e6:.2f}ms  lat_p99={write.get('clat_ns',{}).get('percentile',{}).get('99.000000',0)/1e6:.2f}ms\")
+print(f\"  total: {read.get('io_bytes',0)+write.get('io_bytes',0)} bytes, {read.get('total_ios',0)+write.get('total_ios',0)} IOs\")
+" >> "$fio_log" 2>/dev/null || true
+    fi
 }
 
 generate_perf_report() {
@@ -623,11 +675,44 @@ main() {
 
     mount_slayerfs
 
+    # Pre-flight sanity check: verify the filesystem can create, write, and read files.
+    info "执行挂载点预检: $mount_dir"
+    local preflight_dir="$mount_dir/.perf-preflight"
+    local preflight_file="$preflight_dir/test.bin"
+    rm -rf "$preflight_dir"
+    mkdir -p "$preflight_dir"
+    if ! echo "slayerfs-preflight-$(date +%s)" > "$preflight_file"; then
+        err "预检失败: 无法写入 $preflight_file"
+        exit 1
+    fi
+    local preflight_read
+    preflight_read=$(cat "$preflight_file" 2>/dev/null)
+    if [[ -z "$preflight_read" ]]; then
+        err "预检失败: 无法读取 $preflight_file"
+        exit 1
+    fi
+    rm -rf "$preflight_dir"
+    ok "预检通过: 写入/读取正常"
+
     info "开始性能测试: tools=$perf_tools"
     set +e
     run_perf_suite
     status=$?
     set -e
+
+    # Post-test filesystem statistics
+    info "测试完成后文件系统统计:"
+    if command -v df >/dev/null 2>&1; then
+        df -h "$mount_dir" 2>/dev/null | tail -1 | while read -r fs size used avail pct mnt; do
+            info "  磁盘使用: $used / $size ($pct)"
+        done
+    fi
+    if [[ -d "$mount_dir" ]]; then
+        local total_files
+        total_files=$(find "$mount_dir" -type f 2>/dev/null | wc -l)
+        info "  残留文件数: $total_files"
+    fi
+
     generate_perf_report || true
 
     if [[ "$status" -eq 0 ]]; then

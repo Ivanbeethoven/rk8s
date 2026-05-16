@@ -3986,6 +3986,7 @@ impl StoredAttr {
         FileAttr {
             ino,
             size: self.size,
+            blocks: self.size.div_ceil(512),
             kind,
             mode: self.mode,
             uid: self.uid,
