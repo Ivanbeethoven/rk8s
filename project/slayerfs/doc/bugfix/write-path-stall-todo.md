@@ -48,12 +48,18 @@
   - 代码：`src/vfs/io/writer.rs`
 - [x] 增加 metadata commit 失败的单元测试。
   - 当前覆盖：非重试 metadata 错误会让 `flush` 返回 writeback failure。
+- [x] 增加 `should_retry_meta_write` 分类正确性测试。
+  - 代码：`src/vfs/io/writer.rs`
+  - 覆盖所有 RetryReason 变体和非重试错误。
 - [ ] 增加 metadata commit 连续 `ContinueRetry` 的单元测试。
   - 建议：用测试 MetaLayer 注入 `ContinueRetry`，验证超过预算后 `flush` 返回错误。
+  - 阻塞：需要 mock MetaLayer 基础设施。
 - [ ] 增加 close/fsync 错误传播测试。
   - 建议：覆盖 VFS 层，确认用户可见错误不会被 close 或 fsync 吞掉。
-- [ ] 增加慢 flush 日志字段。
-  - 建议字段：ino、chunk_id、slice_id、状态、等待耗时、失败次数、最后错误。
+- [x] 增加慢 flush 日志字段。
+  - 代码：`src/vfs/io/writer.rs`
+  - 当前策略：flush timeout 时记录 ino、elapsed_ms、pending_slices 数量和各 slice 状态。
+  - commit_chunk 重试时记录 retry_reason、retry_failures、backoff_ms。
 - [ ] 在 xfstests 产物中自动抓取 `auto_flush: alive` 前后的前台等待状态。
 
 ## 验证清单

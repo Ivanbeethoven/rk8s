@@ -994,7 +994,29 @@ where
                     .is_err()
                     && start.elapsed() > deadline
                 {
-                    break 'outer Err(anyhow::anyhow!("flush timeout after {:?}", deadline));
+                    let pending: Vec<_> = slices
+                        .iter()
+                        .filter(|s| !matches!(s.lock().state, SliceStatus::Committed))
+                        .map(|s| {
+                            let g = s.lock();
+                            format!("{:?}@{}", g.state, g.offset)
+                        })
+                        .collect();
+                    let ino = self.shared.inode.ino();
+                    tracing::error!(
+                        ino,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        pending_slices = pending.len(),
+                        pending_states = ?pending,
+                        "flush timeout"
+                    );
+                    break 'outer Err(anyhow::anyhow!(
+                        "flush timeout after {:?} for ino {ino}, {}/{} slices still pending: {:?}",
+                        deadline,
+                        ino,
+                        pending.len(),
+                        pending
+                    ));
                 }
 
                 // If the notify fired spuriously or for a different chunk,
