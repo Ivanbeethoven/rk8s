@@ -271,7 +271,43 @@ where
     M: MetaLayer + Send + Sync + 'static,
 {
     fn new(config: Arc<VFSConfig>, backend: Arc<Backend<S, M>>) -> Self {
-        let reader = Arc::new(DataReader::new(config.read.clone(), backend.clone()));
+        let prefetch_backend = backend.clone();
+        let prefetch_layout = config.read.layout;
+        let prefetcher: Arc<dyn crate::vfs::cache::prefetch::Prefetcher> = Arc::new(
+            crate::vfs::cache::prefetch::GlobalPrefetcher::new(
+                16,  // concurrency
+                256, // queue depth
+                move |ino, start, len| {
+                    let backend = prefetch_backend.clone();
+                    let layout = prefetch_layout;
+                    async move {
+                        use crate::chunk::reader::DataFetcher;
+                        use crate::vfs::chunk_id_for;
+                        use crate::vfs::io::split_chunk_spans;
+
+                        let spans = split_chunk_spans(layout, start, len as usize);
+                        for span in spans {
+                            let cid = match chunk_id_for(ino, span.index) {
+                                Ok(c) => c,
+                                Err(_) => continue,
+                            };
+                            let mut fetcher = DataFetcher::new(layout, cid, &*backend);
+                            if fetcher.prepare_slices().await.is_err() {
+                                continue;
+                            }
+                            let _ = fetcher
+                                .read_at(span.offset.into(), span.len as usize)
+                                .await;
+                        }
+                    }
+                },
+            ),
+        );
+
+        let reader = Arc::new(
+            DataReader::new(config.read.clone(), backend.clone())
+                .with_prefetcher(prefetcher),
+        );
 
         let write_back = {
             let cache_root = dirs::cache_dir()

@@ -36,6 +36,7 @@ pub(crate) struct DataReader<B, M> {
     /// Per-handle readers, grouped by inode
     files: DashMap<u64, Vec<(u64, Arc<FileReader<B, M>>)>>, // ino -> (fh, reader)
     backend: Arc<Backend<B, M>>,
+    prefetcher: Option<Arc<dyn crate::vfs::cache::prefetch::Prefetcher>>,
 }
 
 impl<B, M> DataReader<B, M>
@@ -49,7 +50,16 @@ where
             buffer_usage: Arc::new(AtomicU64::new(0)),
             files: DashMap::new(),
             backend,
+            prefetcher: None,
         }
+    }
+
+    pub(crate) fn with_prefetcher(
+        mut self,
+        prefetcher: Arc<dyn crate::vfs::cache::prefetch::Prefetcher>,
+    ) -> Self {
+        self.prefetcher = Some(prefetcher);
+        self
     }
 
     pub(crate) fn open_for_handle(&self, ino: Arc<Inode>, fh: u64) -> Arc<FileReader<B, M>> {
@@ -69,6 +79,12 @@ where
     }
 
     pub(crate) fn close_for_handle(&self, ino: u64, fh: u64) {
+        if let Some(prefetcher) = &self.prefetcher {
+            let p = prefetcher.clone();
+            let ino_i64 = ino as i64;
+            tokio::spawn(async move { p.cancel_for_handle(ino_i64, fh).await });
+        }
+
         if let Entry::Occupied(mut entry) = self.files.entry(ino) {
             let mut removed = Vec::new();
             let list = entry.get_mut();
@@ -91,6 +107,25 @@ where
                     reader.invalidate_all().await;
                 });
             }
+        }
+    }
+
+    /// Submit a prefetch task for the range following a completed read.
+    /// Called by the VFS after each successful read to warm the cache.
+    pub(crate) fn submit_prefetch(&self, ino: i64, fh: u64, offset: u64, read_len: u64) {
+        if let Some(prefetcher) = &self.prefetcher {
+            use crate::vfs::cache::prefetch::{PrefetchPriority, PrefetchTask};
+            let ahead_start = offset + read_len;
+            let ahead_len = read_len.max(self.config.layout.block_size as u64);
+            let p = prefetcher.clone();
+            let task = PrefetchTask {
+                ino,
+                start: ahead_start,
+                len: ahead_len,
+                priority: PrefetchPriority::Sequential,
+                owner_fh: fh,
+            };
+            tokio::spawn(async move { p.submit(task).await });
         }
     }
 
