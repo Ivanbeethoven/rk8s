@@ -120,6 +120,10 @@ impl WriteBackCache for FsWriteBackCache {
 
         fs::rename(&tmp_path, &slice_path).await?;
 
+        // fsync parent directory to ensure the rename is durable.
+        let dir_fd = fs::File::open(&dir).await?;
+        dir_fd.sync_all().await?;
+
         let record = DirtySliceRecord {
             key,
             ino: key.ino,

@@ -51,20 +51,19 @@ const COMMIT_RETRY_MAX_MS: u64 = 2000;
 const COMMIT_META_MAX_RETRIES: u32 = 15;
 const WRITE_SLICE_MAX_RETRIES: u32 = 64;
 /// Maximum age of a Writable slice before auto_flush freezes it and starts
-/// background upload, regardless of idle time.  A short threshold lets the
-/// background path pre-empt foreground fsync so that explicit flushes mostly
-/// wait for work that is already in flight rather than kicking off a full
-/// upload+commit round from scratch.
-const AUTO_FLUSH_MAX_AGE: Duration = Duration::from_millis(5);
+/// background upload, regardless of idle time.  For S3 backends, a longer
+/// threshold aggregates more data per slice, reducing small-object PUT
+/// amplification.  fsync/close still force-seal immediately.
+const AUTO_FLUSH_MAX_AGE: Duration = Duration::from_millis(500);
 
 const MAX_UNFLUSHED_SLICES: usize = 3;
 const MAX_SLICES_THRESHOLD: usize = 800;
 const WRITE_MAX_WAIT: Duration = Duration::from_secs(30);
 /// Minimum number of bytes a Writable slice must hold before `should_freeze`
-/// returns true on a size basis.  This lets single-page (4 KiB) writeback
-/// from the kernel trigger an immediate freeze so that the background
-/// upload+commit path can pre-empt a subsequent fsync.
-const SHOULD_FREEZE_MIN_BYTES: u64 = 4096;
+/// returns true on a size basis.  8 MiB aggregation reduces small-object
+/// PUT amplification on S3 backends.  fsync/close bypass this threshold
+/// and force-seal regardless of size.
+const SHOULD_FREEZE_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
 fn commit_retry_backoff(failures: u32) -> Duration {
     let exp = failures.saturating_sub(1).min(16);
@@ -2046,6 +2045,9 @@ mod tests {
         let first = vec![1u8; len];
         writer.write_at(0, &first).await.unwrap();
 
+        // Flush to freeze the first slice so the overwrite creates a new one.
+        writer.flush().await.unwrap();
+
         let second = vec![2u8; len];
         writer.write_at(0, &second).await.unwrap();
 
@@ -2053,9 +2055,8 @@ mod tests {
 
         let cid = chunk_id_for(inode.ino(), 0).unwrap();
         let slices = meta_store.get_slices(cid).await.unwrap();
-        // With SHOULD_FREEZE_MIN_BYTES the first 1 MiB slice is frozen
-        // immediately, so the second write goes to a fresh slice.
-        // Both are committed by flush.
+        // The first flush commits slice 1, then the overwrite at offset 0
+        // cannot append to a Committed slice, so it creates a fresh slice.
         assert_eq!(slices.len(), 2);
 
         let mut reader = DataFetcher::new(layout, cid, backend.as_ref());
