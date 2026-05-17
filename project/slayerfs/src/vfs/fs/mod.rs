@@ -283,10 +283,17 @@ where
             );
 
             // Crash recovery: scan for dirty slices from a previous session.
-            let wb_clone = wb.clone();
-            tokio::spawn(async move {
-                Self::recover_dirty_slices(&wb_clone).await;
-            });
+            // Skip in test builds to avoid cross-test contamination from
+            // leftover dirty slice files in the shared temp directory.
+            #[cfg(not(test))]
+            {
+                let wb_clone = wb.clone();
+                let backend_clone = backend.clone();
+                let layout = config.write.layout;
+                tokio::spawn(async move {
+                    Self::recover_dirty_slices(&wb_clone, &backend_clone, layout).await;
+                });
+            }
 
             Some(wb)
         };
@@ -308,11 +315,14 @@ where
         }
     }
 
-    /// Scan local SSD for dirty slices from a previous session and clean up
-    /// terminal records. Non-terminal records are logged for observability.
+    /// Scan local SSD for dirty slices from a previous session.
+    /// Re-uploads recoverable slices and cleans up stale records.
     async fn recover_dirty_slices(
         wb: &crate::vfs::cache::write_back::FsWriteBackCache,
+        backend: &Arc<Backend<S, M>>,
+        layout: crate::chunk::ChunkLayout,
     ) {
+        use crate::vfs::cache::keys::DirtySliceState;
         use crate::vfs::cache::write_back::WriteBackCache;
 
         let records = match wb.recover().await {
@@ -332,23 +342,89 @@ where
             "recovered dirty slices from previous session"
         );
 
-        for record in &records {
-            tracing::info!(
-                ino = record.ino,
-                chunk_id = record.chunk_id,
-                state = ?record.state,
-                length = record.length,
-                path = ?record.path,
-                "recovered dirty slice"
-            );
-        }
-
-        // Clean up records whose data files no longer exist on disk.
         for record in records {
             if !record.path.exists() {
                 let _ = wb.remove(&record.key).await;
+                continue;
+            }
+
+            match record.state {
+                DirtySliceState::Sealed
+                | DirtySliceState::Failed
+                | DirtySliceState::Uploading => {
+                    tracing::info!(
+                        ino = record.ino,
+                        chunk_id = record.chunk_id,
+                        length = record.length,
+                        state = ?record.state,
+                        "re-uploading recovered slice"
+                    );
+                    Self::reupload_recovered_slice(
+                        wb, backend, layout, &record,
+                    )
+                    .await;
+                }
+                _ => {
+                    let _ = wb.remove(&record.key).await;
+                }
             }
         }
+    }
+
+    async fn reupload_recovered_slice(
+        wb: &crate::vfs::cache::write_back::FsWriteBackCache,
+        backend: &Arc<Backend<S, M>>,
+        layout: crate::chunk::ChunkLayout,
+        record: &crate::vfs::cache::write_back::DirtySliceRecord,
+    ) {
+        use crate::chunk::writer::DataUploader;
+        use crate::vfs::cache::write_back::WriteBackCache;
+
+        let data = match tokio::fs::read(&record.path).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(path = ?record.path, error = ?e, "cannot read recovered slice");
+                return;
+            }
+        };
+
+        let slice_id = match backend.meta().next_id(crate::meta::SLICE_ID_KEY).await {
+            Ok(id) => id as u64,
+            Err(e) => {
+                tracing::warn!(error = ?e, "failed to allocate slice_id for recovery");
+                return;
+            }
+        };
+
+        let uploader = DataUploader::new(layout, backend);
+        let chunks = vec![bytes::Bytes::from(data)];
+        if let Err(e) = uploader.write_at_vectored(slice_id, 0u64.into(), &chunks).await {
+            tracing::warn!(slice_id, error = ?e, "recovery upload failed");
+            return;
+        }
+
+        let desc = crate::chunk::SliceDesc {
+            chunk_id: record.chunk_id,
+            slice_id,
+            offset: record.chunk_offset,
+            length: record.length,
+        };
+        let (ino, chunk_index) =
+            crate::vfs::extract_ino_and_chunk_index(record.chunk_id);
+        let file_offset = chunk_index * layout.chunk_size + desc.offset;
+        let new_size = file_offset + desc.length;
+
+        if let Err(e) = backend
+            .meta()
+            .write(ino, record.chunk_id, desc, new_size)
+            .await
+        {
+            tracing::warn!(ino, slice_id, error = ?e, "recovery metadata commit failed");
+            return;
+        }
+
+        tracing::info!(ino, slice_id, length = record.length, "recovery commit success");
+        let _ = wb.remove(&record.key).await;
     }
 
     fn append_lock(&self, ino: i64) -> Arc<Mutex<()>> {

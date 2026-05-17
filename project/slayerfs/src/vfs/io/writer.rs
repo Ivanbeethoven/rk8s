@@ -54,6 +54,7 @@ const WRITE_SLICE_MAX_RETRIES: u32 = 64;
 /// background upload, regardless of idle time.  For S3 backends, a longer
 /// threshold aggregates more data per slice, reducing small-object PUT
 /// amplification.  fsync/close still force-seal immediately.
+/// NOTE: This is the fallback; prefer config.auto_flush_max_age when available.
 const AUTO_FLUSH_MAX_AGE: Duration = Duration::from_millis(500);
 
 const MAX_UNFLUSHED_SLICES: usize = 3;
@@ -63,6 +64,7 @@ const WRITE_MAX_WAIT: Duration = Duration::from_secs(30);
 /// returns true on a size basis.  8 MiB aggregation reduces small-object
 /// PUT amplification on S3 backends.  fsync/close bypass this threshold
 /// and force-seal regardless of size.
+/// NOTE: This is the fallback; prefer config.freeze_min_bytes when available.
 const SHOULD_FREEZE_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
 fn commit_retry_backoff(failures: u32) -> Duration {
@@ -358,11 +360,8 @@ where
     fn should_freeze(&self) -> bool {
         self.with_ref(|s| {
             let end = s.offset + s.data.len();
-            // Freeze when the slice fills the chunk, or when enough data
-            // has accumulated that a background upload cycle is worthwhile.
-            // The size-based check lets the write path itself trigger
-            // uploads without waiting for auto_flush's next poll interval.
-            end >= self.shared.config.layout.chunk_size || s.data.len() >= SHOULD_FREEZE_MIN_BYTES
+            let freeze_min = self.shared.config.freeze_min_bytes;
+            end >= self.shared.config.layout.chunk_size || s.data.len() >= freeze_min
         })
     }
 
@@ -1600,7 +1599,8 @@ where
                         // time fsync calls flush(), auto_flush has usually
                         // already frozen the slice and kicked off the upload,
                         // so flush only waits for in-flight work to land.
-                        let mut should = age > AUTO_FLUSH_MAX_AGE
+                        let auto_flush_max = shared.config.auto_flush_max_age;
+                        let mut should = age > auto_flush_max
                             || (idle_time > idle && age > idle)
                             || age > FLUSH_DURATION;
                         if !should && too_many {
@@ -1829,7 +1829,12 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     fn test_config(layout: ChunkLayout) -> Arc<WriteConfig> {
-        Arc::new(WriteConfig::new(layout).page_size(4 * 1024))
+        Arc::new(
+            WriteConfig::new(layout)
+                .page_size(4 * 1024)
+                .freeze_min_bytes(4096)
+                .auto_flush_max_age(Duration::from_millis(5)),
+        )
     }
 
     fn blocks_len(data: &[(usize, Vec<Bytes>)]) -> usize {

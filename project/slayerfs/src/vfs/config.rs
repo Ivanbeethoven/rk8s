@@ -64,6 +64,11 @@ pub struct WriteConfig {
     /// Default: 300MB. Set to 0 to disable throttling.
     pub buffer_size: u64,
     pub flush_all_interval: Duration,
+    /// Minimum bytes before auto_flush freezes a slice on size.
+    /// Higher values aggregate more data per S3 PUT (reduces small-object amplification).
+    pub freeze_min_bytes: u64,
+    /// Maximum age of a Writable slice before auto_flush freezes it.
+    pub auto_flush_max_age: Duration,
 }
 
 impl Default for WriteConfig {
@@ -73,6 +78,14 @@ impl Default for WriteConfig {
             page_size: DEFAULT_PAGE_SIZE,
             buffer_size: DEFAULT_WRITE_BUFFER_SIZE,
             flush_all_interval: DEFAULT_FLUSH_ALL_INTERVAL,
+            #[cfg(not(test))]
+            freeze_min_bytes: 8 * 1024 * 1024,
+            #[cfg(test)]
+            freeze_min_bytes: 4096,
+            #[cfg(not(test))]
+            auto_flush_max_age: Duration::from_millis(500),
+            #[cfg(test)]
+            auto_flush_max_age: Duration::from_millis(5),
         }
     }
 }
@@ -100,6 +113,20 @@ impl WriteConfig {
     pub fn flush_all_interval(self, flush_all_interval: Duration) -> Self {
         Self {
             flush_all_interval,
+            ..self
+        }
+    }
+
+    pub fn freeze_min_bytes(self, freeze_min_bytes: u64) -> Self {
+        Self {
+            freeze_min_bytes,
+            ..self
+        }
+    }
+
+    pub fn auto_flush_max_age(self, auto_flush_max_age: Duration) -> Self {
+        Self {
+            auto_flush_max_age,
             ..self
         }
     }
