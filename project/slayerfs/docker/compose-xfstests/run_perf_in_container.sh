@@ -19,7 +19,19 @@ log_file="${SLAYERFS_LOG_FILE:-/artifacts/slayerfs.log}"
 xfstests_dir="${XFSTESTS_DIR:-/opt/xfstests-dev}"
 artifact_root="${SLAYERFS_ARTIFACT_ROOT:-/artifacts}"
 artifact_dir="${SLAYERFS_ARTIFACT_DIR:-}"
-perf_tools="${PERF_TOOLS:-dirstress metaperf looptest fio}"
+perf_tools="${PERF_TOOLS:-dirstress metaperf looptest fio-seqread fio-seqwrite fio-randread fio-randwrite}"
+
+env_or_default() {
+    local specific_var="$1"
+    local common_var="$2"
+    local default_value="$3"
+    local value="${!specific_var:-}"
+    if [[ -n "$value" ]]; then
+        printf '%s' "$value"
+    else
+        printf '%s' "${!common_var:-$default_value}"
+    fi
+}
 
 write_config() {
     mkdir -p "$(dirname "$config_path")" "$mount_dir"
@@ -379,7 +391,60 @@ run_looptest() {
     fi
 }
 
-run_fio() {
+append_fio_log_summary() {
+    local json_path="$1"
+    local log_path="$2"
+    local label="${3:-fio}"
+
+    if [[ -f "$json_path" ]] && command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+import json, sys
+with open('$json_path') as f:
+    data = json.load(f)
+jobs = data.get('jobs', [])
+if not jobs:
+    sys.exit(1)
+read = jobs[0].get('read', {})
+write = jobs[0].get('write', {})
+opts = jobs[0].get('job options', {})
+print(f\"${label}: {opts.get('rw','?')} bs={opts.get('bs','?')} numjobs={opts.get('numjobs','?')} runtime={opts.get('runtime','?')}s\")
+print(f\"  read:  bw={read.get('bw','?')} KiB/s  iops={read.get('iops','?'):.1f}  lat_avg={read.get('clat_ns',{}).get('mean',0)/1e6:.2f}ms  lat_p99={read.get('clat_ns',{}).get('percentile',{}).get('99.000000',0)/1e6:.2f}ms\")
+print(f\"  write: bw={write.get('bw','?')} KiB/s  iops={write.get('iops','?'):.1f}  lat_avg={write.get('clat_ns',{}).get('mean',0)/1e6:.2f}ms  lat_p99={write.get('clat_ns',{}).get('percentile',{}).get('99.000000',0)/1e6:.2f}ms\")
+print(f\"  total: {read.get('io_bytes',0)+write.get('io_bytes',0)} bytes, {read.get('total_ios',0)+write.get('total_ios',0)} IOs\")
+" >> "$log_path" 2>/dev/null || true
+    fi
+}
+
+prepare_fio_dataset() {
+    local tool="$1"
+    local work_dir="$2"
+    local dataset_size="$3"
+    local direct_mode="$4"
+    local prep_log="$artifact_dir/tools/${tool}-prepare.log"
+    local -a prep_args=(
+        --name="${tool}-prepare"
+        --directory="$work_dir"
+        --rw=write
+        --bs="${PERF_FIO_PREP_BS:-1m}"
+        --size="$dataset_size"
+        --numjobs=1
+        --ioengine="${PERF_FIO_PREP_IOENGINE:-sync}"
+        --iodepth="${PERF_FIO_PREP_IODEPTH:-1}"
+        --direct="$direct_mode"
+        --end_fsync=1
+        --group_reporting
+        --eta=never
+    )
+
+    info "预填充 fio 数据集: $tool"
+    if [[ "${PERF_LOG_TO_CONSOLE:-false}" == "true" ]]; then
+        fio "${prep_args[@]}" 2>&1 | tee "$prep_log"
+        return "${PIPESTATUS[0]}"
+    fi
+    fio "${prep_args[@]}" >"$prep_log" 2>&1
+}
+
+run_fio_custom() {
     local work_dir="$mount_dir/.perf-fio"
     local json_path="$artifact_dir/results/fio.json"
     local -a args=()
@@ -415,26 +480,144 @@ run_fio() {
 
     args+=(--output-format=json --output="$json_path")
     run_logged_tool fio fio "${args[@]}"
+    append_fio_log_summary "$json_path" "$artifact_dir/tools/fio.log" "fio"
+}
 
-    # Append a human-readable summary to the log (the main output is in results/fio.json)
-    local fio_log="$artifact_dir/tools/fio.log"
-    if [[ -f "$json_path" ]] && command -v python3 >/dev/null 2>&1; then
-        python3 -c "
-import json, sys
-with open('$json_path') as f:
-    data = json.load(f)
-jobs = data.get('jobs', [])
-if not jobs:
-    sys.exit(1)
-read = jobs[0].get('read', {})
-write = jobs[0].get('write', {})
-opts = jobs[0].get('job options', {})
-print(f\"fio: {opts.get('rw','?')} bs={opts.get('bs','?')} numjobs={opts.get('numjobs','?')} runtime={opts.get('runtime','?')}s\")
-print(f\"  read:  bw={read.get('bw','?')} KiB/s  iops={read.get('iops','?'):.1f}  lat_avg={read.get('clat_ns',{}).get('mean',0)/1e6:.2f}ms  lat_p99={read.get('clat_ns',{}).get('percentile',{}).get('99.000000',0)/1e6:.2f}ms\")
-print(f\"  write: bw={write.get('bw','?')} KiB/s  iops={write.get('iops','?'):.1f}  lat_avg={write.get('clat_ns',{}).get('mean',0)/1e6:.2f}ms  lat_p99={write.get('clat_ns',{}).get('percentile',{}).get('99.000000',0)/1e6:.2f}ms\")
-print(f\"  total: {read.get('io_bytes',0)+write.get('io_bytes',0)} bytes, {read.get('total_ios',0)+write.get('total_ios',0)} IOs\")
-" >> "$fio_log" 2>/dev/null || true
+run_fio_profile() {
+    local tool="$1"
+    local mode="$2"
+    local work_dir="$mount_dir/.perf-${tool}"
+    local json_path="$artifact_dir/results/${tool}.json"
+    local profile_suffix="${tool#fio-}"
+    local profile_key
+    local profile_args_var
+    local name_var
+    local rw_var
+    local rwmixread_var
+    local bs_var
+    local size_var
+    local numjobs_var
+    local ioengine_var
+    local iodepth_var
+    local direct_var
+    local runtime_var
+    local name rw rwmixread bs size numjobs ioengine iodepth direct runtime
+    local needs_prefill=false
+    local -a args=()
+
+    profile_key="$(printf '%s' "$profile_suffix" | tr '[:lower:]-' '[:upper:]_')"
+    profile_args_var="PERF_FIO_${profile_key}_ARGS"
+    name_var="PERF_FIO_${profile_key}_NAME"
+    rw_var="PERF_FIO_${profile_key}_RW"
+    rwmixread_var="PERF_FIO_${profile_key}_RWMIXREAD"
+    bs_var="PERF_FIO_${profile_key}_BS"
+    size_var="PERF_FIO_${profile_key}_SIZE"
+    numjobs_var="PERF_FIO_${profile_key}_NUMJOBS"
+    ioengine_var="PERF_FIO_${profile_key}_IOENGINE"
+    iodepth_var="PERF_FIO_${profile_key}_IODEPTH"
+    direct_var="PERF_FIO_${profile_key}_DIRECT"
+    runtime_var="PERF_FIO_${profile_key}_RUNTIME"
+
+    rm -rf "$work_dir"
+    mkdir -p "$work_dir"
+
+    if [[ -n "${!profile_args_var:-}" ]]; then
+        read -r -a args <<<"${!profile_args_var}"
+    else
+        case "$mode" in
+            seqread)
+                name="$(env_or_default "$name_var" PERF_FIO_NAME slayerfs-seqread)"
+                rw="$(env_or_default "$rw_var" PERF_FIO_RW read)"
+                bs="$(env_or_default "$bs_var" PERF_FIO_BS 1m)"
+                size="$(env_or_default "$size_var" PERF_FIO_SIZE 1g)"
+                numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 1)"
+                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE sync)"
+                iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
+                direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
+                runtime="$(env_or_default "$runtime_var" PERF_FIO_RUNTIME 60)"
+                needs_prefill=true
+                ;;
+            seqwrite)
+                name="$(env_or_default "$name_var" PERF_FIO_NAME slayerfs-seqwrite)"
+                rw="$(env_or_default "$rw_var" PERF_FIO_RW write)"
+                bs="$(env_or_default "$bs_var" PERF_FIO_BS 1m)"
+                size="$(env_or_default "$size_var" PERF_FIO_SIZE 1g)"
+                numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 1)"
+                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE sync)"
+                iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
+                direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
+                runtime="$(env_or_default "$runtime_var" PERF_FIO_RUNTIME 60)"
+                ;;
+            randread)
+                name="$(env_or_default "$name_var" PERF_FIO_NAME slayerfs-randread)"
+                rw="$(env_or_default "$rw_var" PERF_FIO_RW randread)"
+                bs="$(env_or_default "$bs_var" PERF_FIO_BS 4k)"
+                size="$(env_or_default "$size_var" PERF_FIO_SIZE 512m)"
+                numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 4)"
+                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE sync)"
+                iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
+                direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
+                runtime="$(env_or_default "$runtime_var" PERF_FIO_RUNTIME 60)"
+                needs_prefill=true
+                ;;
+            randwrite)
+                name="$(env_or_default "$name_var" PERF_FIO_NAME slayerfs-randwrite)"
+                rw="$(env_or_default "$rw_var" PERF_FIO_RW randwrite)"
+                bs="$(env_or_default "$bs_var" PERF_FIO_BS 4k)"
+                size="$(env_or_default "$size_var" PERF_FIO_SIZE 512m)"
+                numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 4)"
+                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE sync)"
+                iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
+                direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
+                runtime="$(env_or_default "$runtime_var" PERF_FIO_RUNTIME 60)"
+                ;;
+            randrw)
+                name="$(env_or_default "$name_var" PERF_FIO_NAME slayerfs-randrw)"
+                rw="$(env_or_default "$rw_var" PERF_FIO_RW randrw)"
+                rwmixread="$(env_or_default "$rwmixread_var" PERF_FIO_RWMIXREAD 70)"
+                bs="$(env_or_default "$bs_var" PERF_FIO_BS 4k)"
+                size="$(env_or_default "$size_var" PERF_FIO_SIZE 512m)"
+                numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 4)"
+                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE sync)"
+                iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
+                direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
+                runtime="$(env_or_default "$runtime_var" PERF_FIO_RUNTIME 60)"
+                needs_prefill=true
+                ;;
+            *)
+                err "未知的 fio profile: $mode"
+                return 1
+                ;;
+        esac
+
+        args=(
+            --name="$name"
+            --directory="$work_dir"
+            --rw="$rw"
+            --bs="$bs"
+            --size="$size"
+            --numjobs="$numjobs"
+            --ioengine="$ioengine"
+            --iodepth="$iodepth"
+            --direct="$direct"
+            --runtime="$runtime"
+            --time_based
+            --group_reporting
+            --eta=never
+        )
+
+        if [[ -n "${rwmixread:-}" ]]; then
+            args+=(--rwmixread="$rwmixread")
+        fi
     fi
+
+    if [[ "$needs_prefill" == true ]]; then
+        prepare_fio_dataset "$tool" "$work_dir" "$size" "$direct" || return $?
+    fi
+
+    args+=(--output-format=json --output="$json_path")
+    run_logged_tool "$tool" fio "${args[@]}"
+    append_fio_log_summary "$json_path" "$artifact_dir/tools/${tool}.log" "$tool"
 }
 
 generate_perf_report() {
@@ -449,7 +632,7 @@ artifact_dir = pathlib.Path(sys.argv[1])
 meta_backend = sys.argv[2]
 summary_path = artifact_dir / "perf-summary.tsv"
 report_path = artifact_dir / "report.md"
-fio_json_path = artifact_dir / "results" / "fio.json"
+fio_json_paths = sorted((artifact_dir / "results").glob("fio*.json"))
 
 rows = []
 if summary_path.exists():
@@ -474,11 +657,8 @@ for row in rows:
         f"{row.get('seconds', '')} | tools/{log} |"
     )
 
-if fio_json_path.exists():
+if fio_json_paths:
     try:
-        data = json.loads(fio_json_path.read_text())
-        jobs = data.get("jobs", [])
-
         def num(value, default=0):
             try:
                 return float(value)
@@ -542,69 +722,30 @@ if fio_json_path.exists():
                     return options
             return {}
 
-        fio_version = data.get("fio version", "unknown")
-        timestamp = data.get("timestamp")
-        started_at = ""
-        if timestamp:
-            started_at = dt.datetime.fromtimestamp(int(timestamp), tz=dt.timezone.utc).isoformat()
-
-        options = first_job_options()
-        read = op_totals("read")
-        write = op_totals("write")
-        total_bw = read["bw_bytes"] + write["bw_bytes"]
-        total_iops = read["iops"] + write["iops"]
-        total_io = read["io_bytes"] + write["io_bytes"]
-        max_runtime_ms = max(read["runtime_ms"], write["runtime_ms"])
-
         lines.extend([
             "",
             "## Fio",
             "",
-            "### Test Setup",
-            "",
-            "| Field | Value |",
-            "| --- | ---: |",
-            f"| fio version | {fio_version} |",
-            f"| Started at | {started_at or 'unknown'} |",
-            f"| Jobs reported | {len(jobs)} |",
-            f"| Job name | {options.get('name', jobs[0].get('jobname', 'unknown') if jobs else 'unknown')} |",
-            f"| Workload | {options.get('rw', 'unknown')} |",
-            f"| Block size | {options.get('bs', 'unknown')} |",
-            f"| Size | {options.get('size', 'unknown')} |",
-            f"| Runtime | {options.get('runtime', max_runtime_ms / 1000 if max_runtime_ms else 'unknown')} s |",
-            f"| Num jobs | {options.get('numjobs', 'unknown')} |",
-            f"| IO engine | {options.get('ioengine', 'unknown')} |",
-            f"| IO depth | {options.get('iodepth', 'unknown')} |",
-            f"| Direct IO | {options.get('direct', 'unknown')} |",
-            "",
-            "### Overall Result",
-            "",
-            "| Metric | Value |",
-            "| --- | ---: |",
-            f"| Total bandwidth | {fmt_rate(total_bw)} |",
-            f"| Total IOPS | {fmt_iops(total_iops)} |",
-            f"| Total data transferred | {fmt_bytes(total_io)} |",
-            f"| Effective runtime | {max_runtime_ms / 1000:.2f} s |",
-            "",
-            "### Read / Write Detail",
-            "",
-            "| Operation | Bandwidth | IOPS | Data | IOs | Avg clat | P95 clat | P99 clat |",
+            "| Tool | Workload | BS | Jobs | Read BW | Read IOPS | Write BW | Write IOPS | Read P99 | Write P99 | Raw |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-            (
-                f"| Read | {fmt_rate(read['bw_bytes'])} | {fmt_iops(read['iops'])} | "
-                f"{fmt_bytes(read['io_bytes'])} | {read['total_ios']:,.0f} | "
-                f"{fmt_ms_from_ns(read['mean_ns'])} | {fmt_ms_from_ns(read['p95_ns'])} | "
-                f"{fmt_ms_from_ns(read['p99_ns'])} |"
-            ),
-            (
-                f"| Write | {fmt_rate(write['bw_bytes'])} | {fmt_iops(write['iops'])} | "
-                f"{fmt_bytes(write['io_bytes'])} | {write['total_ios']:,.0f} | "
-                f"{fmt_ms_from_ns(write['mean_ns'])} | {fmt_ms_from_ns(write['p95_ns'])} | "
-                f"{fmt_ms_from_ns(write['p99_ns'])} |"
-            ),
-            "",
-            f"Raw fio JSON: results/{fio_json_path.name}",
         ])
+
+        for fio_json_path in fio_json_paths:
+            data = json.loads(fio_json_path.read_text())
+            jobs = data.get("jobs", [])
+            if not jobs:
+                continue
+            options = first_job_options()
+            read = op_totals("read")
+            write = op_totals("write")
+            tool_name = fio_json_path.stem
+            lines.append(
+                f"| {tool_name} | {options.get('rw', 'unknown')} | {options.get('bs', 'unknown')} | "
+                f"{options.get('numjobs', 'unknown')} | {fmt_rate(read['bw_bytes'])} | "
+                f"{fmt_iops(read['iops'])} | {fmt_rate(write['bw_bytes'])} | "
+                f"{fmt_iops(write['iops'])} | {fmt_ms_from_ns(read['p99_ns'])} | "
+                f"{fmt_ms_from_ns(write['p99_ns'])} | results/{fio_json_path.name} |"
+            )
     except Exception as exc:
         lines.extend(["", "## Fio", "", f"Failed to parse fio JSON: {exc}"])
 
@@ -638,7 +779,22 @@ run_perf_suite() {
                 run_looptest || status=1
                 ;;
             fio)
-                run_fio || status=1
+                run_fio_custom || status=1
+                ;;
+            fio-seqread)
+                run_fio_profile "$tool" seqread || status=1
+                ;;
+            fio-seqwrite)
+                run_fio_profile "$tool" seqwrite || status=1
+                ;;
+            fio-randread)
+                run_fio_profile "$tool" randread || status=1
+                ;;
+            fio-randwrite)
+                run_fio_profile "$tool" randwrite || status=1
+                ;;
+            fio-randrw)
+                run_fio_profile "$tool" randrw || status=1
                 ;;
             *)
                 err "不支持的 PERF_TOOLS 项: $tool"

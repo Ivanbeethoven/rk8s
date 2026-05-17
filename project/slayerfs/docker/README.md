@@ -52,20 +52,34 @@ bash compose-xfstests/run_redis_ltp.sh --skip-tests "fanotify01 fanotify03"
 ```bash
 cd project/slayerfs/docker
 
-# 默认跑 dirstress + metaperf + looptest
+# 默认跑全量工具，并默认使用 rustfs 作为对象存储
 bash compose-xfstests/run_redis_perf.sh
+
+# 如需回退到本地目录对象存储，可显式指定 --local-fs
+bash compose-xfstests/run_redis_perf.sh --local-fs
 
 # 指定工具，并额外跑一次宿主机 slayerfs_bench
 bash compose-xfstests/run_etcd_perf.sh \
-  --tools "dirstress dirperf metaperf looptest" \
+  --tools "dirstress dirperf metaperf looptest fio-seqread fio-randwrite fio-randrw" \
   --slayerfs-bench
 ```
 
 产物目录：`docker/compose-xfstests/artifacts/perf-run-*/`
 - `perf-summary.tsv`：每个压力工具的状态和耗时
 - `tools/*.log`：各工具原始输出
+- `results/fio-*.json`：各个 fio workload 的原始 JSON
 - `slayerfs.log`：FUSE 挂载期 SlayerFS 日志
 - `slayerfs-bench/console.log`：可选的宿主机 Criterion bench 控制台输出
+
+`fio` 相关 workload：
+- `fio-seqread` / `fio-seqwrite`：顺序读写吞吐
+- `fio-randread` / `fio-randwrite`：4k 随机读写 IOPS/时延
+- `fio-randrw`：随机混合读写
+- `fio`：保留原始自定义模式，适合配合 `PERF_FIO_ARGS` 完全手工指定参数
+
+对象存储后端：
+- 默认使用 `rustfs`（即 `SLAYERFS_DATA_BACKEND=s3`）
+- 如需改回本地目录对象存储，可传 `--local-fs`
 
 ## 本地 KVM xfstests（旧路径）
 

@@ -20,23 +20,26 @@ usage() {
 
 说明:
   - 使用 docker compose 在容器内运行 xfstests 压力工具，元数据库为 etcd
+  - 默认使用 rustfs 作为对象存储后端
   - 可选附带运行宿主机上的 slayerfs_bench
   - 测试产物输出到: $ARTIFACTS_DIR/perf-run-*
 
 选项:
-  --s3                       使用 rustfs 作为对象存储（SLAYERFS_DATA_BACKEND=s3）
-  --tools "<tool...>"        指定压力工具列表，默认: "dirstress metaperf looptest fio"
+  --s3                       使用 rustfs 作为对象存储（默认）
+  --local-fs                 改为使用本地目录作为对象存储
+  --tools "<tool...>"        指定压力工具列表，默认: "dirstress dirperf metaperf looptest fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw"
   --slayerfs-bench           额外运行一次宿主机 cargo bench --bench slayerfs_bench
   --bench-args "<args...>"   透传给 cargo bench 之后的 Criterion 参数
   --keep                     结束后不执行 compose down（便于调试）
   -h, --help                 显示帮助
 
 支持的 PERF_TOOLS:
-  dirstress dirperf metaperf looptest fio
+  dirstress dirperf metaperf looptest fio fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw
 
 可通过环境变量覆盖各工具参数:
   PERF_DIRSTRESS_ARGS PERF_DIRPERF_ARGS PERF_METAPERF_ARGS PERF_LOOPTEST_ARGS
   PERF_FIO_ARGS PERF_FIO_RUNTIME PERF_FIO_SIZE PERF_FIO_BS PERF_FIO_NUMJOBS
+  PERF_FIO_SEQREAD_ARGS PERF_FIO_SEQWRITE_ARGS PERF_FIO_RANDREAD_ARGS PERF_FIO_RANDWRITE_ARGS PERF_FIO_RANDRW_ARGS
   PERF_LOG_TO_CONSOLE=true 可恢复压测工具日志输出到终端（默认关闭）
 EOF
     exit 0
@@ -52,15 +55,19 @@ require_value() {
 }
 
 KEEP=false
-USE_S3=false
+USE_S3=true
 RUN_SLAYERFS_BENCH=false
-PERF_TOOLS_VALUE="dirstress metaperf looptest fio"
+PERF_TOOLS_VALUE="dirstress dirperf metaperf looptest fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw"
 BENCH_ARGS_VALUE=""
 
 while [[ $# -gt 0 ]]; do
     case "${1:-}" in
         --s3)
             USE_S3=true
+            shift
+            ;;
+        --local-fs)
+            USE_S3=false
             shift
             ;;
         --tools)
@@ -180,6 +187,11 @@ docker compose -f "$COMPOSE_FILE" run --rm \
     -e PERF_LOOPTEST_ITERS \
     -e PERF_LOOPTEST_BUF_SIZE \
     -e PERF_FIO_ARGS \
+    -e PERF_FIO_SEQREAD_ARGS \
+    -e PERF_FIO_SEQWRITE_ARGS \
+    -e PERF_FIO_RANDREAD_ARGS \
+    -e PERF_FIO_RANDWRITE_ARGS \
+    -e PERF_FIO_RANDRW_ARGS \
     -e PERF_FIO_NAME \
     -e PERF_FIO_RW \
     -e PERF_FIO_RWMIXREAD \

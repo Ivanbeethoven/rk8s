@@ -48,7 +48,7 @@ mod mount_tests {
     use crate::cadapter::localfs::LocalFsBackend;
     use crate::chunk::layout::ChunkLayout;
     use crate::chunk::store::ObjectBlockStore;
-    use crate::fuse::mount::mount_vfs_unprivileged;
+    use crate::fuse::mount::{FuseConcurrencyConfig, mount_vfs_unprivileged};
     use crate::meta::factory::create_meta_store_from_url;
     use std::fs;
     use std::io::Write;
@@ -79,7 +79,7 @@ mod mount_tests {
         let mnt_path = mnt.path().to_path_buf();
 
         // Mount in the background (until unmount)
-        let handle = match mount_vfs_unprivileged(fs, &mnt_path).await {
+        let handle = match mount_vfs_unprivileged(fs, &mnt_path, FuseConcurrencyConfig::default()).await {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("skip fuse test: mount failed: {e}");

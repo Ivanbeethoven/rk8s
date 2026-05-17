@@ -8,6 +8,13 @@ pub const DEFAULT_DATA_DIR: &str = "./data";
 pub const DEFAULT_META_URL: &str = "sqlite::memory:";
 pub const DEFAULT_S3_PART_SIZE: usize = 16 * 1024 * 1024;
 pub const DEFAULT_S3_MAX_CONCURRENCY: usize = 8;
+pub const DEFAULT_FUSE_MAX_BACKGROUND: usize = 12;
+
+fn default_fuse_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().max(2))
+        .unwrap_or(4)
+}
 
 #[derive(Parser)]
 #[command(name = "slayerfs", version, about = "SlayerFS FUSE CLI")]
@@ -92,6 +99,14 @@ pub struct MountArgs {
     /// Block size in bytes.
     #[arg(long)]
     pub block_size: Option<u32>,
+
+    /// Number of rfuse3 worker tasks. Use 0 or 1 to keep legacy session dispatch.
+    #[arg(long)]
+    pub fuse_workers: Option<usize>,
+
+    /// Maximum in-flight FUSE requests when rfuse3 worker mode is enabled.
+    #[arg(long)]
+    pub fuse_max_background: Option<usize>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -133,6 +148,7 @@ pub struct MountFileConfig {
     pub data: Option<DataFileConfig>,
     pub meta: Option<MetaFileConfig>,
     pub layout: Option<LayoutFileConfig>,
+    pub fuse: Option<FuseFileConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -181,6 +197,12 @@ pub struct LayoutFileConfig {
     pub block_size: Option<u32>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct FuseFileConfig {
+    pub workers: Option<usize>,
+    pub max_background: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MountConfig {
     pub mount_point: PathBuf,
@@ -197,6 +219,8 @@ pub struct MountConfig {
     pub meta_etcd_urls: Vec<String>,
     pub chunk_size: u64,
     pub block_size: u32,
+    pub fuse_workers: usize,
+    pub fuse_max_background: usize,
 }
 
 impl MountConfig {
@@ -217,6 +241,7 @@ impl MountConfig {
         let redis_cfg = meta_cfg.redis.unwrap_or_default();
         let etcd_cfg = meta_cfg.etcd.unwrap_or_default();
         let layout_cfg = file_cfg.layout.unwrap_or_default();
+        let fuse_cfg = file_cfg.fuse.unwrap_or_default();
 
         let mount_point = args.mount_point.or(file_cfg.mount_point).ok_or_else(|| {
             anyhow::anyhow!("mount point is required (positional arg or config.mount_point)")
@@ -272,6 +297,14 @@ impl MountConfig {
                 .block_size
                 .or(layout_cfg.block_size)
                 .unwrap_or(DEFAULT_BLOCK_SIZE),
+            fuse_workers: args
+                .fuse_workers
+                .or(fuse_cfg.workers)
+                .unwrap_or_else(default_fuse_workers),
+            fuse_max_background: args
+                .fuse_max_background
+                .or(fuse_cfg.max_background)
+                .unwrap_or(DEFAULT_FUSE_MAX_BACKGROUND),
         })
     }
 }
@@ -291,5 +324,55 @@ mod tests {
             }
             other => panic!("expected info command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mount_subcommand_parses_fuse_worker_args() {
+        let cli = Cli::parse_from([
+            "slayerfs",
+            "mount",
+            "/mnt/slayer",
+            "--fuse-workers",
+            "4",
+            "--fuse-max-background",
+            "64",
+        ]);
+
+        match cli.cmd {
+            Command::Mount(args) => {
+                assert_eq!(args.mount_point, Some(PathBuf::from("/mnt/slayer")));
+                assert_eq!(args.fuse_workers, Some(4));
+                assert_eq!(args.fuse_max_background, Some(64));
+            }
+            other => panic!("expected mount command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_config_defaults_enable_fuse_workers() {
+        let config = MountConfig::from_sources(MountArgs {
+            config: None,
+            mount_point: Some(PathBuf::from("/mnt/slayer")),
+            data_backend: None,
+            data_dir: None,
+            s3_bucket: None,
+            s3_endpoint: None,
+            s3_region: None,
+            s3_part_size: None,
+            s3_max_concurrency: None,
+            s3_force_path_style: None,
+            meta_backend: None,
+            meta_url: None,
+            meta_etcd_urls: None,
+            chunk_size: None,
+            block_size: None,
+            fuse_workers: None,
+            fuse_max_background: None,
+        })
+        .unwrap();
+
+        assert_eq!(config.fuse_workers, default_fuse_workers());
+        assert!(config.fuse_workers > 1);
+        assert_eq!(config.fuse_max_background, DEFAULT_FUSE_MAX_BACKGROUND);
     }
 }

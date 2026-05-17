@@ -15,6 +15,12 @@ use crate::chunk::store::BlockStore;
 use crate::meta::MetaLayer;
 use crate::vfs::fs::VFS;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FuseConcurrencyConfig {
+    pub worker_count: usize,
+    pub max_background: usize,
+}
+
 /// Build default mount options for SlayerFS.
 fn default_mount_options() -> MountOptions {
     let mut mo = MountOptions::default();
@@ -29,6 +35,20 @@ fn default_mount_options() -> MountOptions {
     // Default to 4 MiB for higher throughput while keeping memory usage reasonable.
     mo.max_write(NonZeroU32::new(4 * 1024 * 1024).unwrap());
     mo
+}
+
+fn configure_session<FS>(
+    session: rfuse3::raw::Session<FS>,
+    config: FuseConcurrencyConfig,
+) -> rfuse3::raw::Session<FS>
+where
+    FS: rfuse3::raw::Filesystem + Send + Sync + 'static,
+{
+    if config.worker_count > 1 {
+        session.with_workers(config.worker_count, config.max_background.max(1))
+    } else {
+        session
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -46,6 +66,7 @@ fn fuse_op_log_enabled() -> bool {
 pub async fn mount_vfs_unprivileged<S, M>(
     fs: VFS<S, M>,
     mount_point: impl AsRef<Path>,
+    concurrency: FuseConcurrencyConfig,
 ) -> std::io::Result<rfuse3::raw::MountHandle>
 where
     S: BlockStore + Send + Sync + 'static,
@@ -54,11 +75,11 @@ where
     let mount_point = mount_point.as_ref();
     // Prefer unprivileged mount on Linux (requires fusermount3 in PATH)
     if fuse_op_log_enabled() {
-        rfuse3::raw::Session::new(default_mount_options())
+        configure_session(rfuse3::raw::Session::new(default_mount_options()), concurrency)
             .mount_with_unprivileged(LoggingFileSystem::new(fs), mount_point)
             .await
     } else {
-        rfuse3::raw::Session::new(default_mount_options())
+        configure_session(rfuse3::raw::Session::new(default_mount_options()), concurrency)
             .mount_with_unprivileged(fs, mount_point)
             .await
     }
@@ -69,6 +90,7 @@ where
 pub async fn mount_vfs_unprivileged<S, M>(
     _fs: VFS<S, M>,
     _mount_point: impl AsRef<Path>,
+    _concurrency: FuseConcurrencyConfig,
 ) -> std::io::Result<rfuse3::raw::MountHandle>
 where
     S: BlockStore + Send + Sync + 'static,

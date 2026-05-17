@@ -22,7 +22,6 @@ static GLOBAL: Jemalloc = Jemalloc;
 use std::fs::File;
 #[cfg(feature = "profiling")]
 use std::io::BufWriter;
-use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(feature = "profiling")]
 use std::sync::{LazyLock, Mutex as StdMutex};
@@ -45,7 +44,7 @@ use crate::control::client::send_request;
 use crate::control::job::JobOutcome;
 use crate::control::protocol::{ControlRequest, ControlResponse};
 use crate::control::runtime::RuntimeRegistry;
-use crate::fuse::mount::mount_vfs_unprivileged;
+use crate::fuse::mount::{FuseConcurrencyConfig, mount_vfs_unprivileged};
 use crate::meta::MetaStore;
 use crate::meta::client::MetaClient;
 use crate::meta::config::{
@@ -254,12 +253,12 @@ async fn mount_cmd(args: MountConfig) -> anyhow::Result<()> {
         DataBackendKind::LocalFs => {
             let client = create_localfs_client(&args)?;
             let store = ObjectBlockStore::new(client);
-            mount_with_store(layout, store, meta_store, &args.mount_point).await
+            mount_with_store(layout, store, meta_store, &args).await
         }
         DataBackendKind::S3 => {
             let client = create_s3_client(&args).await?;
             let store = ObjectBlockStore::new(client);
-            mount_with_store(layout, store, meta_store, &args.mount_point).await
+            mount_with_store(layout, store, meta_store, &args).await
         }
     }
 }
@@ -305,11 +304,12 @@ async fn mount_with_store<S>(
     layout: ChunkLayout,
     store: S,
     meta_store: Arc<dyn MetaStore>,
-    mount_point: &PathBuf,
+    args: &MountConfig,
 ) -> anyhow::Result<()>
 where
     S: BlockStore + Send + Sync + 'static,
 {
+    let mount_point = &args.mount_point;
     let store = Arc::new(store);
     let mut meta_config = MetaClientConfig::default();
     meta_config.options.mount_point = Some(mount_point.display().to_string());
@@ -336,7 +336,11 @@ where
         meta_config.compact.clone(),
     )
     .map_err(anyhow::Error::from)?;
-    let handle = mount_vfs_unprivileged(fs, mount_point).await?;
+    let concurrency = FuseConcurrencyConfig {
+        worker_count: args.fuse_workers,
+        max_background: args.fuse_max_background,
+    };
+    let handle = mount_vfs_unprivileged(fs, mount_point, concurrency).await?;
 
     println!("mounted at {}", mount_point.display());
     let mut handle = handle;
