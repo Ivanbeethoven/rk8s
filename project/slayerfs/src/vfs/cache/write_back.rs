@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::keys::{DirtySliceKey, DirtySliceState};
 
@@ -211,6 +211,66 @@ impl WriteBackCache for FsWriteBackCache {
         let _ = fs::remove_file(&meta_path).await;
         let dir = key.dir_path(&self.root);
         let _ = fs::remove_dir(&dir).await;
+        Ok(())
+    }
+}
+
+impl FsWriteBackCache {
+    /// Overlay dirty data from SSD onto a read buffer.
+    /// Scans dirty slices for the given inode/chunk and copies any
+    /// overlapping ranges into `buf`.  Used as a fallback when in-memory
+    /// dirty data has been released (e.g., during crash recovery window).
+    pub async fn overlay_dirty_range(
+        &self,
+        ino: i64,
+        chunk_id: u64,
+        chunk_offset: u64,
+        buf: &mut [u8],
+    ) -> anyhow::Result<()> {
+        let chunk_dir = self.root.join("dirty")
+            .join(ino.to_string())
+            .join(chunk_id.to_string());
+
+        if !chunk_dir.exists() {
+            return Ok(());
+        }
+
+        let mut entries = fs::read_dir(&chunk_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("meta") {
+                continue;
+            }
+
+            let record = match self.read_meta(&path).await {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            if !record.path.exists() {
+                continue;
+            }
+
+            let slice_start = record.chunk_offset;
+            let slice_end = slice_start + record.length;
+            let buf_end = chunk_offset + buf.len() as u64;
+
+            let overlap_start = chunk_offset.max(slice_start);
+            let overlap_end = buf_end.min(slice_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+
+            let file_offset = overlap_start - slice_start;
+            let dst_start = (overlap_start - chunk_offset) as usize;
+            let dst_end = (overlap_end - chunk_offset) as usize;
+            let read_len = dst_end - dst_start;
+
+            let mut file = fs::File::open(&record.path).await?;
+            file.seek(std::io::SeekFrom::Start(file_offset)).await?;
+            file.read_exact(&mut buf[dst_start..dst_start + read_len]).await?;
+        }
+
         Ok(())
     }
 }

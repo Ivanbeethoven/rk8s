@@ -1737,10 +1737,35 @@ where
         buf: &mut [u8],
     ) -> anyhow::Result<()> {
         let writer = self.files.get(&ino).map(|entry| entry.value().clone());
-        if let Some(writer) = writer
-            && writer.has_pending().await
-        {
-            writer.overlay_dirty(offset, buf).await?;
+        match writer {
+            Some(ref writer) if writer.has_pending().await => {
+                writer.overlay_dirty(offset, buf).await?;
+            }
+            #[cfg(not(test))]
+            None => {
+                // SSD fallback: no in-memory writer exists for this inode.
+                // Covers the crash recovery window where dirty data is on
+                // SSD but hasn't been re-uploaded yet.
+                if let Some(wb) = &self.write_back {
+                    let layout = self.config.layout;
+                    let spans = split_chunk_spans(layout, offset, buf.len());
+                    for span in spans {
+                        let cid = chunk_id_for(ino as i64, span.index)?;
+                        let chunk_start = span.index * layout.chunk_size;
+                        let dst_start = (chunk_start + span.offset - offset) as usize;
+                        let dst_end = dst_start + span.len.as_usize();
+                        let _ = wb
+                            .overlay_dirty_range(
+                                ino as i64,
+                                cid,
+                                span.offset,
+                                &mut buf[dst_start..dst_end],
+                            )
+                            .await;
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
