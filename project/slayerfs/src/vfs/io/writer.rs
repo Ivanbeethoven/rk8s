@@ -1940,7 +1940,7 @@ mod tests {
 
     #[async_trait]
     impl BlockStore for BlockingStore {
-        async fn write_range(
+        async fn write_fresh_range(
             &self,
             key: BlockKey,
             offset: u64,
@@ -1949,7 +1949,7 @@ mod tests {
             while self.blocked.load(Ordering::Acquire) {
                 self.notify.notified().await;
             }
-            self.inner.write_range(key, offset, data).await
+            self.inner.write_fresh_range(key, offset, data).await
         }
 
         async fn read_range(
@@ -1970,7 +1970,7 @@ mod tests {
 
     #[async_trait]
     impl BlockStore for FailingStore {
-        async fn write_range(
+        async fn write_fresh_range(
             &self,
             _key: BlockKey,
             _offset: u64,

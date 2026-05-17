@@ -17,6 +17,7 @@
 pub mod cache;
 pub mod compact;
 pub mod layout;
+pub mod page_cache;
 pub mod reader;
 pub mod singleflight;
 pub mod slice;

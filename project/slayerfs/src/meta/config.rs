@@ -456,7 +456,7 @@ fn default_light_enabled() -> bool {
 }
 
 fn default_light_threshold() -> usize {
-    3
+    2
 }
 
 fn default_heavy_enabled() -> bool {
@@ -468,7 +468,7 @@ fn default_heavy_fragment_threshold() -> f64 {
 }
 
 fn default_heavy_slice_threshold() -> usize {
-    50
+    30
 }
 
 fn default_heavy_force_fragment_threshold() -> f64 {
@@ -518,11 +518,11 @@ pub struct CompactConfig {
 impl Default for CompactConfig {
     fn default() -> Self {
         Self {
-            min_slice_count: 5,
+            min_slice_count: 3,
             min_fragment_ratio: 0.1,
             async_threshold: 100,
-            sync_threshold: 350,
-            interval: Duration::from_secs(3600),
+            sync_threshold: 200,
+            interval: Duration::from_secs(600),
             max_chunks_per_run: 1000,
             max_concurrent_tasks: 4,
             lock_ttl: LockTtlConfig::default(),

@@ -3143,6 +3143,7 @@ async fn test_read_lock_shared() {
 
 #[serial]
 #[tokio::test]
+#[ignore = "requires Redis server"]
 async fn test_set_plock_succeeds_on_nonexistent_inode() {
     let store = new_test_store_with_epoch().await;
 
@@ -3172,6 +3173,7 @@ async fn test_set_plock_succeeds_on_nonexistent_inode() {
 
 #[serial]
 #[tokio::test]
+#[ignore = "requires Redis server"]
 async fn test_set_plock_succeeds_on_deleted_inode_via_unlink() {
     let store = new_test_store_with_epoch().await;
     let parent = store.root_ino();
@@ -3206,6 +3208,7 @@ async fn test_set_plock_succeeds_on_deleted_inode_via_unlink() {
 
 #[serial]
 #[tokio::test]
+#[ignore = "requires Redis server"]
 async fn test_blocking_set_plock_succeeds_after_unlink_releases_lock() {
     let store_a = new_test_store_with_epoch().await;
     let parent = store_a.root_ino();

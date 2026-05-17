@@ -1,5 +1,6 @@
 //! Storage backends: asynchronous block-level IO traits and in-memory implementations.
 
+use crate::chunk::page_cache::{ReadPageCache, PageKey};
 use crate::chunk::singleflight::SingleFlight;
 use crate::utils::NumCastExt;
 use crate::utils::zero::make_zero_bytes;
@@ -24,14 +25,12 @@ use tokio::{
 #[async_trait]
 // ensure offset_in_block + data.len() <= block_size
 pub trait BlockStore {
-    async fn write_range(&self, key: BlockKey, offset: u64, data: &[u8]) -> anyhow::Result<u64>;
-
     /// Write a new block without reading any existing data.
     ///
-    /// This exists to support COW-style writes where every write targets a fresh object/key.
-    /// In that model, read-modify-write is wasted IO because there is no old data to preserve.
-    /// Callers must ensure the target key is fresh; using this on an existing object would
-    /// drop any previous content outside the written range.
+    /// All writes use copy-on-write semantics: every write targets a fresh
+    /// object/key.  There is no read-modify-write path — callers must ensure
+    /// the target key is fresh; using this on an existing object would drop
+    /// any previous content outside the written range.
     #[tracing::instrument(level = "trace", skip(self, chunks), fields(key = ?key, offset, chunk_count = chunks.len()))]
     async fn write_fresh_vectored(
         &self,
@@ -46,15 +45,14 @@ pub trait BlockStore {
         self.write_fresh_range(key, offset, &data).await
     }
 
-    /// Write a new block without reading any existing data. See write_fresh_vectored for details.
+    /// Write a new block without reading any existing data.
+    /// Required — every store must implement COW writes directly.
     async fn write_fresh_range(
         &self,
         key: BlockKey,
         offset: u64,
         data: &[u8],
-    ) -> anyhow::Result<u64> {
-        self.write_range(key, offset, data).await
-    }
+    ) -> anyhow::Result<u64>;
 
     async fn read_range(&self, key: BlockKey, offset: u64, buf: &mut [u8]) -> anyhow::Result<()>;
 
@@ -89,7 +87,12 @@ impl InMemoryBlockStore {
 
 #[async_trait]
 impl BlockStore for InMemoryBlockStore {
-    async fn write_range(&self, key: BlockKey, offset: u64, data: &[u8]) -> anyhow::Result<u64> {
+    async fn write_fresh_range(
+        &self,
+        key: BlockKey,
+        offset: u64,
+        data: &[u8],
+    ) -> anyhow::Result<u64> {
         let mut guard = self.map.write().await;
         let entry = guard.entry(key).or_insert_with(Vec::new);
         let start = offset.as_usize();
@@ -132,6 +135,10 @@ impl BlockStore for InMemoryBlockStore {
 pub struct ObjectBlockStore<B: ObjectBackend> {
     client: ObjectClient<B>,
     block_cache: ChunksCache,
+    /// Page-granularity (64KB) read cache for small range reads that would
+    /// otherwise be discarded.  Intercepts repeated small random reads so they
+    /// hit memory instead of making a network round-trip every time.
+    page_cache: ReadPageCache,
     /// SingleFlight controller for coalescing concurrent reads to the same block
     /// Thread-safe and shared across the store lifetime so concurrent requests can coalesce.
     read_flight: SingleFlight<BlockKey, Bytes>,
@@ -147,6 +154,11 @@ pub struct BlockStoreConfig {
     /// For ranges smaller than this threshold, use direct range read instead of full block read
     /// Default is 25% of block size (1MB for 4MB blocks)
     pub range_read_threshold: f32,
+    /// Page size for the page-granularity read cache (default: 64KB).
+    /// Small range reads are aligned to page boundaries, fetched, and cached at this granularity.
+    pub page_size: usize,
+    /// Maximum number of pages in the read cache (default: 4096 → 256MB with 64KB pages).
+    pub page_cache_capacity: usize,
 }
 
 impl Default for BlockStoreConfig {
@@ -154,6 +166,8 @@ impl Default for BlockStoreConfig {
         Self {
             block_size: 4 * 1024 * 1024, // 4MB
             range_read_threshold: 0.25,  // 25% = 1MB for 4MB blocks
+            page_size: 64 * 1024,        // 64KB
+            page_cache_capacity: 4096,   // 4096 pages × 64KB = 256MB
         }
     }
 }
@@ -165,6 +179,12 @@ impl BlockStoreConfig {
         }
         if !(0.0..=1.0).contains(&self.range_read_threshold) {
             anyhow::bail!("range_read_threshold must be between 0.0 and 1.0");
+        }
+        if self.page_size == 0 {
+            anyhow::bail!("page_size must be greater than 0");
+        }
+        if self.page_cache_capacity == 0 {
+            anyhow::bail!("page_cache_capacity must be greater than 0");
         }
         Ok(())
     }
@@ -185,9 +205,11 @@ impl<B: ObjectBackend> ObjectBlockStore<B> {
             .unwrap();
         let config = BlockStoreConfig::default();
         config.validate().expect("default config must be valid");
+        let page_cache = ReadPageCache::new(config.page_cache_capacity, config.page_size);
         Self {
             client,
             block_cache,
+            page_cache,
             read_flight: SingleFlight::new(),
             config,
         }
@@ -214,9 +236,11 @@ impl<B: ObjectBackend> ObjectBlockStore<B> {
 
         let block_cache = block_on(ChunksCache::new_with_config(cache_config))
             .map_err(|e| anyhow::anyhow!("Failed to create cache: {}", e))?;
+        let page_cache = ReadPageCache::new(store_config.page_cache_capacity, store_config.page_size);
         Ok(Self {
             client,
             block_cache,
+            page_cache,
             read_flight: SingleFlight::new(),
             config: store_config,
         })
@@ -230,29 +254,6 @@ impl<B: ObjectBackend> ObjectBlockStore<B> {
 
 #[async_trait]
 impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
-    async fn write_range(&self, key: BlockKey, offset: u64, data: &[u8]) -> anyhow::Result<u64> {
-        let key_str = Self::key_for(key);
-        let mut buf = self
-            .client
-            .get_object(&key_str)
-            .await
-            .map_err(|e| anyhow::anyhow!("object store get failed: {:?}", e))?
-            .unwrap_or_default();
-
-        let start = offset.as_usize();
-        let end = start + data.len();
-        if buf.len() < end {
-            buf.resize(end, 0);
-        }
-        buf[start..end].copy_from_slice(data);
-        self.client
-            .put_object(&key_str, &buf)
-            .await
-            .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
-
-        Ok(data.len() as u64)
-    }
-
     #[tracing::instrument(name = "ObjectBlockStore.write_fresh_vectored", level = "trace", skip(self, chunks), fields(key = ?key, offset, chunk_count = chunks.len()))]
     async fn write_fresh_vectored(
         &self,
@@ -335,15 +336,67 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
         let range_size_threshold = self.config.range_size_threshold();
 
         if len <= range_size_threshold {
-            // Small range read — fetch only the requested range, don't cache
-            // partial blocks (not worth the complexity).
-            tracing::Span::current().record("strategy", "direct_range");
-            let read_len = self
-                .client
-                .get_object_range(&key_str, offset, buf)
-                .await
-                .map_err(|e| anyhow::anyhow!("object store range read failed: {key_str}, {e:?}"))?;
-            tracing::Span::current().record("read_len", read_len);
+            // Small range read — serve via page-granularity cache so that
+            // repeated small reads within the same 64KB page avoid a network
+            // round-trip.
+            let page_size = self.page_cache.page_size();
+            let start_page = offset as usize / page_size;
+            // end_page is inclusive
+            let end_page = (offset as usize + len - 1) / page_size;
+
+            let client = &self.client;
+            let page_cache = &self.page_cache;
+            let mut pos: usize = 0;
+            let mut total_read: usize = 0;
+
+            for page_idx in start_page..=end_page {
+                let page_start = page_idx * page_size;
+                let page_end = (page_start + page_size).min(self.config.block_size);
+
+                let cache_key: PageKey = (key.0, key.1, page_idx as u32);
+
+                let page_data = if let Some(cached) = page_cache.get(&cache_key).await {
+                    tracing::Span::current().record("strategy", "page_cache_hit");
+                    cached
+                } else {
+                    tracing::Span::current().record("strategy", "page_cache_miss");
+                    let range_offset = page_start as u64;
+                    let range_len = page_end - page_start;
+                    let mut page_buf = vec![0u8; range_len];
+                    let read_len = client
+                        .get_object_range(&key_str, range_offset, &mut page_buf)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("object store range read failed: {key_str}, {e:?}")
+                        })?;
+                    page_buf.truncate(read_len);
+                    let page_bytes = Bytes::from(page_buf);
+                    page_cache.insert(cache_key, page_bytes.clone()).await;
+                    page_bytes
+                };
+
+                // Determine the byte range within this page that the caller needs
+                let copy_start = if page_idx == start_page {
+                    offset as usize - page_start
+                } else {
+                    0
+                };
+                let copy_end = if page_idx == end_page {
+                    (offset as usize + len).saturating_sub(page_start)
+                } else {
+                    page_data.len()
+                };
+                let copy_end = copy_end.min(page_data.len());
+                if copy_end > copy_start {
+                    let copy_len = copy_end - copy_start;
+                    buf[pos..pos + copy_len]
+                        .copy_from_slice(&page_data[copy_start..copy_end]);
+                    pos += copy_len;
+                    total_read += copy_len;
+                }
+            }
+
+            tracing::Span::current().record("read_len", total_read);
             return Ok(());
         }
 
@@ -426,7 +479,7 @@ mod tests {
 
         let data = vec![7u8; layout.block_size as usize / 2];
         store
-            .write_range((42, 3), (layout.block_size / 4) as u64, &data)
+            .write_fresh_range((42, 3), (layout.block_size / 4) as u64, &data)
             .await
             .unwrap();
 
@@ -446,7 +499,7 @@ mod tests {
         let layout = ChunkLayout::default();
         let data = vec![7u8; layout.block_size as usize / 2];
         store
-            .write_range((42, 3), (layout.block_size / 4) as u64, &data)
+            .write_fresh_range((42, 3), (layout.block_size / 4) as u64, &data)
             .await
             .unwrap();
         // First read should miss the cache.
@@ -572,6 +625,7 @@ mod tests {
         let config = BlockStoreConfig {
             block_size: 4 * 1024 * 1024,
             range_read_threshold: 0.25, // 1MB threshold
+            ..Default::default()
         };
         let store = Arc::new(ObjectBlockStore::new_with_configs(
             client,
@@ -581,23 +635,40 @@ mod tests {
 
         backend.reset_stats();
 
-        // Small read (512KB < 1MB threshold) - should use range read
+        // Small read (512KB < 1MB threshold) — uses page cache.
+        // 512KB = 8 × 64KB pages, each page triggers one range GET on first access.
         let mut small_buf = vec![0u8; 512 * 1024];
         store.read_range((42, 3), 0, &mut small_buf).await?;
 
         let stats = backend.get_stats();
         assert_eq!(
-            stats.get_object_range_calls, 1,
-            "Small read should use range read"
+            stats.get_object_range_calls, 8,
+            "512KB read should fetch 8 pages (8 × 64KB range reads)"
         );
         assert_eq!(
             stats.get_object_calls, 0,
-            "Small read should not use full read"
+            "Small read should not use full block read"
+        );
+
+        // Same read again — all pages should hit the page cache, zero new backend calls.
+        backend.reset_stats();
+        let mut small_buf2 = vec![0u8; 512 * 1024];
+        store.read_range((42, 3), 0, &mut small_buf2).await?;
+        assert_eq!(small_buf, small_buf2);
+
+        let stats = backend.get_stats();
+        assert_eq!(
+            stats.get_object_range_calls, 0,
+            "Re-read of same range should hit page cache (no new range reads)"
+        );
+        assert_eq!(
+            stats.get_object_calls, 0,
+            "Re-read should not fall back to full block read"
         );
 
         backend.reset_stats();
 
-        // Large read (2MB > 1MB threshold) - should use full read
+        // Large read (2MB > 1MB threshold) — should use full block read.
         let mut large_buf = vec![0u8; 2 * 1024 * 1024];
         store.read_range((42, 3), 0, &mut large_buf).await?;
 
@@ -608,14 +679,15 @@ mod tests {
             "Large read should not use range read"
         );
 
-        // Concurrent large reads should coalesce to a single backend call
+        // Concurrent large reads for a DIFFERENT (uncached) block should
+        // coalesce to a single backend call via SingleFlight.
         backend.reset_stats();
         let handles: Vec<_> = (0..5)
             .map(|_| {
                 let store = store.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 2 * 1024 * 1024];
-                    store.read_range((42, 3), 0, &mut buf).await
+                    store.read_range((99, 1), 0, &mut buf).await
                 })
             })
             .collect();

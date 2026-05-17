@@ -81,7 +81,9 @@ pub struct CompactionWorkerConfig {
 impl Default for CompactionWorkerConfig {
     fn default() -> Self {
         Self {
-            scan_interval: Duration::from_secs(3600),
+            // Scan every 10 minutes instead of every hour so fragmentation is
+            // caught sooner.  Scanning is cheap — it only queries metadata.
+            scan_interval: Duration::from_secs(600),
             max_chunks_per_run: 100,
             enabled: true,
         }
