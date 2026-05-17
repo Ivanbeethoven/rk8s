@@ -1331,6 +1331,55 @@ where
                 // waiting on a Readonly slice with no uploader.  Re-kick it here
                 // so FUSE flush/truncate cannot wait forever on commit progress.
                 if runtime.frozen {
+                    use crate::vfs::cache::config::WriteBackMode;
+
+                    let early_committed = if matches!(
+                        shared.config.writeback_mode,
+                        WriteBackMode::CommitBeforeUpload
+                    ) {
+                        // CommitBeforeUpload: commit metadata immediately while
+                        // upload proceeds in background.
+                        let desc = SliceHandle {
+                            slice: &slice,
+                            shared: &shared,
+                        }
+                        .desc_for_commit();
+
+                        if let Some(desc) = desc {
+                            let (ino, chunk_index) =
+                                extract_ino_and_chunk_index(desc.chunk_id);
+                            let file_offset =
+                                chunk_index * shared.config.layout.chunk_size + desc.offset;
+                            let new_size = file_offset + desc.length;
+
+                            let ok = shared
+                                .backend
+                                .meta()
+                                .write(ino, desc.chunk_id, desc, new_size)
+                                .await
+                                .is_ok();
+
+                            if ok {
+                                SliceHandle {
+                                    slice: &slice,
+                                    shared: &shared,
+                                }
+                                .mark_committed();
+                                shared.inode.set_committed_size(new_size);
+                            }
+                            ok
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if early_committed {
+                        Self::pop_front_slice(&shared, chunk_id).await;
+                        continue;
+                    }
+
                     if handle.can_continue_upload() {
                         Self::spawn_flush_slice(shared.clone(), slice.clone());
                     }

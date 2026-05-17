@@ -69,6 +69,8 @@ pub struct WriteConfig {
     pub freeze_min_bytes: u64,
     /// Maximum age of a Writable slice before auto_flush freezes it.
     pub auto_flush_max_age: Duration,
+    /// Controls ordering of upload vs metadata commit.
+    pub writeback_mode: crate::vfs::cache::config::WriteBackMode,
 }
 
 impl Default for WriteConfig {
@@ -86,6 +88,7 @@ impl Default for WriteConfig {
             auto_flush_max_age: Duration::from_millis(500),
             #[cfg(test)]
             auto_flush_max_age: Duration::from_millis(5),
+            writeback_mode: crate::vfs::cache::config::WriteBackMode::UploadBeforeCommit,
         }
     }
 }
