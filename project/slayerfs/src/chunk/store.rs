@@ -63,6 +63,7 @@ pub trait BlockStore {
 
     /// Proactively insert a block into the read cache after upload.
     /// Default is a no-op; ObjectBlockStore overrides to populate ChunksCache.
+    #[allow(dead_code)]
     async fn cache_block(&self, _key: BlockKey, _data: &[u8]) -> anyhow::Result<()> {
         Ok(())
     }
@@ -396,6 +397,7 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn cache_block(&self, key: BlockKey, data: &[u8]) -> anyhow::Result<()> {
         let key_str = Self::key_for(key);
         let _ = self.block_cache.insert(&key_str, &data.to_vec()).await;
