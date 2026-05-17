@@ -75,6 +75,11 @@ pub struct WriteConfig {
 
 impl Default for WriteConfig {
     fn default() -> Self {
+        let writeback_mode = match std::env::var("SLAYERFS_WRITEBACK_MODE").ok().as_deref() {
+            Some("commit_first") => crate::vfs::cache::config::WriteBackMode::CommitBeforeUpload,
+            _ => crate::vfs::cache::config::WriteBackMode::UploadBeforeCommit,
+        };
+
         Self {
             layout: ChunkLayout::default(),
             page_size: DEFAULT_PAGE_SIZE,
@@ -88,7 +93,7 @@ impl Default for WriteConfig {
             auto_flush_max_age: Duration::from_millis(500),
             #[cfg(test)]
             auto_flush_max_age: Duration::from_millis(5),
-            writeback_mode: crate::vfs::cache::config::WriteBackMode::UploadBeforeCommit,
+            writeback_mode,
         }
     }
 }
@@ -130,6 +135,13 @@ impl WriteConfig {
     pub fn auto_flush_max_age(self, auto_flush_max_age: Duration) -> Self {
         Self {
             auto_flush_max_age,
+            ..self
+        }
+    }
+
+    pub fn writeback_mode(self, writeback_mode: crate::vfs::cache::config::WriteBackMode) -> Self {
+        Self {
+            writeback_mode,
             ..self
         }
     }
