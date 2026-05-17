@@ -10,9 +10,9 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::io::Write;
 use std::io::{IoSlice, IoSliceMut};
 use std::ops::{Deref, DerefMut};
+use std::os::fd::AsRawFd;
 #[cfg(any(
     all(target_os = "linux", feature = "unprivileged"),
     target_os = "freebsd",
@@ -21,6 +21,7 @@ use std::os::fd::OwnedFd;
 use std::os::fd::{AsFd, BorrowedFd};
 #[cfg(target_os = "freebsd")]
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::FromRawFd;
 #[cfg(any(
     target_os = "macos",
     all(target_os = "linux", feature = "unprivileged")
@@ -212,6 +213,23 @@ impl FuseConnection {
         })
     }
 
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            unmount_notify: self.unmount_notify.clone(),
+            mode: match &self.mode {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                ConnectionMode::Block(connection) => ConnectionMode::Block(connection.try_clone()?),
+                #[cfg(any(
+                    all(target_os = "linux", feature = "unprivileged"),
+                    target_os = "freebsd",
+                ))]
+                ConnectionMode::NonBlock(connection) => {
+                    ConnectionMode::NonBlock(connection.try_clone()?)
+                }
+            },
+        })
+    }
+
     pub async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
         &self,
         header_buf: Vec<u8>,
@@ -246,7 +264,10 @@ impl FuseConnection {
         }
     }
 
-    pub async fn write_vectored<T: Deref<Target = [u8]> + Send, U: Deref<Target = [u8]> + Send>(
+    pub async fn write_vectored<
+        T: Deref<Target = [u8]> + Send + 'static,
+        U: Deref<Target = [u8]> + Send + 'static,
+    >(
         &self,
         data: T,
         body_extend_data: Option<U>,
@@ -444,60 +465,98 @@ impl BlockFuseConnection {
         })
     }
 
+    fn try_clone(&self) -> io::Result<Self> {
+        let fd = self.file.as_raw_fd();
+        let new_fd = unsafe { libc::dup(fd) };
+        if new_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { File::from_raw_fd(new_fd) };
+        Ok(Self {
+            file,
+            read: Mutex::new(()),
+            write: Mutex::new(()),
+        })
+    }
+
     async fn read_vectored<T: DerefMut<Target = [u8]> + Send + 'static>(
         &self,
-        mut header_buf: Vec<u8>,
-        mut data_buf: T,
+        header_buf: Vec<u8>,
+        data_buf: T,
     ) -> CompleteIoResult<(Vec<u8>, T), usize> {
-        use std::io::Read;
-        use std::mem::ManuallyDrop;
-        use std::os::fd::{AsRawFd, FromRawFd};
-
         let _guard = self.read.lock().await;
         let fd = self.file.as_raw_fd();
 
-        let ((header_buf, data_buf), res) = task::spawn_blocking(move || {
-            // Safety: when we call read, the fd is still valid, when fd is closed and file is
-            // dropped, the read operation will return error
-            let file = unsafe { File::from_raw_fd(fd) };
-            // avoid close the file
-            let mut file = ManuallyDrop::new(file);
-
-            let res = file.read_vectored(&mut [
-                IoSliceMut::new(&mut header_buf),
-                IoSliceMut::new(&mut data_buf),
-            ]);
-
-            ((header_buf, data_buf), res)
+        task::spawn_blocking(move || {
+            let mut iov = [
+                libc::iovec {
+                    iov_base: header_buf.as_ptr() as *mut libc::c_void,
+                    iov_len: header_buf.len(),
+                },
+                libc::iovec {
+                    iov_base: data_buf.as_ptr() as *mut libc::c_void,
+                    iov_len: data_buf.len(),
+                },
+            ];
+            let n = unsafe { libc::readv(fd, iov.as_mut_ptr(), 2) };
+            if n < 0 {
+                ((header_buf, data_buf), Err(io::Error::last_os_error()))
+            } else {
+                ((header_buf, data_buf), Ok(n as usize))
+            }
         })
         .await
-        .unwrap();
-
-        ((header_buf, data_buf), res)
+        .unwrap()
     }
 
-    async fn write_vectored<T: Deref<Target = [u8]> + Send, U: Deref<Target = [u8]> + Send>(
+    async fn write_vectored<
+        T: Deref<Target = [u8]> + Send + 'static,
+        U: Deref<Target = [u8]> + Send + 'static,
+    >(
         &self,
         data: T,
         body_extend_data: Option<U>,
     ) -> CompleteIoResult<(T, Option<U>), usize> {
         let _guard = self.write.lock().await;
+        let fd = self.file.as_raw_fd();
 
-        let res = {
-            let body_extend_data = body_extend_data.as_deref();
-
-            match body_extend_data {
-                None => (&self.file).write_vectored(&[IoSlice::new(data.deref())]),
-
-                Some(body_extend_data) => (&self.file)
-                    .write_vectored(&[IoSlice::new(data.deref()), IoSlice::new(body_extend_data)]),
+        task::spawn_blocking(move || {
+            let body = body_extend_data.as_deref();
+            match body {
+                None => {
+                    let iov = [libc::iovec {
+                        iov_base: data.deref().as_ptr() as *mut libc::c_void,
+                        iov_len: data.deref().len(),
+                    }];
+                    let n = unsafe { libc::writev(fd, iov.as_ptr(), 1) };
+                    if n < 0 {
+                        ((data, body_extend_data), Err(io::Error::last_os_error()))
+                    } else {
+                        ((data, body_extend_data), Ok(n as usize))
+                    }
+                }
+                Some(body_data) => {
+                    let iov = [
+                        libc::iovec {
+                            iov_base: data.deref().as_ptr() as *mut libc::c_void,
+                            iov_len: data.deref().len(),
+                        },
+                        libc::iovec {
+                            iov_base: body_data.as_ptr() as *mut libc::c_void,
+                            iov_len: body_data.len(),
+                        },
+                    ];
+                    let n = unsafe { libc::writev(fd, iov.as_ptr(), 2) };
+                    if n < 0 {
+                        ((data, body_extend_data), Err(io::Error::last_os_error()))
+                    } else {
+                        ((data, body_extend_data), Ok(n as usize))
+                    }
+                }
             }
-        };
-
-        match res {
-            Err(err) => ((data, body_extend_data), Err(err)),
-            Ok(n) => ((data, body_extend_data), Ok(n)),
-        }
+        })
+        .await
+        .unwrap()
     }
 }
 
@@ -645,6 +704,21 @@ impl NonBlockFuseConnection {
         Ok(())
     }
 
+    fn try_clone(&self) -> io::Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let fd = self.fd.as_raw_fd();
+        let new_fd = unsafe { libc::dup(fd) };
+        if new_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let owned_fd = unsafe { OwnedFd::from_raw_fd(new_fd) };
+        Ok(Self {
+            fd: AsyncFd::new(owned_fd)?,
+            read: Mutex::new(()),
+            write: Mutex::new(()),
+        })
+    }
+
     async fn read_vectored<T: DerefMut<Target = [u8]> + Send>(
         &self,
         mut header_buf: Vec<u8>,
@@ -675,7 +749,10 @@ impl NonBlockFuseConnection {
         }
     }
 
-    async fn write_vectored<T: Deref<Target = [u8]> + Send, U: Deref<Target = [u8]> + Send>(
+    async fn write_vectored<
+        T: Deref<Target = [u8]> + Send + 'static,
+        U: Deref<Target = [u8]> + Send + 'static,
+    >(
         &self,
         data: T,
         body_extend_data: Option<U>,

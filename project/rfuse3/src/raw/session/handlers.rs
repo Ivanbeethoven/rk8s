@@ -1,16 +1,17 @@
 //! Handler functions for FUSE operations.
 //!
-//! Each `worker_*` function processes a specific FUSE opcode in the worker pool.
+//! Each `handle_*_inline` function processes a specific FUSE opcode in the worker pool.
+//! The `WorkItem` (containing `InflightGuard`) is held until the FS operation completes,
+//! ensuring backpressure is accurate.
 
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::pin::pin;
-use std::sync::Arc;
 
 use bincode::Options;
 use futures_util::future::Either;
 use futures_util::stream::StreamExt;
-use tracing::{debug, debug_span, error};
+use tracing::{debug, error};
 
 use crate::helper::*;
 use crate::notify::Notify;
@@ -20,10 +21,10 @@ use crate::raw::reply::ReplyXAttr;
 use crate::raw::request::Request;
 use crate::{Errno, SetAttr};
 
-use super::utils::{apply_direct_io, reply_error_in_worker, spawn};
+use super::utils::{apply_direct_io, reply_error_in_worker};
 use super::worker::{DispatchCtx, WorkItem};
-pub(super) async fn worker_lookup<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_lookup_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let name = match get_first_null_position(&item.data) {
@@ -31,41 +32,37 @@ pub(super) async fn worker_lookup<FS: Filesystem + Send + Sync + 'static>(
             debug!(unique = item.unique, "lookup body has no null (worker)");
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(idx) => OsString::from_vec(item.data[..idx].to_vec()),
     };
     let parent = item.in_header.nodeid;
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
-    spawn(debug_span!("fuse_lookup_worker"), async move {
-        debug!(unique = item.unique, parent, ?name, "lookup (worker)");
-        let data = match fs.lookup(Request::from(&item), parent, &name).await {
-            Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
-            Ok(entry) => {
-                let entry_out: fuse_entry_out = entry.into();
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE);
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("serialize header");
-                get_bincode_config()
-                    .serialize_into(&mut data, &entry_out)
-                    .expect("serialize entry");
-                data
-            }
-        };
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    debug!(unique = item.unique, parent, ?name, "lookup (worker)");
+    let data = match ctx.fs.lookup(Request::from(&item), parent, &name).await {
+        Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
+        Ok(entry) => {
+            let entry_out: fuse_entry_out = entry.into();
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data, &out_header)
+                .expect("serialize header");
+            get_bincode_config()
+                .serialize_into(&mut data, &entry_out)
+                .expect("serialize entry");
+            data
+        }
+    };
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_getattr<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_getattr_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let getattr_in = match get_bincode_config().deserialize::<fuse_getattr_in>(&item.data) {
@@ -76,7 +73,7 @@ pub(super) async fn worker_getattr<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
@@ -86,52 +83,49 @@ pub(super) async fn worker_getattr<FS: Filesystem + Send + Sync + 'static>(
     } else {
         None
     };
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
-    spawn(debug_span!("fuse_getattr_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            "getattr (worker)"
-        );
-        let data = match fs
-            .getattr(
-                Request::from(&item),
-                item.in_header.nodeid,
-                fh,
-                getattr_in.getattr_flags,
-            )
-            .await
-        {
-            Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
-            Ok(attr) => {
-                let attr_out = fuse_attr_out {
-                    attr_valid: attr.ttl.as_secs(),
-                    attr_valid_nsec: attr.ttl.subsec_nanos(),
-                    dummy: getattr_in.dummy,
-                    attr: attr.attr.into(),
-                };
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_ATTR_OUT_SIZE) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_ATTR_OUT_SIZE);
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("serialize header");
-                get_bincode_config()
-                    .serialize_into(&mut data, &attr_out)
-                    .expect("serialize attr_out");
-                data
-            }
-        };
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        "getattr (worker)"
+    );
+    let data = match ctx
+        .fs
+        .getattr(
+            Request::from(&item),
+            item.in_header.nodeid,
+            fh,
+            getattr_in.getattr_flags,
+        )
+        .await
+    {
+        Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
+        Ok(attr) => {
+            let attr_out = fuse_attr_out {
+                attr_valid: attr.ttl.as_secs(),
+                attr_valid_nsec: attr.ttl.subsec_nanos(),
+                dummy: getattr_in.dummy,
+                attr: attr.attr.into(),
+            };
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + FUSE_ATTR_OUT_SIZE) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_ATTR_OUT_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data, &out_header)
+                .expect("serialize header");
+            get_bincode_config()
+                .serialize_into(&mut data, &attr_out)
+                .expect("serialize attr_out");
+            data
+        }
+    };
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_open<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_open_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let open_in = match get_bincode_config().deserialize::<fuse_open_in>(&item.data) {
@@ -142,50 +136,47 @@ pub(super) async fn worker_open<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
-    let fs = ctx.fs.clone();
-    let resp = ctx.resp.clone();
     let direct_io = ctx.direct_io;
-    spawn(debug_span!("fuse_open_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            flags = open_in.flags,
-            "open (worker)"
-        );
-        let data = match fs
-            .open(Request::from(&item), item.in_header.nodeid, open_in.flags)
-            .await
-        {
-            Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
-            Ok(opened) => {
-                let mut open_out: fuse_open_out = opened.into();
-                apply_direct_io(&mut open_out.open_flags, direct_io);
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_OPEN_OUT_SIZE) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_OPEN_OUT_SIZE);
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("serialize header");
-                get_bincode_config()
-                    .serialize_into(&mut data, &open_out)
-                    .expect("serialize open_out");
-                data
-            }
-        };
-        let _ = resp.unbounded_send(Either::Left(data));
-    });
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        flags = open_in.flags,
+        "open (worker)"
+    );
+    let data = match ctx
+        .fs
+        .open(Request::from(&item), item.in_header.nodeid, open_in.flags)
+        .await
+    {
+        Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
+        Ok(opened) => {
+            let mut open_out: fuse_open_out = opened.into();
+            apply_direct_io(&mut open_out.open_flags, direct_io);
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + FUSE_OPEN_OUT_SIZE) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_OPEN_OUT_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data, &out_header)
+                .expect("serialize header");
+            get_bincode_config()
+                .serialize_into(&mut data, &open_out)
+                .expect("serialize open_out");
+            data
+        }
+    };
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_read<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_read_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let read_in = match get_bincode_config().deserialize::<fuse_read_in>(&item.data) {
@@ -196,63 +187,62 @@ pub(super) async fn worker_read<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
-    let fs = ctx.fs.clone();
-    let resp = ctx.resp.clone();
-    spawn(debug_span!("fuse_read_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            size = read_in.size,
-            offset = read_in.offset,
-            "read (worker)"
-        );
-        let mut reply_data = match fs
-            .read(
-                Request::from(&item),
-                item.in_header.nodeid,
-                read_in.fh,
-                read_in.offset,
-                read_in.size,
-            )
-            .await
-        {
-            Err(err) => {
-                let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                let _ = resp.unbounded_send(Either::Left(data));
-                return;
-            }
-            Ok(reply) => reply.data,
-        };
-        if reply_data.len() > read_in.size as usize {
-            reply_data.truncate(read_in.size as usize);
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        size = read_in.size,
+        offset = read_in.offset,
+        "read (worker)"
+    );
+    let mut reply_data = match ctx
+        .fs
+        .read(
+            Request::from(&item),
+            item.in_header.nodeid,
+            read_in.fh,
+            read_in.offset,
+            read_in.size,
+        )
+        .await
+    {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+            return;
         }
-        let out_header = fuse_out_header {
-            len: (FUSE_OUT_HEADER_SIZE + reply_data.len()) as u32,
-            error: 0,
-            unique: item.unique,
-        };
-        let mut data_buf = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
-        get_bincode_config()
-            .serialize_into(&mut data_buf, &out_header)
-            .expect("serialize header");
-        let _ = resp.unbounded_send(Either::Right((data_buf, reply_data)));
-    });
+        Ok(reply) => reply.data,
+    };
+    if reply_data.len() > read_in.size as usize {
+        reply_data.truncate(read_in.size as usize);
+    }
+    let out_header = fuse_out_header {
+        len: (FUSE_OUT_HEADER_SIZE + reply_data.len()) as u32,
+        error: 0,
+        unique: item.unique,
+    };
+    let mut data_buf = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
+    get_bincode_config()
+        .serialize_into(&mut data_buf, &out_header)
+        .expect("serialize header");
+    let _ = ctx
+        .resp_for(item.unique)
+        .unbounded_send(Either::Right((data_buf, reply_data)));
 }
 
-pub(super) async fn worker_write<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_write_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     if item.data.len() < FUSE_WRITE_IN_SIZE {
         // malformed
         let data =
             reply_error_in_worker(libc::EINVAL.into(), item.unique).expect("serialize out_header");
-        let _ = ctx.resp.unbounded_send(Either::Left(data));
+        let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
         return;
     }
     let write_in =
@@ -264,7 +254,7 @@ pub(super) async fn worker_write<FS: Filesystem + Send + Sync + 'static>(
                 );
                 let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                     .expect("serialize out_header");
-                let _ = ctx.resp.unbounded_send(Either::Left(data));
+                let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
                 return;
             }
             Ok(v) => v,
@@ -273,57 +263,56 @@ pub(super) async fn worker_write<FS: Filesystem + Send + Sync + 'static>(
     if write_in.size as usize != payload.len() {
         let data =
             reply_error_in_worker(libc::EINVAL.into(), item.unique).expect("serialize out_header");
-        let _ = ctx.resp.unbounded_send(Either::Left(data));
+        let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
         return;
     }
     // Use Bytes::slice for zero-copy - creates a new Bytes sharing the same underlying data
     let payload_bytes = item.data.slice(FUSE_WRITE_IN_SIZE..);
-    let fs = ctx.fs.clone();
-    let resp = ctx.resp.clone();
-    spawn(debug_span!("fuse_write_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            size = write_in.size,
-            offset = write_in.offset,
-            "write (worker)"
-        );
-        let write_out_data = match fs
-            .write(
-                Request::from(&item),
-                item.in_header.nodeid,
-                write_in.fh,
-                write_in.offset,
-                &payload_bytes,
-                write_in.write_flags,
-                write_in.flags,
-            )
-            .await
-        {
-            Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
-            Ok(reply_write) => {
-                let write_out: fuse_write_out = reply_write.into();
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE);
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("serialize header");
-                get_bincode_config()
-                    .serialize_into(&mut data, &write_out)
-                    .expect("serialize write_out");
-                data
-            }
-        };
-        let _ = resp.unbounded_send(Either::Left(write_out_data));
-    });
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        size = write_in.size,
+        offset = write_in.offset,
+        "write (worker)"
+    );
+    let write_out_data = match ctx
+        .fs
+        .write(
+            Request::from(&item),
+            item.in_header.nodeid,
+            write_in.fh,
+            write_in.offset,
+            &payload_bytes,
+            write_in.write_flags,
+            write_in.flags,
+        )
+        .await
+    {
+        Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
+        Ok(reply_write) => {
+            let write_out: fuse_write_out = reply_write.into();
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data, &out_header)
+                .expect("serialize header");
+            get_bincode_config()
+                .serialize_into(&mut data, &write_out)
+                .expect("serialize write_out");
+            data
+        }
+    };
+    let _ = ctx
+        .resp_for(item.unique)
+        .unbounded_send(Either::Left(write_out_data));
 }
 
-pub(super) async fn worker_readdir<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_readdir_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     // need mount options to check force_readdir_plus; currently not in ctx, so just execute kernel-side ENOSYS logic inline here is impossible.
@@ -336,89 +325,88 @@ pub(super) async fn worker_readdir<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
-    let fs = ctx.fs.clone();
-    let resp = ctx.resp.clone();
-    spawn(debug_span!("fuse_readdir_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            fh = read_in.fh,
-            offset = read_in.offset,
-            "readdir (worker)"
-        );
-        let reply_readdir = match fs
-            .readdir(
-                Request::from(&item),
-                item.in_header.nodeid,
-                read_in.fh,
-                read_in.offset as i64,
-            )
-            .await
-        {
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        fh = read_in.fh,
+        offset = read_in.offset,
+        "readdir (worker)"
+    );
+    let reply_readdir = match ctx
+        .fs
+        .readdir(
+            Request::from(&item),
+            item.in_header.nodeid,
+            read_in.fh,
+            read_in.offset as i64,
+        )
+        .await
+    {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+            return;
+        }
+        Ok(r) => r,
+    };
+    let max_size = read_in.size as usize;
+    let mut entry_data = Vec::with_capacity(max_size);
+    let mut entries = pin!(reply_readdir.entries);
+    while let Some(entry) = entries.next().await {
+        let entry = match entry {
             Err(err) => {
-                let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                let _ = resp.unbounded_send(Either::Left(data));
+                let out_header = fuse_out_header {
+                    len: FUSE_OUT_HEADER_SIZE as u32,
+                    error: err.into(),
+                    unique: item.unique,
+                };
+                let data = get_bincode_config()
+                    .serialize(&out_header)
+                    .expect("serialize out_header");
+                let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
                 return;
             }
-            Ok(r) => r,
+            Ok(e) => e,
         };
-        let max_size = read_in.size as usize;
-        let mut entry_data = Vec::with_capacity(max_size);
-        let mut entries = pin!(reply_readdir.entries);
-        while let Some(entry) = entries.next().await {
-            let entry = match entry {
-                Err(err) => {
-                    let out_header = fuse_out_header {
-                        len: FUSE_OUT_HEADER_SIZE as u32,
-                        error: err.into(),
-                        unique: item.unique,
-                    };
-                    let data = get_bincode_config()
-                        .serialize(&out_header)
-                        .expect("serialize out_header");
-                    let _ = resp.unbounded_send(Either::Left(data));
-                    return;
-                }
-                Ok(e) => e,
-            };
-            let name = &entry.name;
-            let dir_entry_size = FUSE_DIRENT_SIZE + name.len();
-            let padding_size = get_padding_size(dir_entry_size);
-            if entry_data.len() + dir_entry_size > max_size {
-                break;
-            }
-            let dir_entry = fuse_dirent {
-                ino: entry.inode,
-                off: entry.offset as u64,
-                namelen: name.len() as u32,
-                r#type: mode_from_kind_and_perm(entry.kind, 0) >> 12,
-            };
-            get_bincode_config()
-                .serialize_into(&mut entry_data, &dir_entry)
-                .expect("serialize dirent");
-            entry_data.extend_from_slice(name.as_bytes());
-            entry_data.resize(entry_data.len() + padding_size, 0);
+        let name = &entry.name;
+        let dir_entry_size = FUSE_DIRENT_SIZE + name.len();
+        let padding_size = get_padding_size(dir_entry_size);
+        if entry_data.len() + dir_entry_size > max_size {
+            break;
         }
-        let out_header = fuse_out_header {
-            len: (FUSE_OUT_HEADER_SIZE + entry_data.len()) as u32,
-            error: 0,
-            unique: item.unique,
+        let dir_entry = fuse_dirent {
+            ino: entry.inode,
+            off: entry.offset as u64,
+            namelen: name.len() as u32,
+            r#type: mode_from_kind_and_perm(entry.kind, 0) >> 12,
         };
-        let mut data_buf = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
         get_bincode_config()
-            .serialize_into(&mut data_buf, &out_header)
-            .expect("serialize header");
-        let _ = resp.unbounded_send(Either::Right((data_buf, entry_data.into())));
-    });
+            .serialize_into(&mut entry_data, &dir_entry)
+            .expect("serialize dirent");
+        entry_data.extend_from_slice(name.as_bytes());
+        entry_data.resize(entry_data.len() + padding_size, 0);
+    }
+    let out_header = fuse_out_header {
+        len: (FUSE_OUT_HEADER_SIZE + entry_data.len()) as u32,
+        error: 0,
+        unique: item.unique,
+    };
+    let mut data_buf = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
+    get_bincode_config()
+        .serialize_into(&mut data_buf, &out_header)
+        .expect("serialize header");
+    let _ = ctx
+        .resp_for(item.unique)
+        .unbounded_send(Either::Right((data_buf, entry_data.into())));
 }
 
-pub(super) async fn worker_setattr<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_setattr_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let setattr_in = match get_bincode_config().deserialize::<fuse_setattr_in>(&item.data) {
@@ -429,98 +417,92 @@ pub(super) async fn worker_setattr<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
-    spawn(debug_span!("fuse_setattr_worker"), async move {
-        let set_attr = SetAttr::from(&setattr_in);
-        let fh = if setattr_in.valid & FATTR_FH > 0 {
-            Some(setattr_in.fh)
-        } else {
-            None
-        };
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            "setattr (worker)"
-        );
-        let data = match fs
-            .setattr(Request::from(&item), item.in_header.nodeid, fh, set_attr)
-            .await
-        {
-            Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
-            Ok(attr) => {
-                let attr_out: fuse_attr_out = attr.into();
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_ATTR_OUT_SIZE) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_ATTR_OUT_SIZE);
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("serialize header");
-                get_bincode_config()
-                    .serialize_into(&mut data, &attr_out)
-                    .expect("serialize attr_out");
-                data
-            }
-        };
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    let set_attr = SetAttr::from(&setattr_in);
+    let fh = if setattr_in.valid & FATTR_FH > 0 {
+        Some(setattr_in.fh)
+    } else {
+        None
+    };
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        "setattr (worker)"
+    );
+    let data = match ctx
+        .fs
+        .setattr(Request::from(&item), item.in_header.nodeid, fh, set_attr)
+        .await
+    {
+        Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
+        Ok(attr) => {
+            let attr_out: fuse_attr_out = attr.into();
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + FUSE_ATTR_OUT_SIZE) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_ATTR_OUT_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data, &out_header)
+                .expect("serialize header");
+            get_bincode_config()
+                .serialize_into(&mut data, &attr_out)
+                .expect("serialize attr_out");
+            data
+        }
+    };
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_readlink<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_readlink_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
-    spawn(debug_span!("fuse_readlink_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            "readlink (worker)"
-        );
-        let data = match fs
-            .readlink(Request::from(&item), item.in_header.nodeid)
-            .await
-        {
-            Err(err) => {
-                let out_header = fuse_out_header {
-                    len: FUSE_OUT_HEADER_SIZE as u32,
-                    error: err.into(),
-                    unique: item.unique,
-                };
-                Either::Left(
-                    get_bincode_config()
-                        .serialize(&out_header)
-                        .expect("serialize out_header"),
-                )
-            }
-            Ok(data) => {
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + data.data.len()) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data_buf = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        "readlink (worker)"
+    );
+    let data = match ctx
+        .fs
+        .readlink(Request::from(&item), item.in_header.nodeid)
+        .await
+    {
+        Err(err) => {
+            let out_header = fuse_out_header {
+                len: FUSE_OUT_HEADER_SIZE as u32,
+                error: err.into(),
+                unique: item.unique,
+            };
+            Either::Left(
                 get_bincode_config()
-                    .serialize_into(&mut data_buf, &out_header)
-                    .expect("serialize header");
-                Either::Right((data_buf, data.data))
-            }
-        };
-        let _ = resp_sender.unbounded_send(data);
-    });
+                    .serialize(&out_header)
+                    .expect("serialize out_header"),
+            )
+        }
+        Ok(data) => {
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + data.data.len()) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data_buf = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data_buf, &out_header)
+                .expect("serialize header");
+            Either::Right((data_buf, data.data))
+        }
+    };
+    let _ = ctx.resp_for(item.unique).unbounded_send(data);
 }
 
-pub(super) async fn worker_symlink<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_symlink_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let (name, first_null_index) = match get_first_null_position(&item.data) {
@@ -528,7 +510,7 @@ pub(super) async fn worker_symlink<FS: Filesystem + Send + Sync + 'static>(
             debug!(unique = item.unique, "symlink has no null (worker)");
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(index) => (OsString::from_vec(item.data[..index].to_vec()), index),
@@ -539,50 +521,47 @@ pub(super) async fn worker_symlink<FS: Filesystem + Send + Sync + 'static>(
             debug!(unique = item.unique, "symlink has no second null (worker)");
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(index) => OsString::from_vec(data[..index].to_vec()),
     };
     let parent = item.in_header.nodeid;
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
-    spawn(debug_span!("fuse_symlink_worker"), async move {
-        debug!(
-            unique = item.unique,
-            parent,
-            ?name,
-            ?link_name,
-            "symlink (worker)"
-        );
-        let data = match fs
-            .symlink(Request::from(&item), parent, &name, &link_name)
-            .await
-        {
-            Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
-            Ok(entry) => {
-                let entry_out: fuse_entry_out = entry.into();
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE);
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("serialize header");
-                get_bincode_config()
-                    .serialize_into(&mut data, &entry_out)
-                    .expect("serialize entry");
-                data
-            }
-        };
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    debug!(
+        unique = item.unique,
+        parent,
+        ?name,
+        ?link_name,
+        "symlink (worker)"
+    );
+    let data = match ctx
+        .fs
+        .symlink(Request::from(&item), parent, &name, &link_name)
+        .await
+    {
+        Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
+        Ok(entry) => {
+            let entry_out: fuse_entry_out = entry.into();
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data, &out_header)
+                .expect("serialize header");
+            get_bincode_config()
+                .serialize_into(&mut data, &entry_out)
+                .expect("serialize entry");
+            data
+        }
+    };
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_mknod<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_mknod_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let mknod_in = match get_bincode_config().deserialize::<fuse_mknod_in>(&item.data) {
@@ -593,7 +572,7 @@ pub(super) async fn worker_mknod<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
@@ -607,57 +586,54 @@ pub(super) async fn worker_mknod<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(index) => OsString::from_vec(data[..index].to_vec()),
     };
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
-    spawn(debug_span!("fuse_mknod_worker"), async move {
-        debug!(
-            unique = item.unique,
-            parent = item.in_header.nodeid,
-            ?name,
-            ?mknod_in,
-            "mknod (worker)"
-        );
-        match fs
-            .mknod(
-                Request::from(&item),
-                item.in_header.nodeid,
-                &name,
-                mknod_in.mode,
-                mknod_in.rdev,
-            )
-            .await
-        {
-            Err(err) => {
-                let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
-            Ok(entry) => {
-                let entry_out: fuse_entry_out = entry.into();
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE);
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("serialize header");
-                get_bincode_config()
-                    .serialize_into(&mut data, &entry_out)
-                    .expect("serialize entry");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
+    debug!(
+        unique = item.unique,
+        parent = item.in_header.nodeid,
+        ?name,
+        ?mknod_in,
+        "mknod (worker)"
+    );
+    match ctx
+        .fs
+        .mknod(
+            Request::from(&item),
+            item.in_header.nodeid,
+            &name,
+            mknod_in.mode,
+            mknod_in.rdev,
+        )
+        .await
+    {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
         }
-    });
+        Ok(entry) => {
+            let entry_out: fuse_entry_out = entry.into();
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data, &out_header)
+                .expect("serialize header");
+            get_bincode_config()
+                .serialize_into(&mut data, &entry_out)
+                .expect("serialize entry");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+        }
+    }
 }
 
-pub(super) async fn worker_mkdir<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_mkdir_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let mkdir_in = match get_bincode_config().deserialize::<fuse_mkdir_in>(&item.data) {
@@ -668,7 +644,7 @@ pub(super) async fn worker_mkdir<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
@@ -682,57 +658,54 @@ pub(super) async fn worker_mkdir<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(index) => OsString::from_vec(data[..index].to_vec()),
     };
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
-    spawn(debug_span!("fuse_mkdir_worker"), async move {
-        debug!(
-            unique = item.unique,
-            parent = item.in_header.nodeid,
-            ?name,
-            ?mkdir_in,
-            "mkdir (worker)"
-        );
-        match fs
-            .mkdir(
-                Request::from(&item),
-                item.in_header.nodeid,
-                &name,
-                mkdir_in.mode,
-                mkdir_in.umask,
-            )
-            .await
-        {
-            Err(err) => {
-                let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
-            Ok(entry) => {
-                let entry_out: fuse_entry_out = entry.into();
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE);
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("serialize header");
-                get_bincode_config()
-                    .serialize_into(&mut data, &entry_out)
-                    .expect("serialize entry");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
+    debug!(
+        unique = item.unique,
+        parent = item.in_header.nodeid,
+        ?name,
+        ?mkdir_in,
+        "mkdir (worker)"
+    );
+    match ctx
+        .fs
+        .mkdir(
+            Request::from(&item),
+            item.in_header.nodeid,
+            &name,
+            mkdir_in.mode,
+            mkdir_in.umask,
+        )
+        .await
+    {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
         }
-    });
+        Ok(entry) => {
+            let entry_out: fuse_entry_out = entry.into();
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data, &out_header)
+                .expect("serialize header");
+            get_bincode_config()
+                .serialize_into(&mut data, &entry_out)
+                .expect("serialize entry");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+        }
+    }
 }
 
-pub(super) async fn worker_unlink<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_unlink_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let name = match get_first_null_position(&item.data) {
@@ -743,35 +716,32 @@ pub(super) async fn worker_unlink<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(index) => OsString::from_vec(item.data[..index].to_vec()),
     };
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
-    spawn(debug_span!("fuse_unlink_worker"), async move {
-        debug!(
-            unique = item.unique,
-            parent = item.in_header.nodeid,
-            ?name,
-            "unlink (worker)"
-        );
-        let resp = if let Err(err) = fs
-            .unlink(Request::from(&item), item.in_header.nodeid, &name)
-            .await
-        {
-            err
-        } else {
-            Errno::from(0)
-        };
-        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    debug!(
+        unique = item.unique,
+        parent = item.in_header.nodeid,
+        ?name,
+        "unlink (worker)"
+    );
+    let resp = if let Err(err) = ctx
+        .fs
+        .unlink(Request::from(&item), item.in_header.nodeid, &name)
+        .await
+    {
+        err
+    } else {
+        Errno::from(0)
+    };
+    let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_rmdir<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_rmdir_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let name = match get_first_null_position(&item.data) {
@@ -782,35 +752,32 @@ pub(super) async fn worker_rmdir<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(index) => OsString::from_vec(item.data[..index].to_vec()),
     };
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
-    spawn(debug_span!("fuse_rmdir_worker"), async move {
-        debug!(
-            unique = item.unique,
-            parent = item.in_header.nodeid,
-            ?name,
-            "rmdir (worker)"
-        );
-        let resp = if let Err(err) = fs
-            .rmdir(Request::from(&item), item.in_header.nodeid, &name)
-            .await
-        {
-            err
-        } else {
-            Errno::from(0)
-        };
-        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    debug!(
+        unique = item.unique,
+        parent = item.in_header.nodeid,
+        ?name,
+        "rmdir (worker)"
+    );
+    let resp = if let Err(err) = ctx
+        .fs
+        .rmdir(Request::from(&item), item.in_header.nodeid, &name)
+        .await
+    {
+        err
+    } else {
+        Errno::from(0)
+    };
+    let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_rename<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_rename_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let rename_in = match get_bincode_config().deserialize::<fuse_rename_in>(&item.data) {
@@ -821,7 +788,7 @@ pub(super) async fn worker_rename<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
@@ -835,7 +802,7 @@ pub(super) async fn worker_rename<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(index) => (OsString::from_vec(data[..index].to_vec()), index),
@@ -849,43 +816,40 @@ pub(super) async fn worker_rename<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(index) => OsString::from_vec(data[..index].to_vec()),
     };
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
-    spawn(debug_span!("fuse_rename_worker"), async move {
-        debug!(
-            unique = item.unique,
-            parent = item.in_header.nodeid,
-            ?name,
-            new_parent = rename_in.newdir,
-            ?new_name,
-            "rename (worker)"
-        );
-        let resp = if let Err(err) = fs
-            .rename(
-                Request::from(&item),
-                item.in_header.nodeid,
-                &name,
-                rename_in.newdir,
-                &new_name,
-            )
-            .await
-        {
-            err
-        } else {
-            Errno::from(0)
-        };
-        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    debug!(
+        unique = item.unique,
+        parent = item.in_header.nodeid,
+        ?name,
+        new_parent = rename_in.newdir,
+        ?new_name,
+        "rename (worker)"
+    );
+    let resp = if let Err(err) = ctx
+        .fs
+        .rename(
+            Request::from(&item),
+            item.in_header.nodeid,
+            &name,
+            rename_in.newdir,
+            &new_name,
+        )
+        .await
+    {
+        err
+    } else {
+        Errno::from(0)
+    };
+    let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_link<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_link_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let link_in = match get_bincode_config().deserialize::<fuse_link_in>(&item.data) {
@@ -896,7 +860,7 @@ pub(super) async fn worker_link<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
@@ -910,93 +874,90 @@ pub(super) async fn worker_link<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(index) => OsString::from_vec(data[..index].to_vec()),
     };
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
-    spawn(debug_span!("fuse_link_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = link_in.oldnodeid,
-            new_parent = item.in_header.nodeid,
-            ?name,
-            "link (worker)"
-        );
-        match fs
-            .link(
-                Request::from(&item),
-                link_in.oldnodeid,
-                item.in_header.nodeid,
-                &name,
-            )
-            .await
-        {
-            Err(err) => {
-                let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
-            Ok(entry) => {
-                let entry_out: fuse_entry_out = entry.into();
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE);
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("serialize header");
-                get_bincode_config()
-                    .serialize_into(&mut data, &entry_out)
-                    .expect("serialize entry");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
+    debug!(
+        unique = item.unique,
+        inode = link_in.oldnodeid,
+        new_parent = item.in_header.nodeid,
+        ?name,
+        "link (worker)"
+    );
+    match ctx
+        .fs
+        .link(
+            Request::from(&item),
+            link_in.oldnodeid,
+            item.in_header.nodeid,
+            &name,
+        )
+        .await
+    {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
         }
-    });
+        Ok(entry) => {
+            let entry_out: fuse_entry_out = entry.into();
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data, &out_header)
+                .expect("serialize header");
+            get_bincode_config()
+                .serialize_into(&mut data, &entry_out)
+                .expect("serialize entry");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+        }
+    }
 }
 
-pub(super) async fn worker_statfs<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_statfs_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
-    spawn(debug_span!("fuse_statfs_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            "statfs (worker)"
-        );
-        let fs_stat = match fs.statfs(Request::from(&item), item.in_header.nodeid).await {
-            Err(err) => {
-                let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-                return;
-            }
-            Ok(fs_stat) => fs_stat,
-        };
-        let statfs_out: fuse_statfs_out = fs_stat.into();
-        let out_header = fuse_out_header {
-            len: (FUSE_OUT_HEADER_SIZE + FUSE_STATFS_OUT_SIZE) as u32,
-            error: 0,
-            unique: item.unique,
-        };
-        let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_STATFS_OUT_SIZE);
-        get_bincode_config()
-            .serialize_into(&mut data, &out_header)
-            .expect("serialize header");
-        get_bincode_config()
-            .serialize_into(&mut data, &statfs_out)
-            .expect("serialize statfs_out");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        "statfs (worker)"
+    );
+    let fs_stat = match ctx
+        .fs
+        .statfs(Request::from(&item), item.in_header.nodeid)
+        .await
+    {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+            return;
+        }
+        Ok(fs_stat) => fs_stat,
+    };
+    let statfs_out: fuse_statfs_out = fs_stat.into();
+    let out_header = fuse_out_header {
+        len: (FUSE_OUT_HEADER_SIZE + FUSE_STATFS_OUT_SIZE) as u32,
+        error: 0,
+        unique: item.unique,
+    };
+    let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_STATFS_OUT_SIZE);
+    get_bincode_config()
+        .serialize_into(&mut data, &out_header)
+        .expect("serialize header");
+    get_bincode_config()
+        .serialize_into(&mut data, &statfs_out)
+        .expect("serialize statfs_out");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_release<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_release_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let release_in = match get_bincode_config().deserialize::<fuse_release_in>(&item.data) {
@@ -1007,46 +968,43 @@ pub(super) async fn worker_release<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
-    spawn(debug_span!("fuse_release_worker"), async move {
-        let flush = release_in.release_flags & FUSE_RELEASE_FLUSH > 0;
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            fh = release_in.fh,
-            flags = release_in.flags,
-            lock_owner = release_in.lock_owner,
+    let flush = release_in.release_flags & FUSE_RELEASE_FLUSH > 0;
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        fh = release_in.fh,
+        flags = release_in.flags,
+        lock_owner = release_in.lock_owner,
+        flush,
+        "release (worker)"
+    );
+    let resp = if let Err(err) = ctx
+        .fs
+        .release(
+            Request::from(&item),
+            item.in_header.nodeid,
+            release_in.fh,
+            release_in.flags,
+            release_in.lock_owner,
             flush,
-            "release (worker)"
-        );
-        let resp = if let Err(err) = fs
-            .release(
-                Request::from(&item),
-                item.in_header.nodeid,
-                release_in.fh,
-                release_in.flags,
-                release_in.lock_owner,
-                flush,
-            )
-            .await
-        {
-            err
-        } else {
-            Errno::from(0)
-        };
-        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+        )
+        .await
+    {
+        err
+    } else {
+        Errno::from(0)
+    };
+    let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_fsync<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_fsync_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let fsync_in = match get_bincode_config().deserialize::<fuse_fsync_in>(&item.data) {
@@ -1057,42 +1015,39 @@ pub(super) async fn worker_fsync<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
-    spawn(debug_span!("fuse_fsync_worker"), async move {
-        let data_sync = fsync_in.fsync_flags & 1 > 0;
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            fh = fsync_in.fh,
+    let data_sync = fsync_in.fsync_flags & 1 > 0;
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        fh = fsync_in.fh,
+        data_sync,
+        "fsync (worker)"
+    );
+    let resp = if let Err(err) = ctx
+        .fs
+        .fsync(
+            Request::from(&item),
+            item.in_header.nodeid,
+            fsync_in.fh,
             data_sync,
-            "fsync (worker)"
-        );
-        let resp = if let Err(err) = fs
-            .fsync(
-                Request::from(&item),
-                item.in_header.nodeid,
-                fsync_in.fh,
-                data_sync,
-            )
-            .await
-        {
-            err
-        } else {
-            Errno::from(0)
-        };
-        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+        )
+        .await
+    {
+        err
+    } else {
+        Errno::from(0)
+    };
+    let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_setxattr<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_setxattr_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let setxattr_in = match get_bincode_config().deserialize::<fuse_setxattr_in>(&item.data) {
@@ -1103,7 +1058,7 @@ pub(super) async fn worker_setxattr<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
@@ -1118,7 +1073,7 @@ pub(super) async fn worker_setxattr<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(index) => (OsString::from_vec(data[..index].to_vec()), index),
@@ -1129,49 +1084,46 @@ pub(super) async fn worker_setxattr<FS: Filesystem + Send + Sync + 'static>(
         debug!(unique = item.unique, "setxattr value data too short");
         let data =
             reply_error_in_worker(libc::EINVAL.into(), item.unique).expect("serialize out_header");
-        let _ = ctx.resp.unbounded_send(Either::Left(data));
+        let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
         return;
     }
 
     let value = data[..setxattr_in.size as usize].to_vec();
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
 
-    spawn(debug_span!("fuse_setxattr_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            ?name,
-            size = setxattr_in.size,
-            flags = setxattr_in.flags,
-            "setxattr (worker)"
-        );
-        // TODO handle os X argument
-        let resp = if let Err(err) = fs
-            .setxattr(
-                Request::from(&item),
-                item.in_header.nodeid,
-                &name,
-                &value,
-                setxattr_in.flags,
-                #[cfg(target_os = "macos")]
-                setxattr_in.position,
-                #[cfg(not(target_os = "macos"))]
-                0,
-            )
-            .await
-        {
-            err
-        } else {
-            Errno::from(0)
-        };
-        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        ?name,
+        size = setxattr_in.size,
+        flags = setxattr_in.flags,
+        "setxattr (worker)"
+    );
+    // TODO handle os X argument
+    let resp = if let Err(err) = ctx
+        .fs
+        .setxattr(
+            Request::from(&item),
+            item.in_header.nodeid,
+            &name,
+            &value,
+            setxattr_in.flags,
+            #[cfg(target_os = "macos")]
+            setxattr_in.position,
+            #[cfg(not(target_os = "macos"))]
+            0,
+        )
+        .await
+    {
+        err
+    } else {
+        Errno::from(0)
+    };
+    let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_getxattr<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_getxattr_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let getxattr_in = match get_bincode_config().deserialize::<fuse_getxattr_in>(&item.data) {
@@ -1182,7 +1134,7 @@ pub(super) async fn worker_getxattr<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
@@ -1197,78 +1149,75 @@ pub(super) async fn worker_getxattr<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(index) => OsString::from_vec(data[..index].to_vec()),
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        ?name,
+        size = getxattr_in.size,
+        "getxattr (worker)"
+    );
 
-    spawn(debug_span!("fuse_getxattr_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            ?name,
-            size = getxattr_in.size,
-            "getxattr (worker)"
-        );
+    let reply_result = ctx
+        .fs
+        .getxattr(
+            Request::from(&item),
+            item.in_header.nodeid,
+            &name,
+            getxattr_in.size,
+        )
+        .await;
 
-        let reply_result = fs
-            .getxattr(
-                Request::from(&item),
-                item.in_header.nodeid,
-                &name,
-                getxattr_in.size,
-            )
-            .await;
-
-        match reply_result {
-            Err(err) => {
-                let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
+    match reply_result {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+        }
+        Ok(reply_xattr) => match reply_xattr {
+            ReplyXAttr::Size(size) => {
+                let getxattr_out = fuse_getxattr_out { size, _padding: 0 };
+                let out_header = fuse_out_header {
+                    len: (FUSE_OUT_HEADER_SIZE + FUSE_GETXATTR_OUT_SIZE) as u32,
+                    error: libc::ERANGE,
+                    unique: item.unique,
+                };
+                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_GETXATTR_OUT_SIZE);
+                get_bincode_config()
+                    .serialize_into(&mut data, &out_header)
+                    .expect("serialize header");
+                get_bincode_config()
+                    .serialize_into(&mut data, &getxattr_out)
+                    .expect("serialize getxattr_out");
+                let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             }
-            Ok(reply_xattr) => match reply_xattr {
-                ReplyXAttr::Size(size) => {
-                    let getxattr_out = fuse_getxattr_out { size, _padding: 0 };
-                    let out_header = fuse_out_header {
-                        len: (FUSE_OUT_HEADER_SIZE + FUSE_GETXATTR_OUT_SIZE) as u32,
-                        error: libc::ERANGE,
-                        unique: item.unique,
-                    };
-                    let mut data =
-                        Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_GETXATTR_OUT_SIZE);
-                    get_bincode_config()
-                        .serialize_into(&mut data, &out_header)
-                        .expect("serialize header");
-                    get_bincode_config()
-                        .serialize_into(&mut data, &getxattr_out)
-                        .expect("serialize getxattr_out");
-                    let _ = resp_sender.unbounded_send(Either::Left(data));
-                }
-                ReplyXAttr::Data(data_vec) => {
-                    // TODO check is right way or not
-                    // TODO should we check data length or not
-                    let out_header = fuse_out_header {
-                        len: (FUSE_OUT_HEADER_SIZE + data_vec.len()) as u32,
-                        error: 0,
-                        unique: item.unique,
-                    };
-                    let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
-                    get_bincode_config()
-                        .serialize_into(&mut data, &out_header)
-                        .expect("serialize header");
-                    data.extend_from_slice(&data_vec);
-                    let _ = resp_sender.unbounded_send(Either::Right((data, data_vec)));
-                }
-            },
-        };
-    });
+            ReplyXAttr::Data(data_vec) => {
+                // TODO check is right way or not
+                // TODO should we check data length or not
+                let out_header = fuse_out_header {
+                    len: (FUSE_OUT_HEADER_SIZE + data_vec.len()) as u32,
+                    error: 0,
+                    unique: item.unique,
+                };
+                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
+                get_bincode_config()
+                    .serialize_into(&mut data, &out_header)
+                    .expect("serialize header");
+                data.extend_from_slice(&data_vec);
+                let _ = ctx
+                    .resp_for(item.unique)
+                    .unbounded_send(Either::Right((data, data_vec)));
+            }
+        },
+    };
 }
 
-pub(super) async fn worker_listxattr<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_listxattr_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let getxattr_in = match get_bincode_config().deserialize::<fuse_getxattr_in>(&item.data) {
@@ -1279,76 +1228,73 @@ pub(super) async fn worker_listxattr<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        size = getxattr_in.size,
+        "listxattr (worker)"
+    );
 
-    spawn(debug_span!("fuse_listxattr_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            size = getxattr_in.size,
-            "listxattr (worker)"
-        );
+    let reply_result = ctx
+        .fs
+        .listxattr(
+            Request::from(&item),
+            item.in_header.nodeid,
+            getxattr_in.size,
+        )
+        .await;
 
-        let reply_result = fs
-            .listxattr(
-                Request::from(&item),
-                item.in_header.nodeid,
-                getxattr_in.size,
-            )
-            .await;
-
-        match reply_result {
-            Err(err) => {
-                let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
+    match reply_result {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+        }
+        Ok(reply_xattr) => match reply_xattr {
+            ReplyXAttr::Size(size) => {
+                let getxattr_out = fuse_getxattr_out { size, _padding: 0 };
+                let out_header = fuse_out_header {
+                    len: (FUSE_OUT_HEADER_SIZE + FUSE_GETXATTR_OUT_SIZE) as u32,
+                    error: 0, //almost as same as getxattr.did the error right?
+                    unique: item.unique,
+                };
+                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_GETXATTR_OUT_SIZE);
+                get_bincode_config()
+                    .serialize_into(&mut data, &out_header)
+                    .expect("serialize header");
+                get_bincode_config()
+                    .serialize_into(&mut data, &getxattr_out)
+                    .expect("serialize getxattr_out");
+                let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             }
-            Ok(reply_xattr) => match reply_xattr {
-                ReplyXAttr::Size(size) => {
-                    let getxattr_out = fuse_getxattr_out { size, _padding: 0 };
-                    let out_header = fuse_out_header {
-                        len: (FUSE_OUT_HEADER_SIZE + FUSE_GETXATTR_OUT_SIZE) as u32,
-                        error: 0, //almost as same as getxattr.did the error right?
-                        unique: item.unique,
-                    };
-                    let mut data =
-                        Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_GETXATTR_OUT_SIZE);
-                    get_bincode_config()
-                        .serialize_into(&mut data, &out_header)
-                        .expect("serialize header");
-                    get_bincode_config()
-                        .serialize_into(&mut data, &getxattr_out)
-                        .expect("serialize getxattr_out");
-                    let _ = resp_sender.unbounded_send(Either::Left(data));
-                }
-                ReplyXAttr::Data(data_vec) => {
-                    // TODO check is right way or not
-                    // TODO should we check data length or not
-                    let out_header = fuse_out_header {
-                        len: (FUSE_OUT_HEADER_SIZE + data_vec.len()) as u32,
-                        error: 0,
-                        unique: item.unique,
-                    };
-                    let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
-                    get_bincode_config()
-                        .serialize_into(&mut data, &out_header)
-                        .expect("serialize header");
-                    data.extend_from_slice(&data_vec);
-                    let _ = resp_sender.unbounded_send(Either::Right((data, data_vec)));
-                }
-            },
-        };
-    });
+            ReplyXAttr::Data(data_vec) => {
+                // TODO check is right way or not
+                // TODO should we check data length or not
+                let out_header = fuse_out_header {
+                    len: (FUSE_OUT_HEADER_SIZE + data_vec.len()) as u32,
+                    error: 0,
+                    unique: item.unique,
+                };
+                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
+                get_bincode_config()
+                    .serialize_into(&mut data, &out_header)
+                    .expect("serialize header");
+                data.extend_from_slice(&data_vec);
+                let _ = ctx
+                    .resp_for(item.unique)
+                    .unbounded_send(Either::Right((data, data_vec)));
+            }
+        },
+    };
 }
 
-pub(super) async fn worker_removexattr<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_removexattr_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let name = match get_first_null_position(&item.data) {
@@ -1359,38 +1305,34 @@ pub(super) async fn worker_removexattr<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(index) => OsString::from_vec(item.data[..index].to_vec()),
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        ?name,
+        "removexattr (worker)"
+    );
 
-    spawn(debug_span!("fuse_removexattr_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            ?name,
-            "removexattr (worker)"
-        );
-
-        let resp = if let Err(err) = fs
-            .removexattr(Request::from(&item), item.in_header.nodeid, &name)
-            .await
-        {
-            err
-        } else {
-            Errno::from(0)
-        };
-        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    let resp = if let Err(err) = ctx
+        .fs
+        .removexattr(Request::from(&item), item.in_header.nodeid, &name)
+        .await
+    {
+        err
+    } else {
+        Errno::from(0)
+    };
+    let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_flush<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_flush_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let flush_in = match get_bincode_config().deserialize::<fuse_flush_in>(&item.data) {
@@ -1401,44 +1343,40 @@ pub(super) async fn worker_flush<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        fh = flush_in.fh,
+        lock_owner = flush_in.lock_owner,
+        "flush (worker)"
+    );
 
-    spawn(debug_span!("fuse_flush_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            fh = flush_in.fh,
-            lock_owner = flush_in.lock_owner,
-            "flush (worker)"
-        );
-
-        let resp = if let Err(err) = fs
-            .flush(
-                Request::from(&item),
-                item.in_header.nodeid,
-                flush_in.fh,
-                flush_in.lock_owner,
-            )
-            .await
-        {
-            err
-        } else {
-            Errno::from(0)
-        };
-        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    let resp = if let Err(err) = ctx
+        .fs
+        .flush(
+            Request::from(&item),
+            item.in_header.nodeid,
+            flush_in.fh,
+            flush_in.lock_owner,
+        )
+        .await
+    {
+        err
+    } else {
+        Errno::from(0)
+    };
+    let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_opendir<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_opendir_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let open_in = match get_bincode_config().deserialize::<fuse_open_in>(&item.data) {
@@ -1449,54 +1387,51 @@ pub(super) async fn worker_opendir<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
     let direct_io = ctx.direct_io;
 
-    spawn(debug_span!("fuse_opendir_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            flags = open_in.flags,
-            "opendir (worker)"
-        );
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        flags = open_in.flags,
+        "opendir (worker)"
+    );
 
-        let data = match fs
-            .opendir(Request::from(&item), item.in_header.nodeid, open_in.flags)
-            .await
-        {
-            Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
-            Ok(opened) => {
-                let mut open_out: fuse_open_out = opened.into();
-                apply_direct_io(&mut open_out.open_flags, direct_io);
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_OPEN_OUT_SIZE) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_OPEN_OUT_SIZE);
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("serialize header");
-                get_bincode_config()
-                    .serialize_into(&mut data, &open_out)
-                    .expect("serialize open_out");
-                data
-            }
-        };
+    let data = match ctx
+        .fs
+        .opendir(Request::from(&item), item.in_header.nodeid, open_in.flags)
+        .await
+    {
+        Err(err) => reply_error_in_worker(err, item.unique).expect("serialize out_header"),
+        Ok(opened) => {
+            let mut open_out: fuse_open_out = opened.into();
+            apply_direct_io(&mut open_out.open_flags, direct_io);
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + FUSE_OPEN_OUT_SIZE) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_OPEN_OUT_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data, &out_header)
+                .expect("serialize header");
+            get_bincode_config()
+                .serialize_into(&mut data, &open_out)
+                .expect("serialize open_out");
+            data
+        }
+    };
 
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_releasedir<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_releasedir_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let release_in = match get_bincode_config().deserialize::<fuse_release_in>(&item.data) {
@@ -1507,44 +1442,40 @@ pub(super) async fn worker_releasedir<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        fh = release_in.fh,
+        flags = release_in.flags,
+        "releasedir (worker)"
+    );
 
-    spawn(debug_span!("fuse_releasedir_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            fh = release_in.fh,
-            flags = release_in.flags,
-            "releasedir (worker)"
-        );
-
-        let resp = if let Err(err) = fs
-            .releasedir(
-                Request::from(&item),
-                item.in_header.nodeid,
-                release_in.fh,
-                release_in.flags,
-            )
-            .await
-        {
-            err
-        } else {
-            Errno::from(0)
-        };
-        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    let resp = if let Err(err) = ctx
+        .fs
+        .releasedir(
+            Request::from(&item),
+            item.in_header.nodeid,
+            release_in.fh,
+            release_in.flags,
+        )
+        .await
+    {
+        err
+    } else {
+        Errno::from(0)
+    };
+    let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_fsyncdir<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_fsyncdir_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let fsync_in = match get_bincode_config().deserialize::<fuse_fsync_in>(&item.data) {
@@ -1555,45 +1486,41 @@ pub(super) async fn worker_fsyncdir<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    let data_sync = fsync_in.fsync_flags & 1 > 0;
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        fh = fsync_in.fh,
+        data_sync,
+        "fsyncdir (worker)"
+    );
 
-    spawn(debug_span!("fuse_fsyncdir_worker"), async move {
-        let data_sync = fsync_in.fsync_flags & 1 > 0;
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            fh = fsync_in.fh,
+    let resp = if let Err(err) = ctx
+        .fs
+        .fsyncdir(
+            Request::from(&item),
+            item.in_header.nodeid,
+            fsync_in.fh,
             data_sync,
-            "fsyncdir (worker)"
-        );
-
-        let resp = if let Err(err) = fs
-            .fsyncdir(
-                Request::from(&item),
-                item.in_header.nodeid,
-                fsync_in.fh,
-                data_sync,
-            )
-            .await
-        {
-            err
-        } else {
-            Errno::from(0)
-        };
-        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+        )
+        .await
+    {
+        err
+    } else {
+        Errno::from(0)
+    };
+    let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_access<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_access_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let access_in = match get_bincode_config().deserialize::<fuse_access_in>(&item.data) {
@@ -1604,38 +1531,34 @@ pub(super) async fn worker_access<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        mask = access_in.mask,
+        "access (worker)"
+    );
 
-    spawn(debug_span!("fuse_access_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            mask = access_in.mask,
-            "access (worker)"
-        );
-
-        let resp = if let Err(err) = fs
-            .access(Request::from(&item), item.in_header.nodeid, access_in.mask)
-            .await
-        {
-            err
-        } else {
-            Errno::from(0)
-        };
-        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    let resp = if let Err(err) = ctx
+        .fs
+        .access(Request::from(&item), item.in_header.nodeid, access_in.mask)
+        .await
+    {
+        err
+    } else {
+        Errno::from(0)
+    };
+    let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_create<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_create_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let create_in = match get_bincode_config().deserialize::<fuse_create_in>(&item.data) {
@@ -1646,7 +1569,7 @@ pub(super) async fn worker_create<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
@@ -1661,68 +1584,64 @@ pub(super) async fn worker_create<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(index) => OsString::from_vec(data[..index].to_vec()),
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
     let direct_io = ctx.direct_io;
 
-    spawn(debug_span!("fuse_create_worker"), async move {
-        debug!(
-            unique = item.unique,
-            parent = item.in_header.nodeid,
-            ?name,
-            mode = create_in.mode,
-            flags = create_in.flags,
-            "create (worker)"
-        );
+    debug!(
+        unique = item.unique,
+        parent = item.in_header.nodeid,
+        ?name,
+        mode = create_in.mode,
+        flags = create_in.flags,
+        "create (worker)"
+    );
 
-        match fs
-            .create(
-                Request::from(&item),
-                item.in_header.nodeid,
-                &name,
-                create_in.mode,
-                create_in.flags,
-            )
-            .await
-        {
-            Err(err) => {
-                let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
-            Ok(created) => {
-                let (entry_out, mut open_out): (fuse_entry_out, fuse_open_out) = created.into();
-                apply_direct_io(&mut open_out.open_flags, direct_io);
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE + FUSE_OPEN_OUT_SIZE) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data = Vec::with_capacity(
-                    FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE + FUSE_OPEN_OUT_SIZE,
-                );
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("serialize header");
-                get_bincode_config()
-                    .serialize_into(&mut data, &entry_out)
-                    .expect("serialize entry");
-                get_bincode_config()
-                    .serialize_into(&mut data, &open_out)
-                    .expect("serialize open");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
+    match ctx
+        .fs
+        .create(
+            Request::from(&item),
+            item.in_header.nodeid,
+            &name,
+            create_in.mode,
+            create_in.flags,
+        )
+        .await
+    {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
         }
-    });
+        Ok(created) => {
+            let (entry_out, mut open_out): (fuse_entry_out, fuse_open_out) = created.into();
+            apply_direct_io(&mut open_out.open_flags, direct_io);
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE + FUSE_OPEN_OUT_SIZE) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data =
+                Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_ENTRY_OUT_SIZE + FUSE_OPEN_OUT_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data, &out_header)
+                .expect("serialize header");
+            get_bincode_config()
+                .serialize_into(&mut data, &entry_out)
+                .expect("serialize entry");
+            get_bincode_config()
+                .serialize_into(&mut data, &open_out)
+                .expect("serialize open");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+        }
+    }
 }
 
-pub(super) async fn worker_bmap<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_bmap_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let bmap_in = match get_bincode_config().deserialize::<fuse_bmap_in>(&item.data) {
@@ -1733,59 +1652,55 @@ pub(super) async fn worker_bmap<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        blocksize = bmap_in.blocksize,
+        block = bmap_in.block,
+        "bmap (worker)"
+    );
 
-    spawn(debug_span!("fuse_bmap_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            blocksize = bmap_in.blocksize,
-            block = bmap_in.block,
-            "bmap (worker)"
-        );
-
-        match fs
-            .bmap(
-                Request::from(&item),
-                item.in_header.nodeid,
-                bmap_in.blocksize,
-                bmap_in.block,
-            )
-            .await
-        {
-            Err(err) => {
-                let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
-            Ok(bmap_reply) => {
-                let bmap_out: fuse_bmap_out = bmap_reply.into();
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_BMAP_OUT_SIZE) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_BMAP_OUT_SIZE);
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("serialize header");
-                get_bincode_config()
-                    .serialize_into(&mut data, &bmap_out)
-                    .expect("serialize bmap_out");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
+    match ctx
+        .fs
+        .bmap(
+            Request::from(&item),
+            item.in_header.nodeid,
+            bmap_in.blocksize,
+            bmap_in.block,
+        )
+        .await
+    {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
         }
-    });
+        Ok(bmap_reply) => {
+            let bmap_out: fuse_bmap_out = bmap_reply.into();
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + FUSE_BMAP_OUT_SIZE) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_BMAP_OUT_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data, &out_header)
+                .expect("serialize header");
+            get_bincode_config()
+                .serialize_into(&mut data, &bmap_out)
+                .expect("serialize bmap_out");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+        }
+    }
 }
 
-pub(super) async fn worker_fallocate<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_fallocate_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let fallocate_in = match get_bincode_config().deserialize::<fuse_fallocate_in>(&item.data) {
@@ -1796,48 +1711,44 @@ pub(super) async fn worker_fallocate<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        fh = fallocate_in.fh,
+        offset = fallocate_in.offset,
+        length = fallocate_in.length,
+        mode = fallocate_in.mode,
+        "fallocate (worker)"
+    );
 
-    spawn(debug_span!("fuse_fallocate_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            fh = fallocate_in.fh,
-            offset = fallocate_in.offset,
-            length = fallocate_in.length,
-            mode = fallocate_in.mode,
-            "fallocate (worker)"
-        );
-
-        let resp = if let Err(err) = fs
-            .fallocate(
-                Request::from(&item),
-                item.in_header.nodeid,
-                fallocate_in.fh,
-                fallocate_in.offset,
-                fallocate_in.length,
-                fallocate_in.mode,
-            )
-            .await
-        {
-            err
-        } else {
-            Errno::from(0)
-        };
-        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    let resp = if let Err(err) = ctx
+        .fs
+        .fallocate(
+            Request::from(&item),
+            item.in_header.nodeid,
+            fallocate_in.fh,
+            fallocate_in.offset,
+            fallocate_in.length,
+            fallocate_in.mode,
+        )
+        .await
+    {
+        err
+    } else {
+        Errno::from(0)
+    };
+    let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_readdirplus<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_readdirplus_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let read_in = match get_bincode_config().deserialize::<fuse_read_in>(&item.data) {
@@ -1848,107 +1759,104 @@ pub(super) async fn worker_readdirplus<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        fh = read_in.fh,
+        offset = read_in.offset,
+        "readdirplus (worker)"
+    );
 
-    spawn(debug_span!("fuse_readdirplus_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            fh = read_in.fh,
-            offset = read_in.offset,
-            "readdirplus (worker)"
-        );
+    let reply_readdir_plus = match ctx
+        .fs
+        .readdirplus(
+            Request::from(&item),
+            item.in_header.nodeid,
+            read_in.fh,
+            read_in.offset,
+            read_in.lock_owner,
+        )
+        .await
+    {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+            return;
+        }
+        Ok(r) => r,
+    };
 
-        let reply_readdir_plus = match fs
-            .readdirplus(
-                Request::from(&item),
-                item.in_header.nodeid,
-                read_in.fh,
-                read_in.offset,
-                read_in.lock_owner,
-            )
-            .await
-        {
+    let max_size = read_in.size as usize;
+    let mut entry_data = Vec::with_capacity(max_size);
+    let mut entries = pin!(reply_readdir_plus.entries);
+
+    while let Some(entry_plus) = entries.next().await {
+        let entry_plus = match entry_plus {
             Err(err) => {
                 let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
+                let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
                 return;
             }
-            Ok(r) => r,
+            Ok(entry_plus) => entry_plus,
         };
 
-        let max_size = read_in.size as usize;
-        let mut entry_data = Vec::with_capacity(max_size);
-        let mut entries = pin!(reply_readdir_plus.entries);
+        let name = &entry_plus.name;
+        let dirent_plus_size = FUSE_DIRENTPLUS_SIZE + name.len();
+        let padding_size = get_padding_size(dirent_plus_size);
 
-        while let Some(entry_plus) = entries.next().await {
-            let entry_plus = match entry_plus {
-                Err(err) => {
-                    let data =
-                        reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                    let _ = resp_sender.unbounded_send(Either::Left(data));
-                    return;
-                }
-                Ok(entry_plus) => entry_plus,
-            };
-
-            let name = &entry_plus.name;
-            let dirent_plus_size = FUSE_DIRENTPLUS_SIZE + name.len();
-            let padding_size = get_padding_size(dirent_plus_size);
-
-            if entry_data.len() + dirent_plus_size > max_size {
-                break;
-            }
-
-            let entry_out = fuse_entry_out {
-                nodeid: entry_plus.attr.ino,
-                generation: entry_plus.generation,
-                entry_valid: entry_plus.entry_ttl.as_secs(),
-                attr_valid: entry_plus.attr_ttl.as_secs(),
-                entry_valid_nsec: entry_plus.entry_ttl.subsec_nanos(),
-                attr_valid_nsec: entry_plus.attr_ttl.subsec_nanos(),
-                attr: entry_plus.attr.into(),
-            };
-            let dirent_plus = fuse_direntplus {
-                entry_out,
-                dirent: fuse_dirent {
-                    ino: entry_plus.inode,
-                    off: entry_plus.offset as u64,
-                    namelen: name.len() as u32,
-                    // learn from fuse-rs and golang bazil.org fuse DirentType
-                    r#type: mode_from_kind_and_perm(entry_plus.kind, 0) >> 12,
-                },
-            };
-
-            get_bincode_config()
-                .serialize_into(&mut entry_data, &dirent_plus)
-                .expect("serialize direntplus");
-            entry_data.extend_from_slice(name.as_bytes());
-            entry_data.resize(entry_data.len() + padding_size, 0);
+        if entry_data.len() + dirent_plus_size > max_size {
+            break;
         }
 
-        let out_header = fuse_out_header {
-            len: (FUSE_OUT_HEADER_SIZE + entry_data.len()) as u32,
-            error: 0,
-            unique: item.unique,
+        let entry_out = fuse_entry_out {
+            nodeid: entry_plus.attr.ino,
+            generation: entry_plus.generation,
+            entry_valid: entry_plus.entry_ttl.as_secs(),
+            attr_valid: entry_plus.attr_ttl.as_secs(),
+            entry_valid_nsec: entry_plus.entry_ttl.subsec_nanos(),
+            attr_valid_nsec: entry_plus.attr_ttl.subsec_nanos(),
+            attr: entry_plus.attr.into(),
         };
-        let mut data_buf = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
+        let dirent_plus = fuse_direntplus {
+            entry_out,
+            dirent: fuse_dirent {
+                ino: entry_plus.inode,
+                off: entry_plus.offset as u64,
+                namelen: name.len() as u32,
+                // learn from fuse-rs and golang bazil.org fuse DirentType
+                r#type: mode_from_kind_and_perm(entry_plus.kind, 0) >> 12,
+            },
+        };
+
         get_bincode_config()
-            .serialize_into(&mut data_buf, &out_header)
-            .expect("serialize header");
-        let _ = resp_sender.unbounded_send(Either::Right((data_buf, entry_data.into())));
-    });
+            .serialize_into(&mut entry_data, &dirent_plus)
+            .expect("serialize direntplus");
+        entry_data.extend_from_slice(name.as_bytes());
+        entry_data.resize(entry_data.len() + padding_size, 0);
+    }
+
+    let out_header = fuse_out_header {
+        len: (FUSE_OUT_HEADER_SIZE + entry_data.len()) as u32,
+        error: 0,
+        unique: item.unique,
+    };
+    let mut data_buf = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
+    get_bincode_config()
+        .serialize_into(&mut data_buf, &out_header)
+        .expect("serialize header");
+    let _ = ctx
+        .resp_for(item.unique)
+        .unbounded_send(Either::Right((data_buf, entry_data.into())));
 }
 
-pub(super) async fn worker_rename2<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_rename2_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let rename2_in = match get_bincode_config().deserialize::<fuse_rename2_in>(&item.data) {
@@ -1959,7 +1867,7 @@ pub(super) async fn worker_rename2<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
@@ -1974,7 +1882,7 @@ pub(super) async fn worker_rename2<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(index) => (OsString::from_vec(data[..index].to_vec()), index),
@@ -1989,48 +1897,44 @@ pub(super) async fn worker_rename2<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Some(index) => OsString::from_vec(data[..index].to_vec()),
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    debug!(
+        unique = item.unique,
+        parent = item.in_header.nodeid,
+        ?name,
+        new_parent = rename2_in.newdir,
+        ?new_name,
+        flags = rename2_in.flags,
+        "rename2 (worker)"
+    );
 
-    spawn(debug_span!("fuse_rename2_worker"), async move {
-        debug!(
-            unique = item.unique,
-            parent = item.in_header.nodeid,
-            ?name,
-            new_parent = rename2_in.newdir,
-            ?new_name,
-            flags = rename2_in.flags,
-            "rename2 (worker)"
-        );
-
-        let resp = if let Err(err) = fs
-            .rename2(
-                Request::from(&item),
-                item.in_header.nodeid,
-                &name,
-                rename2_in.newdir,
-                &new_name,
-                rename2_in.flags,
-            )
-            .await
-        {
-            err
-        } else {
-            Errno::from(0)
-        };
-        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    let resp = if let Err(err) = ctx
+        .fs
+        .rename2(
+            Request::from(&item),
+            item.in_header.nodeid,
+            &name,
+            rename2_in.newdir,
+            &new_name,
+            rename2_in.flags,
+        )
+        .await
+    {
+        err
+    } else {
+        Errno::from(0)
+    };
+    let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_lseek<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_lseek_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let lseek_in = match get_bincode_config().deserialize::<fuse_lseek_in>(&item.data) {
@@ -2041,63 +1945,59 @@ pub(super) async fn worker_lseek<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        fh = lseek_in.fh,
+        offset = lseek_in.offset,
+        whence = lseek_in.whence,
+        "lseek (worker)"
+    );
 
-    spawn(debug_span!("fuse_lseek_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            fh = lseek_in.fh,
-            offset = lseek_in.offset,
-            whence = lseek_in.whence,
-            "lseek (worker)"
-        );
-
-        match fs
-            .lseek(
-                Request::from(&item),
-                item.in_header.nodeid,
-                lseek_in.fh,
-                lseek_in.offset,
-                lseek_in.whence,
-            )
-            .await
-        {
-            Err(err) => {
-                let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
-            Ok(offset) => {
-                let lseek_out = fuse_lseek_out {
-                    offset: offset.offset,
-                };
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_LSEEK_OUT_SIZE) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_LSEEK_OUT_SIZE);
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("serialize header");
-                get_bincode_config()
-                    .serialize_into(&mut data, &lseek_out)
-                    .expect("serialize lseek_out");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
+    match ctx
+        .fs
+        .lseek(
+            Request::from(&item),
+            item.in_header.nodeid,
+            lseek_in.fh,
+            lseek_in.offset,
+            lseek_in.whence,
+        )
+        .await
+    {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
         }
-    });
+        Ok(offset) => {
+            let lseek_out = fuse_lseek_out {
+                offset: offset.offset,
+            };
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + FUSE_LSEEK_OUT_SIZE) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_LSEEK_OUT_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data, &out_header)
+                .expect("serialize header");
+            get_bincode_config()
+                .serialize_into(&mut data, &lseek_out)
+                .expect("serialize lseek_out");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+        }
+    }
 }
 
-pub(super) async fn worker_copy_file_range<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_copy_file_range_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let copy_file_range_in =
@@ -2109,70 +2009,66 @@ pub(super) async fn worker_copy_file_range<FS: Filesystem + Send + Sync + 'stati
                 );
                 let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                     .expect("serialize out_header");
-                let _ = ctx.resp.unbounded_send(Either::Left(data));
+                let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
                 return;
             }
             Ok(v) => v,
         };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        fh_in = copy_file_range_in.fh_in,
+        off_in = copy_file_range_in.off_in,
+        nodeid_out = copy_file_range_in.nodeid_out,
+        fh_out = copy_file_range_in.fh_out,
+        off_out = copy_file_range_in.off_out,
+        len = copy_file_range_in.len,
+        flags = copy_file_range_in.flags,
+        "copy_file_range (worker)"
+    );
 
-    spawn(debug_span!("fuse_copy_file_range_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            fh_in = copy_file_range_in.fh_in,
-            off_in = copy_file_range_in.off_in,
-            nodeid_out = copy_file_range_in.nodeid_out,
-            fh_out = copy_file_range_in.fh_out,
-            off_out = copy_file_range_in.off_out,
-            len = copy_file_range_in.len,
-            flags = copy_file_range_in.flags,
-            "copy_file_range (worker)"
-        );
-
-        match fs
-            .copy_file_range(
-                Request::from(&item),
-                item.in_header.nodeid,
-                copy_file_range_in.fh_in,
-                copy_file_range_in.off_in,
-                copy_file_range_in.nodeid_out,
-                copy_file_range_in.fh_out,
-                copy_file_range_in.off_out,
-                copy_file_range_in.len,
-                copy_file_range_in.flags,
-            )
-            .await
-        {
-            Err(err) => {
-                let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
-            Ok(copied) => {
-                let copy_file_range_out: fuse_write_out = copied.into();
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE);
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("serialize header");
-                get_bincode_config()
-                    .serialize_into(&mut data, &copy_file_range_out)
-                    .expect("serialize copy_file_range_out");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
+    match ctx
+        .fs
+        .copy_file_range(
+            Request::from(&item),
+            item.in_header.nodeid,
+            copy_file_range_in.fh_in,
+            copy_file_range_in.off_in,
+            copy_file_range_in.nodeid_out,
+            copy_file_range_in.fh_out,
+            copy_file_range_in.off_out,
+            copy_file_range_in.len,
+            copy_file_range_in.flags,
+        )
+        .await
+    {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
         }
-    });
+        Ok(copied) => {
+            let copy_file_range_out: fuse_write_out = copied.into();
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data, &out_header)
+                .expect("serialize header");
+            get_bincode_config()
+                .serialize_into(&mut data, &copy_file_range_out)
+                .expect("serialize copy_file_range_out");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+        }
+    }
 }
 
 #[cfg(feature = "file-lock")]
-pub(super) async fn worker_getlk<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_getlk_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let lk_in = match get_bincode_config().deserialize::<fuse_lk_in>(&item.data) {
@@ -2183,64 +2079,60 @@ pub(super) async fn worker_getlk<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        fh = lk_in.fh,
+        owner = lk_in.owner,
+        "getlk (worker)"
+    );
 
-    spawn(debug_span!("fuse_getlk_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            fh = lk_in.fh,
-            owner = lk_in.owner,
-            "getlk (worker)"
-        );
-
-        match fs
-            .getlk(
-                Request::from(&item),
-                item.in_header.nodeid,
-                lk_in.fh,
-                lk_in.owner,
-                lk_in.lk.start,
-                lk_in.lk.end,
-                lk_in.lk.r#type,
-                lk_in.lk.pid,
-            )
-            .await
-        {
-            Err(err) => {
-                let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
-            Ok(lock) => {
-                let lk_out: fuse_lk_out = lock.into();
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_LK_OUT_SIZE) as u32,
-                    error: 0,
-                    unique: item.unique,
-                };
-                let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_LK_OUT_SIZE);
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("serialize header");
-                get_bincode_config()
-                    .serialize_into(&mut data, &lk_out)
-                    .expect("serialize lk_out");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-            }
+    match ctx
+        .fs
+        .getlk(
+            Request::from(&item),
+            item.in_header.nodeid,
+            lk_in.fh,
+            lk_in.owner,
+            lk_in.lk.start,
+            lk_in.lk.end,
+            lk_in.lk.r#type,
+            lk_in.lk.pid,
+        )
+        .await
+    {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
         }
-    });
+        Ok(lock) => {
+            let lk_out: fuse_lk_out = lock.into();
+            let out_header = fuse_out_header {
+                len: (FUSE_OUT_HEADER_SIZE + FUSE_LK_OUT_SIZE) as u32,
+                error: 0,
+                unique: item.unique,
+            };
+            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_LK_OUT_SIZE);
+            get_bincode_config()
+                .serialize_into(&mut data, &out_header)
+                .expect("serialize header");
+            get_bincode_config()
+                .serialize_into(&mut data, &lk_out)
+                .expect("serialize lk_out");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+        }
+    }
 }
 
 #[cfg(feature = "file-lock")]
-pub(super) async fn worker_setlk<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_setlk_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
     is_blocking: bool,
 ) {
@@ -2258,51 +2150,47 @@ pub(super) async fn worker_setlk<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        fh = lk_in.fh,
+        owner = lk_in.owner,
+        is_blocking,
+        "setlk (worker)"
+    );
 
-    spawn(debug_span!("fuse_setlk_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            fh = lk_in.fh,
-            owner = lk_in.owner,
+    let resp = if let Err(err) = ctx
+        .fs
+        .setlk(
+            Request::from(&item),
+            item.in_header.nodeid,
+            lk_in.fh,
+            lk_in.owner,
+            lk_in.lk.start,
+            lk_in.lk.end,
+            lk_in.lk.r#type,
+            lk_in.lk.pid,
             is_blocking,
-            "setlk (worker)"
-        );
+        )
+        .await
+    {
+        err
+    } else {
+        Errno::from(0)
+    };
 
-        let resp = if let Err(err) = fs
-            .setlk(
-                Request::from(&item),
-                item.in_header.nodeid,
-                lk_in.fh,
-                lk_in.owner,
-                lk_in.lk.start,
-                lk_in.lk.end,
-                lk_in.lk.r#type,
-                lk_in.lk.pid,
-                is_blocking,
-            )
-            .await
-        {
-            err
-        } else {
-            Errno::from(0)
-        };
-
-        let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_poll<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_poll_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let poll_in = match get_bincode_config().deserialize::<fuse_poll_in>(&item.data) {
@@ -2313,71 +2201,67 @@ pub(super) async fn worker_poll<FS: Filesystem + Send + Sync + 'static>(
             );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
-            let _ = ctx.resp.unbounded_send(Either::Left(data));
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
             return;
         }
         Ok(v) => v,
     };
 
-    let fs = ctx.fs.clone();
-    let resp_sender = ctx.resp.clone();
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        fh = poll_in.fh,
+        kh = poll_in.kh,
+        flags = poll_in.flags,
+        "poll (worker)"
+    );
 
-    spawn(debug_span!("fuse_poll_worker"), async move {
-        debug!(
-            unique = item.unique,
-            inode = item.in_header.nodeid,
-            fh = poll_in.fh,
-            kh = poll_in.kh,
-            flags = poll_in.flags,
-            "poll (worker)"
-        );
+    let notify = Notify::new(ctx.resp_for(item.unique));
+    let reply_poll = match ctx
+        .fs
+        .poll(
+            Request::from(&item),
+            item.in_header.nodeid,
+            poll_in.fh,
+            if poll_in.flags & FUSE_POLL_SCHEDULE_NOTIFY == 0 {
+                None
+            } else {
+                Some(poll_in.kh)
+            },
+            poll_in.flags,
+            poll_in.events,
+            &notify,
+        )
+        .await
+    {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+            return;
+        }
+        Ok(r) => r,
+    };
 
-        let notify = Notify::new(resp_sender.clone());
-        let reply_poll = match fs
-            .poll(
-                Request::from(&item),
-                item.in_header.nodeid,
-                poll_in.fh,
-                if poll_in.flags & FUSE_POLL_SCHEDULE_NOTIFY == 0 {
-                    None
-                } else {
-                    Some(poll_in.kh)
-                },
-                poll_in.flags,
-                poll_in.events,
-                &notify,
-            )
-            .await
-        {
-            Err(err) => {
-                let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
-                let _ = resp_sender.unbounded_send(Either::Left(data));
-                return;
-            }
-            Ok(r) => r,
-        };
+    let poll_out: fuse_poll_out = reply_poll.into();
 
-        let poll_out: fuse_poll_out = reply_poll.into();
+    let out_header = fuse_out_header {
+        len: (FUSE_OUT_HEADER_SIZE + FUSE_POLL_OUT_SIZE) as u32,
+        error: 0,
+        unique: item.unique,
+    };
 
-        let out_header = fuse_out_header {
-            len: (FUSE_OUT_HEADER_SIZE + FUSE_POLL_OUT_SIZE) as u32,
-            error: 0,
-            unique: item.unique,
-        };
-
-        let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_POLL_OUT_SIZE);
-        get_bincode_config()
-            .serialize_into(&mut data, &out_header)
-            .expect("serialize header");
-        get_bincode_config()
-            .serialize_into(&mut data, &poll_out)
-            .expect("serialize poll_out");
-        let _ = resp_sender.unbounded_send(Either::Left(data));
-    });
+    let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_POLL_OUT_SIZE);
+    get_bincode_config()
+        .serialize_into(&mut data, &out_header)
+        .expect("serialize header");
+    get_bincode_config()
+        .serialize_into(&mut data, &poll_out)
+        .expect("serialize poll_out");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
-pub(super) async fn worker_batch_forget<FS: Filesystem + Send + Sync + 'static>(
-    ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_batch_forget_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
     let batch_forget_in = match get_bincode_config().deserialize::<fuse_batch_forget_in>(&item.data)
@@ -2426,16 +2310,14 @@ pub(super) async fn worker_batch_forget<FS: Filesystem + Send + Sync + 'static>(
         return;
     }
 
-    let fs = ctx.fs.clone();
+    debug!(
+        unique = item.unique,
+        count = batch_forget_in.count,
+        "batch_forget (worker)"
+    );
 
-    spawn(debug_span!("fuse_batch_forget_worker"), async move {
-        debug!(
-            unique = item.unique,
-            count = batch_forget_in.count,
-            "batch_forget (worker)"
-        );
-
-        fs.batch_forget(
+    ctx.fs
+        .batch_forget(
             Request {
                 unique: item.unique,
                 uid: item.in_header.uid,
@@ -2445,30 +2327,102 @@ pub(super) async fn worker_batch_forget<FS: Filesystem + Send + Sync + 'static>(
             &inodes,
         )
         .await;
-        // batch_forget has no reply
-    });
+    // batch_forget has no reply
 }
 
 #[cfg(target_os = "macos")]
 #[cfg(target_os = "macos")]
-pub(super) async fn worker_setvolname<FS: Filesystem + Send + Sync + 'static>(
-    _ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_setvolname_inline<FS: Filesystem + Send + Sync + 'static>(
+    _ctx: &DispatchCtx<FS>,
+    _item: WorkItem,
+) {
+    // macOS specific, not yet implemented
+}
+
+pub(super) async fn handle_ioctl_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
+    item: WorkItem,
+) {
+    let ioctl_in = match get_bincode_config().deserialize::<fuse_ioctl_in>(&item.data) {
+        Err(err) => {
+            debug!(unique = item.unique, "deserialize fuse_ioctl_in failed {}", err);
+            let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
+                .expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+            return;
+        }
+        Ok(ioctl_in) => ioctl_in,
+    };
+
+    let payload_end = FUSE_IOCTL_IN_SIZE.saturating_add(ioctl_in.in_size as usize);
+    if item.data.len() < payload_end {
+        let data =
+            reply_error_in_worker(libc::EINVAL.into(), item.unique).expect("serialize out_header");
+        let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+        return;
+    }
+    let ioctl_data = item.data[FUSE_IOCTL_IN_SIZE..payload_end].to_vec();
+
+    let request = Request::from(&item);
+    let in_header = item.in_header;
+
+    let reply_ioctl = match ctx
+        .fs
+        .ioctl(
+            request,
+            in_header.nodeid,
+            ioctl_in.fh,
+            ioctl_in.flags,
+            ioctl_in.cmd,
+            ioctl_in.arg,
+            &ioctl_data,
+            ioctl_in.out_size,
+        )
+        .await
+    {
+        Err(err) => {
+            let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+            return;
+        }
+        Ok(reply_ioctl) => reply_ioctl,
+    };
+
+    let ioctl_out = fuse_ioctl_out {
+        result: reply_ioctl.result,
+        flags: reply_ioctl.flags,
+        in_iovs: reply_ioctl.in_iovs,
+        out_iovs: reply_ioctl.out_iovs,
+    };
+
+    let out_len = FUSE_OUT_HEADER_SIZE + FUSE_IOCTL_OUT_SIZE + reply_ioctl.data.len();
+    let out_header = fuse_out_header {
+        len: out_len as u32,
+        error: 0,
+        unique: item.unique,
+    };
+    let mut data = Vec::with_capacity(out_len);
+    get_bincode_config()
+        .serialize_into(&mut data, &out_header)
+        .expect("serialize header");
+    get_bincode_config()
+        .serialize_into(&mut data, &ioctl_out)
+        .expect("serialize ioctl_out");
+    data.extend_from_slice(&reply_ioctl.data);
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+}
+
+#[cfg(target_os = "macos")]
+pub(super) async fn handle_getxtimes_inline<FS: Filesystem + Send + Sync + 'static>(
+    _ctx: &DispatchCtx<FS>,
     _item: WorkItem,
 ) {
     // macOS specific, not yet implemented
 }
 
 #[cfg(target_os = "macos")]
-pub(super) async fn worker_getxtimes<FS: Filesystem + Send + Sync + 'static>(
-    _ctx: &Arc<DispatchCtx<FS>>,
-    _item: WorkItem,
-) {
-    // macOS specific, not yet implemented
-}
-
-#[cfg(target_os = "macos")]
-pub(super) async fn worker_exchange<FS: Filesystem + Send + Sync + 'static>(
-    _ctx: &Arc<DispatchCtx<FS>>,
+pub(super) async fn handle_exchange_inline<FS: Filesystem + Send + Sync + 'static>(
+    _ctx: &DispatchCtx<FS>,
     _item: WorkItem,
 ) {
     // macOS specific, not yet implemented
