@@ -263,6 +263,7 @@ where
     writer: Arc<DataWriter<S, M>>,
     modified: ModifiedTracker,
     append_locks: DashMap<i64, Arc<Mutex<()>>>,
+    read_cache: Arc<crate::vfs::cache::lru_cache::LruReadCache>,
 }
 
 impl<S, M> VfsState<S, M>
@@ -348,6 +349,9 @@ where
             writer,
             modified: ModifiedTracker::new(),
             append_locks: DashMap::new(),
+            read_cache: Arc::new(
+                crate::vfs::cache::lru_cache::LruReadCache::new(256 * 1024 * 1024),
+            ),
         }
     }
 
