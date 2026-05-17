@@ -145,6 +145,9 @@ pub(crate) struct SliceState {
     notify: Arc<Notify>,
     started: Instant,
     last_mod: Instant,
+    /// Inode data_epoch captured when this slice is frozen.
+    /// If the inode epoch advances (truncate/setattr), stale commits are skipped.
+    frozen_epoch: u64,
 }
 
 impl SliceState {
@@ -168,6 +171,7 @@ impl SliceState {
             notify: Arc::new(Notify::new()),
             started: now,
             last_mod: now,
+            frozen_epoch: 0,
         }
     }
 
@@ -318,6 +322,7 @@ where
         self.with_mut(|s| {
             if matches!(s.state, SliceStatus::Writable) {
                 s.state = SliceStatus::Readonly;
+                s.frozen_epoch = self.shared.inode.data_epoch();
                 s.data.freeze();
 
                 if s.uploading.is_none() && !s.has_idle_block() {
@@ -1350,6 +1355,23 @@ where
             let mut should_pop = false;
 
             if runtime.can_commit() && runtime.err.is_none() {
+                // Epoch check: if a truncate/setattr happened after this slice
+                // was frozen, the commit is stale and must be skipped.
+                let slice_epoch = slice.lock().frozen_epoch;
+                if slice_epoch != 0 && shared.inode.data_epoch() != slice_epoch {
+                    tracing::warn!(
+                        ino = shared.inode.ino(),
+                        slice_epoch,
+                        current_epoch = shared.inode.data_epoch(),
+                        "skipping stale commit after truncate"
+                    );
+                    SliceHandle {
+                        slice: &slice,
+                        shared: &shared,
+                    }
+                    .mark_committed();
+                    should_pop = true;
+                } else {
                 let desc = SliceHandle {
                     slice: &slice,
                     shared: &shared,
@@ -1471,6 +1493,7 @@ where
                 } else {
                     should_pop = true;
                 }
+                } // end epoch-ok else block
             } else if matches!(runtime.status, SliceStatus::Committed) {
                 should_pop = true;
             }

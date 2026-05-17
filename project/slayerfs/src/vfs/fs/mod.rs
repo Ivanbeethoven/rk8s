@@ -278,9 +278,17 @@ where
                 .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
                 .join("slayerfs");
             let _ = std::fs::create_dir_all(&cache_root);
-            Some(Arc::new(
+            let wb = Arc::new(
                 crate::vfs::cache::write_back::FsWriteBackCache::new(cache_root),
-            ))
+            );
+
+            // Crash recovery: scan for dirty slices from a previous session.
+            let wb_clone = wb.clone();
+            tokio::spawn(async move {
+                Self::recover_dirty_slices(&wb_clone).await;
+            });
+
+            Some(wb)
         };
 
         let writer = Arc::new(DataWriter::new(
@@ -297,6 +305,49 @@ where
             writer,
             modified: ModifiedTracker::new(),
             append_locks: DashMap::new(),
+        }
+    }
+
+    /// Scan local SSD for dirty slices from a previous session and clean up
+    /// terminal records. Non-terminal records are logged for observability.
+    async fn recover_dirty_slices(
+        wb: &crate::vfs::cache::write_back::FsWriteBackCache,
+    ) {
+        use crate::vfs::cache::write_back::WriteBackCache;
+
+        let records = match wb.recover().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = ?e, "write-back cache recovery scan failed");
+                return;
+            }
+        };
+
+        if records.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            count = records.len(),
+            "recovered dirty slices from previous session"
+        );
+
+        for record in &records {
+            tracing::info!(
+                ino = record.ino,
+                chunk_id = record.chunk_id,
+                state = ?record.state,
+                length = record.length,
+                path = ?record.path,
+                "recovered dirty slice"
+            );
+        }
+
+        // Clean up records whose data files no longer exist on disk.
+        for record in records {
+            if !record.path.exists() {
+                let _ = wb.remove(&record.key).await;
+            }
         }
     }
 
