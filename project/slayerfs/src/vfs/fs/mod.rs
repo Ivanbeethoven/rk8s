@@ -1815,6 +1815,11 @@ where
             .overlay_dirty_if_exists(handle.ino as u64, offset, &mut data)
             .await
             .map_err(VfsError::from)?;
+
+        self.state
+            .reader
+            .submit_prefetch(handle.ino as i64, fh, offset, data.len() as u64);
+
         Ok(data)
     }
 
