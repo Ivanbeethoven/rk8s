@@ -38,7 +38,7 @@ use std::time::Duration;
 use futures_util::stream::{self, BoxStream};
 use rfuse3::raw::Filesystem;
 use rfuse3::{FileType as FuseFileType, SetAttr, Timestamp};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const FUSE_CACHE_TTL: Duration = Duration::ZERO;
 #[cfg(all(test, target_os = "linux"))]
@@ -623,7 +623,7 @@ where
         // Rewinddir: offset ≤ 0 means restart from the beginning.
         // Replace the cached handle with a fresh snapshot from the meta
         // layer so that entries created after opendir(3) are visible.
-        if fh != 0 && offset <= 0 {
+        if fh != 0 && offset == 0 {
             let _ = self.refresh_dir_handle(fh).await;
         }
 
@@ -728,7 +728,7 @@ where
         let mut all: Vec<DirectoryEntryPlus> = Vec::new();
 
         // Rewinddir: same logic as readdir().
-        if fh != 0 && offset <= 0 {
+        if fh != 0 && offset == 0 {
             let _ = self.refresh_dir_handle(fh).await;
         }
 
@@ -1289,6 +1289,13 @@ where
             return Err(libc::ENOTDIR.into());
         }
 
+        // Flush pending writes for the source inode before the rename so
+        // that temp-file + rename patterns (e.g. object_store PutMode::Create)
+        // do not race with in-flight write-back commit tasks.
+        if let Some(src_ino) = self.child_of(parent as i64, name.as_ref()).await {
+            self.flush_inode(src_ino as u64).await;
+        }
+
         self.rename_at(parent as i64, &name, new_parent as i64, &new_name)
             .await
             .map_err(|e| {
@@ -1302,7 +1309,10 @@ where
                     VfsError::CircularRename { .. } => libc::EINVAL,
                     VfsError::InvalidRenameTarget { .. } => libc::EINVAL,
                     VfsError::CrossesDevices => libc::EXDEV,
-                    _ => libc::EIO,
+                    other => {
+                        warn!(error = ?other, parent, %name, new_parent, %new_name, "unhandled VFS error during rename, mapped to EIO");
+                        libc::EIO
+                    }
                 }
                 .into()
             })

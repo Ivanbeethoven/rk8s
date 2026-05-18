@@ -7,7 +7,7 @@ use crate::meta::client::MetaClient;
 use crate::meta::config::CompactConfig;
 use crate::meta::config::MetaClientConfig;
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
-use crate::meta::store::{AclRule, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot};
+use crate::meta::store::{AclRule, MetaError, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot};
 use dashmap::{DashMap, Entry};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -454,11 +454,32 @@ where
         let file_offset = chunk_index * layout.chunk_size + desc.offset;
         let new_size = file_offset + desc.length;
 
+        // Check if the inode still exists before committing.  If the file was
+        // deleted before the crash, the dirty record is orphaned and should be
+        // cleaned up rather than entering an infinite recovery retry loop.
+        match backend.meta().stat(ino).await {
+            Ok(None) | Err(MetaError::NotFound(_)) => {
+                tracing::warn!(ino, slice_id, "recovery skipped: inode deleted, removing orphan dirty record");
+                let _ = wb.remove(&record.key).await;
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(ino, slice_id, error = ?e, "recovery stat check failed, will retry commit");
+            }
+            Ok(Some(_)) => {}
+        }
+
         if let Err(e) = backend
             .meta()
             .write(ino, record.chunk_id, desc, new_size)
             .await
         {
+            // If the inode was deleted between stat and write, clean up and move on.
+            if matches!(e, MetaError::NotFound(_)) {
+                tracing::warn!(ino, slice_id, "recovery metadata commit: inode gone, removing orphan dirty record");
+                let _ = wb.remove(&record.key).await;
+                return;
+            }
             tracing::warn!(ino, slice_id, error = ?e, "recovery metadata commit failed");
             return;
         }
@@ -769,11 +790,10 @@ where
     }
 
     pub(crate) fn blocks_for_attr(&self, attr: &FileAttr) -> u64 {
-        if let Some(inode) = self.state.inodes.get(&attr.ino) {
-            if let Some(blocks) = inode.allocated_blocks_512() {
+        if let Some(inode) = self.state.inodes.get(&attr.ino)
+            && let Some(blocks) = inode.allocated_blocks_512() {
                 return blocks;
             }
-        }
         // Fall back to the metadata-provided value.  For backends that haven't
         // implemented accurate block tracking yet, this is `size.div_ceil(512)`.
         attr.blocks
@@ -1822,7 +1842,7 @@ where
 
         self.state
             .reader
-            .submit_prefetch(handle.ino as i64, fh, offset, data.len() as u64);
+            .submit_prefetch(handle.ino, fh, offset, data.len() as u64);
 
         Ok(data)
     }
@@ -2193,7 +2213,7 @@ where
     async fn flush_and_sync_handle(&self, fh: u64) -> Result<i64, VfsError> {
         let handle = self.file_handle_required(fh)?;
 
-        tracing::trace!(fh, ino = handle.ino, "vfs.flush_handle_start");
+        tracing::info!(fh, ino = handle.ino, "vfs.flush_handle_start");
         self.state
             .writer
             .flush_required(handle.ino as u64)
@@ -2218,6 +2238,17 @@ where
         let ino = self.flush_and_sync_handle(fh).await?;
         tracing::trace!(fh, ino, "vfs.flush_done");
         Ok(())
+    }
+
+    /// Flush pending writes for an inode (best-effort, without a file handle).
+    /// Used by rename and other metadata operations that need write-back
+    /// convergence before modifying directory entries.
+    pub async fn flush_inode(&self, ino: u64) {
+        let _ = self
+            .state
+            .writer
+            .flush_if_exists(ino)
+            .await;
     }
 
     /// Sync file content (fsync): flush pending writes.

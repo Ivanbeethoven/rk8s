@@ -1504,3 +1504,267 @@ mod permission_tests {
         assert_eq!(stat.gid, 5678);
     }
 }
+
+#[cfg(test)]
+mod truncate_flush_tests {
+    use super::*;
+    use crate::chunk::store::InMemoryBlockStore;
+    use crate::meta::factory::create_meta_store_from_url;
+    use crate::meta::store::{SetAttrFlags, SetAttrRequest};
+    use crate::vfs::fs::VFS;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const OP_TIMEOUT: Duration = Duration::from_secs(60);
+
+    async fn op_timeout<T>(label: &'static str, fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(OP_TIMEOUT, fut)
+            .await
+            .unwrap_or_else(|_| panic!("truncate_flush op timed out: {label}"))
+    }
+
+    async fn new_vfs() -> VFS<InMemoryBlockStore, impl MetaLayer> {
+        let layout = ChunkLayout::default();
+        let store = InMemoryBlockStore::new();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        VFS::new(layout, store, meta_store).await.unwrap()
+    }
+
+    /// Write data to create pending dirty slices in the writer,
+    /// then immediately truncate.  This exercises the flush_required →
+    /// writer.flush() → meta_truncate path that generic/014 tickles.
+    #[tokio::test]
+    async fn test_truncate_after_write_with_pending_dirty_data() {
+        let fs = Arc::new(new_vfs().await);
+        let root = fs.root_ino();
+
+        let ino = op_timeout("create_file", fs.create_file_at(root, "f", false))
+            .await
+            .unwrap();
+
+        // Write enough data to exceed freeze_min_bytes so the writer has
+        // pending dirty slices that need flushing on truncate.
+        let chunk_size = ChunkLayout::default().chunk_size as usize;
+        let data = vec![0xABu8; chunk_size * 2];
+        op_timeout("write", fs.write_ino(ino, 0, &data))
+            .await
+            .unwrap();
+
+        // Truncate down — must flush the pending writes first.
+        // If the truncate deadlocks, the 10 s timeout will fire.
+        op_timeout("truncate", fs.truncate_inode(ino, 1024))
+            .await
+            .unwrap();
+
+        // Verify the file size reflects the truncate.
+        let attr = op_timeout("stat", fs.stat_ino(ino)).await.unwrap();
+        assert_eq!(attr.size, 1024);
+    }
+
+    /// Write, truncate-extend, write again, truncate-shrink — verifies
+    /// the flush+lock handoff is correct across multiple cycles.
+    #[tokio::test]
+    async fn test_write_truncate_write_truncate_cycles() {
+        let fs = Arc::new(new_vfs().await);
+        let root = fs.root_ino();
+
+        let ino = op_timeout("create_file", fs.create_file_at(root, "f", false))
+            .await
+            .unwrap();
+
+        let block = ChunkLayout::default().block_size as u64;
+
+        for cycle in 0..8 {
+            let offset = (cycle as u64 % 4) * block;
+            let size = block as usize * (1 + cycle % 3);
+            let data = vec![(cycle as u8).wrapping_mul(7); size];
+
+            op_timeout("write", fs.write_ino(ino, offset, &data))
+                .await
+                .unwrap();
+
+            let new_size = block * (1 + (cycle as u64 % 5));
+            op_timeout("truncate", fs.truncate_inode(ino, new_size))
+                .await
+                .unwrap();
+        }
+
+        let attr = op_timeout("stat", fs.stat_ino(ino)).await.unwrap();
+        assert!(attr.size > 0, "file should have nonzero size after cycles");
+    }
+
+    /// Simulate the exact truncfile workload: create file, write, then
+    /// do many truncate+write cycles like `truncfile -c 10000` does.
+    #[tokio::test]
+    async fn test_truncfile_style_rapid_truncate_cycles() {
+        let fs = Arc::new(new_vfs().await);
+        let root = fs.root_ino();
+
+        let ino = op_timeout("create_file", fs.create_file_at(root, "truncfile", false))
+            .await
+            .unwrap();
+
+        // Write initial data (truncfile writes before truncating).
+        let initial = vec![0xCDu8; 4096];
+        op_timeout("write", fs.write_ino(ino, 0, &initial))
+            .await
+            .unwrap();
+
+        // Rapid truncate cycles — mimics `truncfile -c 10000`.
+        for i in 0..200 {
+            let size = if i % 2 == 0 {
+                ((i as u64 + 1) * 17) % 65536
+            } else {
+                ((10000u64 - i as u64) * 13) % 32768
+            };
+            op_timeout("truncate", fs.truncate_inode(ino, size))
+                .await
+                .unwrap();
+        }
+
+        // Should still be able to stat after all cycles.
+        let _attr = op_timeout("stat", fs.stat_ino(ino)).await.unwrap();
+    }
+
+    /// Concurrent writes and truncates on the same inode from multiple
+    /// tasks — stresses the mutation lock handoff between write_ino and
+    /// truncate_inode.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_concurrent_write_and_truncate() {
+        let fs = Arc::new(new_vfs().await);
+        let root = fs.root_ino();
+
+        let ino = op_timeout("create_file", fs.create_file_at(root, "f", false))
+            .await
+            .unwrap();
+
+        let fs_w = fs.clone();
+        let write_task = tokio::spawn(async move {
+            for i in 0..200 {
+                let data = vec![(i as u8).wrapping_mul(3); 4096];
+                let offset = ((i * 7) % 20) as u64 * 4096;
+                let _ = fs_w.write_ino(ino, offset, &data).await;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let fs_t = fs.clone();
+        let trunc_task = tokio::spawn(async move {
+            for i in 0..200 {
+                let size = ((i as u64 * 31 + 7) % 15 + 1) * 4096;
+                let _ = fs_t.truncate_inode(ino, size).await;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        op_timeout("write_task", write_task).await.unwrap();
+        op_timeout("trunc_task", trunc_task).await.unwrap();
+
+        let attr = op_timeout("stat", fs.stat_ino(ino)).await.unwrap();
+        assert!(attr.size > 0);
+    }
+
+    /// Use set_attr with size (the FUSE SETATTR path exercised by
+    /// generic/014's truncfile) after writing dirty data.  Verifies the
+    /// flush_required + mutation_lock + meta_truncate + meta_set_attr
+    /// pipeline does not deadlock.
+    #[tokio::test]
+    async fn test_set_attr_truncate_with_pending_writes() {
+        let fs = Arc::new(new_vfs().await);
+        let root = fs.root_ino();
+
+        let ino = op_timeout("create_file", fs.create_file_at(root, "f", false))
+            .await
+            .unwrap();
+
+        // Write dirty data.
+        let chunk = ChunkLayout::default().chunk_size as usize;
+        let data = vec![0xEFu8; chunk * 2];
+        op_timeout("write", fs.write_ino(ino, 0, &data))
+            .await
+            .unwrap();
+
+        // Simulate FUSE SETATTR with size (truncate).  This calls set_attr
+        // which internally does flush_required → mutation_lock →
+        // meta_truncate → meta_set_attr.
+        for size in [chunk as u64, 512, chunk as u64 * 2, 0, 4096] {
+            let req = SetAttrRequest {
+                size: Some(size),
+                ..Default::default()
+            };
+            op_timeout("set_attr", fs.set_attr(ino, &req, SetAttrFlags::empty()))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Write via write_cached_ino (the FUSE_WRITE_CACHE path), then
+    /// truncate via set_attr — exactly the sequence generic/013→014
+    /// produces.  Verifies the cached writeback and truncate paths do
+    /// not deadlock when interleaved.
+    #[tokio::test]
+    async fn test_cached_write_then_set_attr_truncate() {
+        let fs = Arc::new(new_vfs().await);
+        let root = fs.root_ino();
+
+        let ino = op_timeout("create_file", fs.create_file_at(root, "f", false))
+            .await
+            .unwrap();
+
+        let block = ChunkLayout::default().block_size as usize;
+
+        // Use write_cached_ino (mimics FUSE_WRITE_CACHE) to create dirty
+        // slices without an explicit flush — just like the kernel does.
+        for i in 0..16 {
+            let data = vec![(i as u8).wrapping_mul(17); block * 2];
+            op_timeout("write_cached", fs.write_cached_ino(ino, (i * block) as u64, &data))
+                .await
+                .unwrap();
+        }
+
+        // Now truncate — must flush all the cached writes first.
+        let req = SetAttrRequest {
+            size: Some(block as u64 * 3),
+            ..Default::default()
+        };
+        let attr = op_timeout(
+            "set_attr after cached writes",
+            fs.set_attr(ino, &req, SetAttrFlags::empty()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(attr.size, block as u64 * 3);
+    }
+
+    /// Write a large amount of data, then immediately truncate to zero
+    /// before any background flush can complete.  This is the worst case
+    /// for the flush_required path — lots of dirty data to upload.
+    #[tokio::test]
+    async fn test_large_write_then_truncate_to_zero() {
+        let fs = Arc::new(new_vfs().await);
+        let root = fs.root_ino();
+
+        let ino = op_timeout("create_file", fs.create_file_at(root, "f", false))
+            .await
+            .unwrap();
+
+        // Write multiple blocks of data to create dirty slices.
+        let block = ChunkLayout::default().block_size as u64;
+        for i in 0..16 {
+            let data = vec![(i as u8).wrapping_add(0xA0); block as usize * 2];
+            op_timeout("write", fs.write_ino(ino, i * block * 2, &data))
+                .await
+                .unwrap();
+        }
+
+        // Truncate to 0 — requires flushing all pending writes first.
+        op_timeout("truncate to 0", fs.truncate_inode(ino, 0))
+            .await
+            .unwrap();
+
+        let attr = op_timeout("stat", fs.stat_ino(ino)).await.unwrap();
+        assert_eq!(attr.size, 0);
+    }
+}

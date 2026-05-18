@@ -456,6 +456,86 @@ where
         });
         self.shared.flush_notify.notify_waiters();
     }
+
+    /// Attempt to commit a fully-uploaded slice immediately.
+    /// Called from the upload task when all blocks have been transferred,
+    /// so that flush() callers do not wait on the commit_chunk poll loop.
+    async fn try_commit(&self) {
+        let desc = match self.desc_for_commit() {
+            Some(d) => d,
+            None => return,
+        };
+
+        let (ino, chunk_index) =
+            crate::vfs::extract_ino_and_chunk_index(desc.chunk_id);
+        let new_size = chunk_index * self.shared.config.layout.chunk_size
+            + desc.offset
+            + desc.length;
+
+        let mut attempts = 0u32;
+        loop {
+            match self
+                .shared
+                .backend
+                .meta()
+                .write(ino, desc.chunk_id, desc, new_size)
+                .await
+            {
+                Ok(()) => {
+                    self.mark_committed();
+
+                    self.shared
+                        .inode
+                        .add_estimated_allocated_bytes(desc.length.as_usize() as u64);
+
+                    if let Some(wb) = &self.shared.write_back {
+                        let key = crate::vfs::cache::keys::DirtySliceKey {
+                            ino,
+                            chunk_id: desc.chunk_id,
+                            local_seq: desc.slice_id,
+                            epoch: 0,
+                        };
+                        let _ = wb.remove(&key).await;
+                    }
+                    return;
+                }
+                Err(err) => {
+                    let retryable = should_retry_meta_write(&err);
+                    attempts = attempts.saturating_add(1);
+                    if retryable && attempts < COMMIT_META_MAX_RETRIES {
+                        tokio::time::sleep(commit_retry_backoff(attempts)).await;
+                        continue;
+                    }
+                    if retryable {
+                        tracing::debug!(
+                            ino,
+                            chunk_id = desc.chunk_id,
+                            slice_id = desc.slice_id,
+                            attempts,
+                            error = ?err,
+                            "try_commit exhausted retries, deferring to commit_chunk"
+                        );
+                    } else {
+                        self.mark_failed(anyhow::anyhow!(
+                            "try_commit failed for ino {ino}, chunk {}, slice {}: {err}",
+                            desc.chunk_id,
+                            desc.slice_id
+                        ));
+                        if let Some(wb) = &self.shared.write_back {
+                            let key = crate::vfs::cache::keys::DirtySliceKey {
+                                ino,
+                                chunk_id: desc.chunk_id,
+                                local_seq: desc.slice_id,
+                                epoch: 0,
+                            };
+                            let _ = wb.remove(&key).await;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// A snapshot of a slice, allowing us to check slice status without lock.
@@ -965,13 +1045,10 @@ where
         }
 
         let start = Instant::now();
-        let result = 'outer: loop {
+        let result = {
             // Snapshot every slice that exists right now.
             let slices: Vec<Arc<ParkingMutex<SliceState>>> = {
                 let guard = self.shared.inner.lock().await;
-                if !guard.has_chunks() {
-                    break Ok(());
-                }
                 guard
                     .chunks
                     .values()
@@ -992,61 +1069,65 @@ where
 
             // Wait for every slice we captured to be committed.
             // New slices created after the snapshot are for the *next* flush.
-            loop {
-                if let Some(err) = self.shared.writeback_error() {
-                    break 'outer Err(anyhow::anyhow!("writeback failed: {err}"));
-                }
+            if slices.is_empty() {
+                Ok(())
+            } else {
+                loop {
+                    if let Some(err) = self.shared.writeback_error() {
+                        break Err(anyhow::anyhow!("writeback failed: {err}"));
+                    }
 
-                let all_done = slices
-                    .iter()
-                    .all(|s| matches!(s.lock().state, SliceStatus::Committed));
-
-                if all_done {
-                    break 'outer Ok(());
-                }
-
-                if timeout(FLUSH_WAIT, self.shared.flush_notify.notified())
-                    .await
-                    .is_err()
-                    && start.elapsed() > deadline
-                {
-                    let pending: Vec<_> = slices
+                    let all_done = slices
                         .iter()
-                        .filter(|s| !matches!(s.lock().state, SliceStatus::Committed))
-                        .map(|s| {
-                            let g = s.lock();
-                            format!("{:?}@{}", g.state, g.offset)
-                        })
-                        .collect();
-                    let ino = self.shared.inode.ino();
-                    tracing::error!(
-                        ino,
-                        elapsed_ms = start.elapsed().as_millis() as u64,
-                        pending_slices = pending.len(),
-                        pending_states = ?pending,
-                        "flush timeout"
-                    );
-                    break 'outer Err(anyhow::anyhow!(
-                        "flush timeout after {:?} for ino {ino}, {}/{} slices still pending: {:?}",
-                        deadline,
-                        ino,
-                        pending.len(),
-                        pending
-                    ));
-                }
+                        .all(|s| matches!(s.lock().state, SliceStatus::Committed));
 
-                // If the notify fired spuriously or for a different chunk,
-                // re-poll the slice statuses inline so that a continuous
-                // stream of commit completions doesn't keep us sleeping
-                // for the full FLUSH_WAIT interval.
-                if let Some(err) = self.shared.writeback_error() {
-                    break 'outer Err(anyhow::anyhow!("writeback failed: {err}"));
-                }
-                if slices
-                    .iter()
-                    .all(|s| matches!(s.lock().state, SliceStatus::Committed))
-                {
-                    break 'outer Ok(());
+                    if all_done {
+                        break Ok(());
+                    }
+
+                    if timeout(FLUSH_WAIT, self.shared.flush_notify.notified())
+                        .await
+                        .is_err()
+                        && start.elapsed() > deadline
+                    {
+                        let pending: Vec<_> = slices
+                            .iter()
+                            .filter(|s| !matches!(s.lock().state, SliceStatus::Committed))
+                            .map(|s| {
+                                let g = s.lock();
+                                format!("{:?}@{}", g.state, g.offset)
+                            })
+                            .collect();
+                        let ino = self.shared.inode.ino();
+                        tracing::error!(
+                            ino,
+                            elapsed_ms = start.elapsed().as_millis() as u64,
+                            pending_slices = pending.len(),
+                            pending_states = ?pending,
+                            "flush timeout"
+                        );
+                        break Err(anyhow::anyhow!(
+                            "flush timeout after {:?} for ino {ino}, {}/{} slices still pending: {:?}",
+                            deadline,
+                            ino,
+                            pending.len(),
+                            pending
+                        ));
+                    }
+
+                    // If the notify fired spuriously or for a different chunk,
+                    // re-poll the slice statuses inline so that a continuous
+                    // stream of commit completions doesn't keep us sleeping
+                    // for the full FLUSH_WAIT interval.
+                    if let Some(err) = self.shared.writeback_error() {
+                        break Err(anyhow::anyhow!("writeback failed: {err}"));
+                    }
+                    if slices
+                        .iter()
+                        .all(|s| matches!(s.lock().state, SliceStatus::Committed))
+                    {
+                        break Ok(());
+                    }
                 }
             }
         };
@@ -1119,7 +1200,14 @@ where
 
                 let plan = match handle.prepare_upload() {
                     Ok(Some(plan)) => plan,
-                    Ok(None) => return,
+                    Ok(None) => {
+                        // No more blocks to upload — the slice is now in
+                        // Uploaded state.  Wake the commit_chunk poll loop
+                        // so it picks up this slice without waiting for
+                        // its next sleep cycle.
+                        shared.flush_notify.notify_waiters();
+                        return;
+                    }
                     Err(err) => {
                         warn!(error = ?err, "prepare_upload failed");
                         handle.mark_failed(err);
@@ -1170,7 +1258,7 @@ where
                 // final remote slice_id as the local key so commit cleanup can
                 // remove the exact dirty record it just made durable.
                 if let Some(wb) = &shared.write_back {
-                    let ino = shared.inode.ino() as i64;
+                    let ino = shared.inode.ino();
                     let key = crate::vfs::cache::keys::DirtySliceKey {
                         ino,
                         chunk_id,
@@ -1482,6 +1570,20 @@ where
                                     shared: &shared,
                                 }
                                 .mark_failed(anyhow::anyhow!(message));
+
+                                // Clean up local SSD dirty record so a future
+                                // recovery scan does not re-upload a slice that
+                                // will fail the same metadata commit again.
+                                if let Some(wb) = &shared.write_back {
+                                    let key = crate::vfs::cache::keys::DirtySliceKey {
+                                        ino,
+                                        chunk_id: desc.chunk_id,
+                                        local_seq: desc.slice_id,
+                                        epoch: 0,
+                                    };
+                                    let _ = wb.remove(&key).await;
+                                }
+
                                 should_pop = true;
                             } else {
                                 let backoff = commit_retry_backoff(commit_failures);
@@ -1519,7 +1621,7 @@ where
                             // Clean up local SSD dirty copy now that data is committed.
                             if let Some(wb) = &shared.write_back {
                                 let key = crate::vfs::cache::keys::DirtySliceKey {
-                                    ino: ino as i64,
+                                    ino,
                                     chunk_id: desc.chunk_id,
                                     local_seq: desc.slice_id,
                                     epoch: 0,
@@ -1577,11 +1679,10 @@ where
                         "commit_chunk.move_to_recently_committed"
                     ))
                     .await;
-                if let Some(chunk) = guard.chunks.get_mut(&chunk_id) {
-                    if let Some(s) = chunk.slices.pop_front() {
+                if let Some(chunk) = guard.chunks.get_mut(&chunk_id)
+                    && let Some(s) = chunk.slices.pop_front() {
                         chunk.recently_committed.push_back(s);
                     }
-                }
                 if guard.flush_waiting > 0 {
                     shared.flush_notify.notify_waiters();
                 }
@@ -1680,7 +1781,7 @@ where
 
             // Periodically drain recently_committed slices that have been kept
             // long enough for overlay_dirty to consume them.
-            if tick % 100 == 0 {
+            if tick.is_multiple_of(100) {
                 let mut guard = shared.inner.lock().await;
                 let mut emptied = Vec::new();
                 for (cid, chunk) in guard.chunks.iter_mut() {
@@ -1703,7 +1804,7 @@ where
             // Heartbeat every ~30s so we can see auto_flush is alive.
             // The tick counter is only for diagnostics and wraps harmlessly.
             tick += 1;
-            if tick % 3000 == 0 {
+            if tick.is_multiple_of(3000) {
                 tracing::info!(iteration = tick, "auto_flush: alive");
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
