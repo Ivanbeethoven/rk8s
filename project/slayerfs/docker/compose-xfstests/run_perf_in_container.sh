@@ -425,7 +425,7 @@ prepare_fio_dataset() {
         --name="${tool}-prepare"
         --directory="$work_dir"
         --rw=write
-        --bs="${PERF_FIO_PREP_BS:-1m}"
+        --bs="${PERF_FIO_PREP_BS:-4m}"
         --size="$dataset_size"
         --numjobs=1
         --ioengine="${PERF_FIO_PREP_IOENGINE:-sync}"
@@ -465,7 +465,7 @@ run_fio_custom() {
             --directory="$work_dir"
             --rw="${PERF_FIO_RW:-randrw}"
             --rwmixread="${PERF_FIO_RWMIXREAD:-70}"
-            --bs="${PERF_FIO_BS:-4k}"
+            --bs="${PERF_FIO_BS:-4m}"
             --size="${PERF_FIO_SIZE:-256m}"
             --numjobs="${PERF_FIO_NUMJOBS:-4}"
             --ioengine="${PERF_FIO_IOENGINE:-sync}"
@@ -528,7 +528,7 @@ run_fio_profile() {
             seqread)
                 name="$(env_or_default "$name_var" PERF_FIO_NAME slayerfs-seqread)"
                 rw="$(env_or_default "$rw_var" PERF_FIO_RW read)"
-                bs="$(env_or_default "$bs_var" PERF_FIO_BS 1m)"
+                bs="$(env_or_default "$bs_var" PERF_FIO_BS 4m)"
                 size="$(env_or_default "$size_var" PERF_FIO_SIZE 1g)"
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 1)"
                 ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE sync)"
@@ -540,7 +540,7 @@ run_fio_profile() {
             seqwrite)
                 name="$(env_or_default "$name_var" PERF_FIO_NAME slayerfs-seqwrite)"
                 rw="$(env_or_default "$rw_var" PERF_FIO_RW write)"
-                bs="$(env_or_default "$bs_var" PERF_FIO_BS 1m)"
+                bs="$(env_or_default "$bs_var" PERF_FIO_BS 4m)"
                 size="$(env_or_default "$size_var" PERF_FIO_SIZE 1g)"
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 1)"
                 ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE sync)"
@@ -551,7 +551,7 @@ run_fio_profile() {
             randread)
                 name="$(env_or_default "$name_var" PERF_FIO_NAME slayerfs-randread)"
                 rw="$(env_or_default "$rw_var" PERF_FIO_RW randread)"
-                bs="$(env_or_default "$bs_var" PERF_FIO_BS 4k)"
+                bs="$(env_or_default "$bs_var" PERF_FIO_BS 4m)"
                 size="$(env_or_default "$size_var" PERF_FIO_SIZE 512m)"
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 4)"
                 ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE sync)"
@@ -563,7 +563,7 @@ run_fio_profile() {
             randwrite)
                 name="$(env_or_default "$name_var" PERF_FIO_NAME slayerfs-randwrite)"
                 rw="$(env_or_default "$rw_var" PERF_FIO_RW randwrite)"
-                bs="$(env_or_default "$bs_var" PERF_FIO_BS 4k)"
+                bs="$(env_or_default "$bs_var" PERF_FIO_BS 4m)"
                 size="$(env_or_default "$size_var" PERF_FIO_SIZE 512m)"
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 4)"
                 ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE sync)"
@@ -575,7 +575,7 @@ run_fio_profile() {
                 name="$(env_or_default "$name_var" PERF_FIO_NAME slayerfs-randrw)"
                 rw="$(env_or_default "$rw_var" PERF_FIO_RW randrw)"
                 rwmixread="$(env_or_default "$rwmixread_var" PERF_FIO_RWMIXREAD 70)"
-                bs="$(env_or_default "$bs_var" PERF_FIO_BS 4k)"
+                bs="$(env_or_default "$bs_var" PERF_FIO_BS 4m)"
                 size="$(env_or_default "$size_var" PERF_FIO_SIZE 512m)"
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 4)"
                 ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE sync)"

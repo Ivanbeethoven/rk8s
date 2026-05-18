@@ -73,8 +73,8 @@ bash compose-xfstests/run_etcd_perf.sh \
 
 `fio` 相关 workload：
 - `fio-seqread` / `fio-seqwrite`：顺序读写吞吐
-- `fio-randread` / `fio-randwrite`：4k 随机读写 IOPS/时延
-- `fio-randrw`：随机混合读写
+- `fio-randread` / `fio-randwrite`：4m 随机读写 IOPS/时延
+- `fio-randrw`：4m 随机混合读写
 - `fio`：保留原始自定义模式，适合配合 `PERF_FIO_ARGS` 完全手工指定参数
 
 对象存储后端：
