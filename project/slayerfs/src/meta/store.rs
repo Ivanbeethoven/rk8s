@@ -145,6 +145,33 @@ pub struct StatFsSnapshot {
     pub available_inodes: u64,
 }
 
+/// Explicit feature declaration for a metadata backend.
+///
+/// The `MetaStore` trait intentionally contains optional methods while SlayerFS
+/// is converging on JuiceFS-level semantics. These flags let callers and tools
+/// distinguish implemented backend features from trait-level placeholders.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MetaStoreCapabilities {
+    pub namespace: bool,
+    pub file_data: bool,
+    pub batch_stat: bool,
+    pub hardlinks: bool,
+    pub symlinks: bool,
+    pub rename_exchange: bool,
+    pub open_close_tracking: bool,
+    pub stat_fs: bool,
+    pub sessions: bool,
+    pub global_locks: bool,
+    pub plocks: bool,
+    pub flocks: bool,
+    pub xattr: bool,
+    pub acl: bool,
+    pub quota: bool,
+    pub dump_load: bool,
+    pub compaction: bool,
+    pub watch_invalidation: bool,
+}
+
 /// Directory entry
 #[derive(Debug, Clone)]
 pub struct DirEntry {
@@ -415,6 +442,11 @@ pub trait MetaStore: Send + Sync {
     /// Human readable backend name (for diagnostics and logging)
     fn name(&self) -> &'static str {
         "meta-store"
+    }
+
+    /// Returns the optional feature set implemented by this backend.
+    fn capabilities(&self) -> MetaStoreCapabilities {
+        MetaStoreCapabilities::default()
     }
 
     /// Build a concrete store instance from backend config.

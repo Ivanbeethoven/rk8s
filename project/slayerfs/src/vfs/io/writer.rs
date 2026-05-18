@@ -42,6 +42,7 @@ const FLUSH_DURATION: Duration = Duration::from_secs(5);
 const COMMIT_WAIT_SLICE: Duration = Duration::from_millis(100);
 const FLUSH_WAIT: Duration = Duration::from_secs(3);
 const FLUSH_DEADLINE: Duration = Duration::from_secs(300);
+const TRUNCATE_FLUSH_DEADLINE: Duration = Duration::from_secs(10);
 /// Shorter deadline for close-triggered flushes.  FUSE already calls flush()
 /// before close(), so close() only needs to drain residual in-flight work.
 const CLOSE_FLUSH_DEADLINE: Duration = Duration::from_secs(5);
@@ -66,6 +67,15 @@ const WRITE_MAX_WAIT: Duration = Duration::from_secs(30);
 /// and force-seal regardless of size.
 /// NOTE: This is the fallback; prefer config.freeze_min_bytes when available.
 const SHOULD_FREEZE_MIN_BYTES: u64 = 8 * 1024 * 1024;
+
+fn truncate_flush_deadline() -> Duration {
+    std::env::var("SLAYERFS_TRUNCATE_FLUSH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(TRUNCATE_FLUSH_DEADLINE)
+}
 
 fn commit_retry_backoff(failures: u32) -> Duration {
     let exp = failures.saturating_sub(1).min(16);
@@ -1936,6 +1946,33 @@ where
             if ms > 100 {
                 tracing::info!(ino, elapsed_ms = ms, "flush_required: slow flush");
             }
+        }
+        Ok(())
+    }
+
+    /// Truncate/ftruncate runs on the kernel SETATTR path.  A 300s writeback
+    /// wait looks like a stuck FUSE request, so use a short, explicit deadline
+    /// and log the operation boundary for xfstests-style debugging.
+    pub(crate) async fn flush_required_for_truncate(&self, ino: u64) -> anyhow::Result<()> {
+        let writer = self.files.get(&ino).map(|entry| entry.value().clone());
+        if let Some(writer) = writer
+            && writer.has_pending().await
+        {
+            let deadline = truncate_flush_deadline();
+            let start = Instant::now();
+            tracing::info!(
+                ino,
+                timeout_ms = deadline.as_millis() as u64,
+                "truncate flush_required: start"
+            );
+            writer.flush_with_deadline(deadline).await.map_err(|err| {
+                anyhow::anyhow!("truncate flush failed after {:?} for ino {ino}: {err}", deadline)
+            })?;
+            tracing::info!(
+                ino,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "truncate flush_required: completed"
+            );
         }
         Ok(())
     }

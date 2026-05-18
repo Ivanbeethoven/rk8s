@@ -121,8 +121,7 @@ fn init_tracing() {
     use tracing_subscriber::Layer as _;
     use tracing_subscriber::Registry;
 
-    let rust_log =
-        std::env::var("RUST_LOG").unwrap_or_else(|_| "slayerfs=info".to_string());
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "slayerfs=info".to_string());
 
     let fuse_log_path = std::env::var("SLAYERFS_FUSE_LOG_FILE").ok();
     let main_log_path = std::env::var("SLAYERFS_LOG_FILE").ok();
@@ -439,6 +438,8 @@ async fn info_cmd(args: InfoArgs) -> anyhow::Result<()> {
             mount_point,
             started_at,
             version,
+            meta_backend,
+            capabilities,
         } => {
             let started_at = chrono::DateTime::from_timestamp_millis(started_at)
                 .map(|dt| dt.to_rfc3339())
@@ -448,6 +449,8 @@ async fn info_cmd(args: InfoArgs) -> anyhow::Result<()> {
             println!("pid: {pid}");
             println!("started_at: {started_at}");
             println!("version: {version}");
+            println!("meta_backend: {meta_backend}");
+            println!("capabilities: {}", serde_json::to_string(&capabilities)?);
             Ok(())
         }
         ControlResponse::Error { code, message } => {

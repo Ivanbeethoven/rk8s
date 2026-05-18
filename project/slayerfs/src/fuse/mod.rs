@@ -576,6 +576,7 @@ where
         set_attr: SetAttr,
     ) -> FuseResult<ReplyAttr> {
         debug!(unique = req.unique, ino, set_attr = ?set_attr, "fuse.setattr");
+        let setattr_start = std::time::Instant::now();
 
         let (meta_req, meta_flags) = fuse_setattr_to_meta(&set_attr);
 
@@ -592,10 +593,29 @@ where
         }
 
         // Apply the attribute changes
-        let vattr = self
-            .set_attr(ino as i64, &meta_req, meta_flags)
-            .await
-            .map_err(Into::<Errno>::into)?;
+        let vattr = match self.set_attr(ino as i64, &meta_req, meta_flags).await {
+            Ok(vattr) => {
+                debug!(
+                    unique = req.unique,
+                    ino,
+                    size = ?meta_req.size,
+                    elapsed_ms = setattr_start.elapsed().as_millis() as u64,
+                    "fuse.setattr complete"
+                );
+                vattr
+            }
+            Err(err) => {
+                warn!(
+                    unique = req.unique,
+                    ino,
+                    size = ?meta_req.size,
+                    elapsed_ms = setattr_start.elapsed().as_millis() as u64,
+                    error = %err,
+                    "fuse.setattr failed"
+                );
+                return Err(Errno::from(err));
+            }
+        };
 
         let attr = vfs_to_fuse_attr(&vattr, &req, self.blocks_for_attr(&vattr));
 

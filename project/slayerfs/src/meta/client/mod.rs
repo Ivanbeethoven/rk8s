@@ -1121,6 +1121,8 @@ impl<T: MetaStore + ?Sized + 'static> ControlHandler for Arc<MetaClient<T>> {
                         mount_point: state.record.mount_point.clone(),
                         started_at: state.record.started_at.timestamp_millis(),
                         version: env!("CARGO_PKG_VERSION").to_string(),
+                        meta_backend: self.store.name().to_string(),
+                        capabilities: self.store.capabilities(),
                     }
                 } else {
                     ControlResponse::Error {
@@ -2364,11 +2366,16 @@ mod tests {
                 pid,
                 mount_point,
                 version,
+                meta_backend,
+                capabilities,
                 ..
             } => {
                 assert_eq!(pid, std::process::id());
                 assert_eq!(mount_point, "/mnt/info");
                 assert_eq!(version, env!("CARGO_PKG_VERSION"));
+                assert_eq!(meta_backend, "database");
+                assert!(capabilities.namespace);
+                assert!(capabilities.xattr);
             }
             other => panic!("unexpected info response: {other:?}"),
         }
