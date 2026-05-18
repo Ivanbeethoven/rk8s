@@ -1147,21 +1147,6 @@ where
                     }
                 }
 
-                // Best-effort persist to local SSD for crash recovery.
-                // Upload proceeds from memory regardless of SSD persist result.
-                if let Some(wb) = &shared.write_back {
-                    let ino = shared.inode.ino() as i64;
-                    let key = crate::vfs::cache::keys::DirtySliceKey {
-                        ino,
-                        chunk_id,
-                        local_seq: wb.next_seq(),
-                        epoch: 0,
-                    };
-                    if let Err(e) = wb.persist_slice(key, all_chunks.clone()).await {
-                        tracing::debug!(ino, chunk_id, error = ?e, "SSD persist skipped");
-                    }
-                }
-
                 let slice_id = match slice_id {
                     Some(slice_id) => slice_id,
                     None => match handle.shared.backend.meta().next_id(SLICE_ID_KEY).await {
@@ -1180,6 +1165,22 @@ where
                 // The blocks to upload/write should be relative to the slice itself.
                 // Otherwise, a previously uploaded block may be overwritten.
                 let offset = uploaded;
+
+                // Best-effort persist to local SSD for crash recovery. Use the
+                // final remote slice_id as the local key so commit cleanup can
+                // remove the exact dirty record it just made durable.
+                if let Some(wb) = &shared.write_back {
+                    let ino = shared.inode.ino() as i64;
+                    let key = crate::vfs::cache::keys::DirtySliceKey {
+                        ino,
+                        chunk_id,
+                        local_seq: slice_id,
+                        epoch: 0,
+                    };
+                    if let Err(e) = wb.persist_slice(key, all_chunks.clone(), offset).await {
+                        tracing::debug!(ino, chunk_id, slice_id, error = ?e, "SSD persist skipped");
+                    }
+                }
 
                 let uploader = DataUploader::new(shared.config.layout, &shared.backend);
                 let result = backoff(UPLOAD_MAX_RETRIES, || async {
@@ -1346,8 +1347,7 @@ where
                         .desc_for_commit();
 
                         if let Some(desc) = desc {
-                            let (ino, chunk_index) =
-                                extract_ino_and_chunk_index(desc.chunk_id);
+                            let (ino, chunk_index) = extract_ino_and_chunk_index(desc.chunk_id);
                             let file_offset =
                                 chunk_index * shared.config.layout.chunk_size + desc.offset;
                             let new_size = file_offset + desc.length;
@@ -1420,127 +1420,128 @@ where
                     .mark_committed();
                     should_pop = true;
                 } else {
-                let desc = SliceHandle {
-                    slice: &slice,
-                    shared: &shared,
-                }
-                .desc_for_commit();
+                    let desc = SliceHandle {
+                        slice: &slice,
+                        shared: &shared,
+                    }
+                    .desc_for_commit();
 
-                if let Some(desc) = desc {
-                    let (ino, chunk_index) = extract_ino_and_chunk_index(desc.chunk_id);
-                    let file_offset = chunk_index * shared.config.layout.chunk_size + desc.offset;
-                    let new_size = file_offset + desc.length;
+                    if let Some(desc) = desc {
+                        let (ino, chunk_index) = extract_ino_and_chunk_index(desc.chunk_id);
+                        let file_offset =
+                            chunk_index * shared.config.layout.chunk_size + desc.offset;
+                        let new_size = file_offset + desc.length;
 
-                    let result = shared
-                        .backend
-                        .meta()
-                        .write(ino, desc.chunk_id, desc, new_size)
-                        .instrument(tracing::trace_span!(
-                            "commit_chunk.meta_write",
-                            ino,
-                            chunk_id = desc.chunk_id,
-                            slice_id = desc.slice_id,
-                            offset = desc.offset,
-                            len = desc.length,
-                            new_size
-                        ))
-                        .await;
-
-                    if let Err(err) = result {
-                        let retryable = should_retry_meta_write(&err);
-                        if retryable {
-                            commit_failures = commit_failures.saturating_add(1);
-                        }
-
-                        if !retryable || commit_failures >= COMMIT_META_MAX_RETRIES {
-                            let message = if retryable {
-                                format!(
-                                    "metadata commit failed after {commit_failures} attempts for ino {ino}, chunk {}, slice {}: {err}",
-                                    desc.chunk_id, desc.slice_id
-                                )
-                            } else {
-                                format!(
-                                    "metadata commit failed with non-retryable error for ino {ino}, chunk {}, slice {}: {err}",
-                                    desc.chunk_id, desc.slice_id
-                                )
-                            };
-                            warn!(
+                        let result = shared
+                            .backend
+                            .meta()
+                            .write(ino, desc.chunk_id, desc, new_size)
+                            .instrument(tracing::trace_span!(
+                                "commit_chunk.meta_write",
                                 ino,
                                 chunk_id = desc.chunk_id,
                                 slice_id = desc.slice_id,
                                 offset = desc.offset,
                                 len = desc.length,
-                                new_size,
-                                retry_failures = commit_failures,
-                                retryable,
-                                error = ?err,
-                                "commit_chunk meta write failed, giving up"
-                            );
+                                new_size
+                            ))
+                            .await;
+
+                        if let Err(err) = result {
+                            let retryable = should_retry_meta_write(&err);
+                            if retryable {
+                                commit_failures = commit_failures.saturating_add(1);
+                            }
+
+                            if !retryable || commit_failures >= COMMIT_META_MAX_RETRIES {
+                                let message = if retryable {
+                                    format!(
+                                        "metadata commit failed after {commit_failures} attempts for ino {ino}, chunk {}, slice {}: {err}",
+                                        desc.chunk_id, desc.slice_id
+                                    )
+                                } else {
+                                    format!(
+                                        "metadata commit failed with non-retryable error for ino {ino}, chunk {}, slice {}: {err}",
+                                        desc.chunk_id, desc.slice_id
+                                    )
+                                };
+                                warn!(
+                                    ino,
+                                    chunk_id = desc.chunk_id,
+                                    slice_id = desc.slice_id,
+                                    offset = desc.offset,
+                                    len = desc.length,
+                                    new_size,
+                                    retry_failures = commit_failures,
+                                    retryable,
+                                    error = ?err,
+                                    "commit_chunk meta write failed, giving up"
+                                );
+                                SliceHandle {
+                                    slice: &slice,
+                                    shared: &shared,
+                                }
+                                .mark_failed(anyhow::anyhow!(message));
+                                should_pop = true;
+                            } else {
+                                let backoff = commit_retry_backoff(commit_failures);
+                                let reason = match &err {
+                                    MetaError::ContinueRetry(r) => r.to_string(),
+                                    _ => "backend_error".to_string(),
+                                };
+                                warn!(
+                                    ino,
+                                    chunk_id = desc.chunk_id,
+                                    slice_id = desc.slice_id,
+                                    offset = desc.offset,
+                                    len = desc.length,
+                                    new_size,
+                                    retry_failures = commit_failures,
+                                    retry_backoff_ms = backoff.as_millis() as u64,
+                                    %reason,
+                                    error = ?err,
+                                    "commit_chunk meta write failed, retrying"
+                                );
+                            }
+                        } else {
+                            commit_failures = 0;
                             SliceHandle {
                                 slice: &slice,
                                 shared: &shared,
                             }
-                            .mark_failed(anyhow::anyhow!(message));
+                            .mark_committed();
+
+                            // Track committed bytes on the inode for accurate st_blocks.
+                            shared
+                                .inode
+                                .add_estimated_allocated_bytes(desc.length.as_usize() as u64);
+
+                            // Clean up local SSD dirty copy now that data is committed.
+                            if let Some(wb) = &shared.write_back {
+                                let key = crate::vfs::cache::keys::DirtySliceKey {
+                                    ino: ino as i64,
+                                    chunk_id: desc.chunk_id,
+                                    local_seq: desc.slice_id,
+                                    epoch: 0,
+                                };
+                                let _ = wb.remove(&key).await;
+                            }
+
+                            let _ = shared
+                                .reader
+                                .invalidate(ino as u64, file_offset, desc.length.as_usize())
+                                .instrument(tracing::trace_span!(
+                                    "commit_chunk.invalidate",
+                                    ino,
+                                    offset = file_offset,
+                                    len = desc.length
+                                ))
+                                .await;
                             should_pop = true;
-                        } else {
-                            let backoff = commit_retry_backoff(commit_failures);
-                            let reason = match &err {
-                                MetaError::ContinueRetry(r) => r.to_string(),
-                                _ => "backend_error".to_string(),
-                            };
-                            warn!(
-                                ino,
-                                chunk_id = desc.chunk_id,
-                                slice_id = desc.slice_id,
-                                offset = desc.offset,
-                                len = desc.length,
-                                new_size,
-                                retry_failures = commit_failures,
-                                retry_backoff_ms = backoff.as_millis() as u64,
-                                %reason,
-                                error = ?err,
-                                "commit_chunk meta write failed, retrying"
-                            );
                         }
                     } else {
-                        commit_failures = 0;
-                        SliceHandle {
-                            slice: &slice,
-                            shared: &shared,
-                        }
-                        .mark_committed();
-
-                        // Track committed bytes on the inode for accurate st_blocks.
-                        shared
-                            .inode
-                            .add_estimated_allocated_bytes(desc.length.as_usize() as u64);
-
-                        // Clean up local SSD dirty copy now that data is committed.
-                        if let Some(wb) = &shared.write_back {
-                            let key = crate::vfs::cache::keys::DirtySliceKey {
-                                ino: ino as i64,
-                                chunk_id: desc.chunk_id,
-                                local_seq: desc.slice_id,
-                                epoch: 0,
-                            };
-                            let _ = wb.remove(&key).await;
-                        }
-
-                        let _ = shared
-                            .reader
-                            .invalidate(ino as u64, file_offset, desc.length.as_usize())
-                            .instrument(tracing::trace_span!(
-                                "commit_chunk.invalidate",
-                                ino,
-                                offset = file_offset,
-                                len = desc.length
-                            ))
-                            .await;
                         should_pop = true;
                     }
-                } else {
-                    should_pop = true;
-                }
                 } // end epoch-ok else block
             } else if matches!(runtime.status, SliceStatus::Committed) {
                 should_pop = true;
@@ -1572,7 +1573,9 @@ where
                 let mut guard = shared
                     .inner
                     .lock()
-                    .instrument(tracing::trace_span!("commit_chunk.move_to_recently_committed"))
+                    .instrument(tracing::trace_span!(
+                        "commit_chunk.move_to_recently_committed"
+                    ))
                     .await;
                 if let Some(chunk) = guard.chunks.get_mut(&chunk_id) {
                     if let Some(s) = chunk.slices.pop_front() {
@@ -1682,9 +1685,9 @@ where
                 let mut emptied = Vec::new();
                 for (cid, chunk) in guard.chunks.iter_mut() {
                     // Keep recently-committed slices for ~2 s.
-                    chunk.recently_committed.retain(|s| {
-                        s.lock().started.elapsed() < Duration::from_secs(2)
-                    });
+                    chunk
+                        .recently_committed
+                        .retain(|s| s.lock().started.elapsed() < Duration::from_secs(2));
                     if chunk.slices.is_empty() && chunk.recently_committed.is_empty() {
                         emptied.push(*cid);
                     }

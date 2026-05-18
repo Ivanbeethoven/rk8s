@@ -4,8 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures_channel::mpsc::{channel, Receiver, Sender, UnboundedSender};
-use futures_util::sink::SinkExt;
+use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_util::stream::StreamExt;
 use tracing::debug;
 
@@ -78,8 +77,8 @@ impl<FS: Filesystem + Send + Sync + 'static> DispatchCtx<FS> {
 #[derive(Debug)]
 /// Worker pool for processing FUSE requests
 pub(crate) struct Workers<FS: Filesystem + Send + Sync + 'static> {
-    /// Input queues for each worker
-    senders: Vec<Sender<WorkItem>>,
+    /// Input queues for each worker (unbounded)
+    senders: Vec<UnboundedSender<WorkItem>>,
     /// Round-robin counter for load balancing
     next: AtomicUsize,
     #[allow(dead_code)]
@@ -90,13 +89,13 @@ pub(crate) struct Workers<FS: Filesystem + Send + Sync + 'static> {
 impl<FS: Filesystem + Send + Sync + 'static> Workers<FS> {
     pub(crate) fn new(
         worker_count: usize,
-        queue_capacity: usize,
+        _queue_capacity: usize,
         _ctx: Arc<DispatchCtx<FS>>,
     ) -> Self {
         let mut senders = Vec::with_capacity(worker_count);
         let mut handles = Vec::with_capacity(worker_count);
         for idx in 0..worker_count {
-            let (tx, mut rx): (Sender<WorkItem>, Receiver<WorkItem>) = channel(queue_capacity);
+            let (tx, mut rx): (UnboundedSender<WorkItem>, UnboundedReceiver<WorkItem>) = unbounded();
             let ctx_clone = _ctx.clone();
             #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
             let handle = task::spawn(async move {
@@ -123,10 +122,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Workers<FS> {
         }
     }
 
-    pub(crate) async fn submit(&self, item: WorkItem) {
+    pub(crate) fn submit(&self, item: WorkItem) {
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
-        if self.senders[idx].clone().send(item).await.is_err() {
-            // failed to enqueue
+        if self.senders[idx].unbounded_send(item).is_err() {
             tracing::warn!("failed to enqueue work item, channel closed");
         }
     }

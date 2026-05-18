@@ -33,6 +33,7 @@ pub trait WriteBackCache: Send + Sync {
         &self,
         key: DirtySliceKey,
         data: Vec<Bytes>,
+        chunk_offset: u64,
     ) -> anyhow::Result<PathBuf>;
 
     /// Open a persisted slice for reading (used by the uploader).
@@ -42,11 +43,7 @@ pub trait WriteBackCache: Send + Sync {
     ) -> anyhow::Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>>;
 
     /// Update the state of a dirty slice record.
-    async fn mark_state(
-        &self,
-        key: &DirtySliceKey,
-        state: DirtySliceState,
-    ) -> anyhow::Result<()>;
+    async fn mark_state(&self, key: &DirtySliceKey, state: DirtySliceState) -> anyhow::Result<()>;
 
     /// Recover all non-terminal dirty slice records after a crash.
     async fn recover(&self) -> anyhow::Result<Vec<DirtySliceRecord>>;
@@ -101,6 +98,7 @@ impl WriteBackCache for FsWriteBackCache {
         &self,
         key: DirtySliceKey,
         data: Vec<Bytes>,
+        chunk_offset: u64,
     ) -> anyhow::Result<PathBuf> {
         let dir = key.dir_path(&self.root);
         fs::create_dir_all(&dir).await?;
@@ -128,7 +126,7 @@ impl WriteBackCache for FsWriteBackCache {
             key,
             ino: key.ino,
             chunk_id: key.chunk_id,
-            chunk_offset: 0,
+            chunk_offset,
             length: total_len,
             remote_slice_id: None,
             state: DirtySliceState::Sealed,
@@ -150,11 +148,7 @@ impl WriteBackCache for FsWriteBackCache {
         Ok(Box::new(file))
     }
 
-    async fn mark_state(
-        &self,
-        key: &DirtySliceKey,
-        state: DirtySliceState,
-    ) -> anyhow::Result<()> {
+    async fn mark_state(&self, key: &DirtySliceKey, state: DirtySliceState) -> anyhow::Result<()> {
         let meta_path = key.meta_path(&self.root);
         if meta_path.exists() {
             let mut record = self.read_meta(&meta_path).await?;
@@ -186,10 +180,12 @@ impl WriteBackCache for FsWriteBackCache {
                     let path = file_entry.path();
                     if path.extension().and_then(|e| e.to_str()) == Some("meta") {
                         match self.read_meta(&path).await {
-                            Ok(record) if !matches!(
-                                record.state,
-                                DirtySliceState::Committed | DirtySliceState::Obsolete
-                            ) => {
+                            Ok(record)
+                                if !matches!(
+                                    record.state,
+                                    DirtySliceState::Committed | DirtySliceState::Obsolete
+                                ) =>
+                            {
                                 records.push(record);
                             }
                             Ok(_) => {}
@@ -227,7 +223,9 @@ impl FsWriteBackCache {
         chunk_offset: u64,
         buf: &mut [u8],
     ) -> anyhow::Result<()> {
-        let chunk_dir = self.root.join("dirty")
+        let chunk_dir = self
+            .root
+            .join("dirty")
             .join(ino.to_string())
             .join(chunk_id.to_string());
 
@@ -268,7 +266,8 @@ impl FsWriteBackCache {
 
             let mut file = fs::File::open(&record.path).await?;
             file.seek(std::io::SeekFrom::Start(file_offset)).await?;
-            file.read_exact(&mut buf[dst_start..dst_start + read_len]).await?;
+            file.read_exact(&mut buf[dst_start..dst_start + read_len])
+                .await?;
         }
 
         Ok(())

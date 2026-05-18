@@ -56,7 +56,7 @@ use futures_channel::{
     mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
-use futures_util::future::{select_all, Either, FutureExt};
+use futures_util::future::Either;
 #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
 use futures_util::select;
 use futures_util::sink::SinkExt;
@@ -684,10 +684,12 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             .map(|r| r.take().unwrap())
             .collect();
 
-        let mut tasks: Vec<Pin<Box<dyn Future<Output = IoResult<()>> + Send>>> =
-            Vec::with_capacity(reply_count + 1);
-        tasks.push(Box::pin(self.dispatch(ready_sender)));
-
+        // Spawn reply tasks independently — they live for the lifetime of the
+        // runtime and stop naturally when their channels close. We intentionally
+        // do NOT use select_all here: if any reply task exits early (e.g. due to
+        // a transient /dev/fuse write error), the entire mount would be torn down,
+        // potentially losing replies for in-flight FUSE requests and causing the
+        // kernel to hang in wait_sb_inodes.
         for (i, rx) in rx_vec.into_iter().enumerate() {
             let conn = if i == 0 {
                 fuse_write_connection.clone()
@@ -695,20 +697,14 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 Arc::new(fuse_write_connection.try_clone()?)
             };
 
-            tasks.push(Box::pin(task::spawn(Self::reply_fuse(conn, rx)).map(|r| {
-                #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
-                {
-                    r.unwrap()
+            task::spawn(async move {
+                if let Err(e) = Self::reply_fuse(conn, rx).await {
+                    tracing::error!("reply fuse task {i} exited: {e}");
                 }
-                #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-                {
-                    r
-                }
-            })));
+            });
         }
 
-        let (result, _index, _remaining) = select_all(tasks).await;
-        result
+        self.dispatch(ready_sender).await
     }
 
     async fn reply_fuse(
@@ -716,7 +712,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         mut response_receiver: UnboundedReceiver<FuseData>,
     ) -> IoResult<()> {
         while let Some(response) = response_receiver.next().await {
-            let (mut data, extend_data) = match response {
+            let (mut data, mut extend_data) = match response {
                 Either::Left(data) => (data, None),
                 Either::Right((data, extend_data)) => (data, Some(extend_data)),
             };
@@ -744,30 +740,38 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 None
             };
 
-            if let Err(err) = fuse_connection.write_vectored(data, extend_data).await.1 {
-                use std::io::ErrorKind;
-                if err.kind() == ErrorKind::NotFound {
-                    warn!(
-                        "may reply interrupted fuse request, ignore this error {}",
-                        err
-                    );
-
-                    continue;
+            // Retry loop: keep writing this reply until it succeeds, the kernel
+            // forgets the request (NotFound), or the channel is closed.
+            loop {
+                let ((ret_data, ret_ext), result) =
+                    fuse_connection.write_vectored(data, extend_data).await;
+                match result {
+                    Ok(_) => break,
+                    Err(err) => {
+                        data = ret_data;
+                        extend_data = ret_ext;
+                        use std::io::ErrorKind;
+                        if err.kind() == ErrorKind::NotFound {
+                            warn!(
+                                "may reply interrupted fuse request, ignore this error {}",
+                                err
+                            );
+                            break;
+                        }
+                        if let Some((len, err_code, unique)) = reply_header {
+                            warn!(
+                                error = %err,
+                                reply_len = len,
+                                reply_error = err_code,
+                                unique,
+                                "reply fuse write error, retrying"
+                            );
+                        } else {
+                            warn!("reply fuse write error, retrying: {}", err);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
                 }
-
-                if let Some((len, err_code, unique)) = reply_header {
-                    error!(
-                        error = %err,
-                        reply_len = len,
-                        reply_error = err_code,
-                        unique,
-                        "reply fuse failed"
-                    );
-                } else {
-                    error!("reply fuse failed {}", err);
-                }
-
-                return Err(err);
             }
         }
 
@@ -1042,8 +1046,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         in_header: lite,
                         data: body_bytes,
                         _inflight_guard: inflight_guard,
-                    })
-                    .await;
+                    });
             } else {
                 // Will concurrency in a single-threaded context cause disorder in the sequence of operations on a single file?
                 match opcode {
@@ -1539,13 +1542,16 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             init_reply.max_write
         };
 
+        let max_background = u16::try_from(self.max_background).unwrap_or(u16::MAX).max(1);
+        let congestion_threshold = (max_background.saturating_mul(3) / 4).max(1);
+
         let init_out = fuse_init_out {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_KERNEL_MINOR_VERSION,
             max_readahead,
             flags: reply_flags,
-            max_background: DEFAULT_MAX_BACKGROUND,
-            congestion_threshold: DEFAULT_CONGESTION_THRESHOLD,
+            max_background,
+            congestion_threshold,
             max_write: max_write.get(),
             time_gran: DEFAULT_TIME_GRAN,
             max_pages: DEFAULT_MAX_PAGES,
