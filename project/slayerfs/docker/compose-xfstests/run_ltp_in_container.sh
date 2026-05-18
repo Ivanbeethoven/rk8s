@@ -169,6 +169,26 @@ prepare_results_dir() {
     mkdir -p "$artifact_dir/results" "$artifact_dir/output"
 }
 
+mount_slayerfs() {
+    info "mount SlayerFS: $mount_dir"
+    mkdir -p "$mount_dir"
+
+    local max_wait="${SLAYERFS_MOUNT_WAIT_SECS:-5}"
+    mount -t fuse.slayerfs slayerfs "$mount_dir"
+
+    local waited=0
+    while [[ $waited -lt $max_wait ]]; do
+        if mount | grep -q " on $mount_dir type fuse"; then
+            ok "SlayerFS mounted at $mount_dir"
+            return 0
+        fi
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    err "SlayerFS mount did not appear at $mount_dir after ${max_wait}s"
+    return 1
+}
+
 copy_artifacts() {
     mkdir -p "$artifact_dir"
     if [[ -f "$log_file" && "$log_file" != "$artifact_dir/slayerfs.log" ]]; then
@@ -390,6 +410,8 @@ main() {
 
     info "prepare results dir"
     prepare_results_dir
+
+    mount_slayerfs
 
     info "run LTP ($ltp_scenarios): mount=$mount_dir"
     set +e

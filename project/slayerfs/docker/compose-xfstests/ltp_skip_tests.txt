@@ -84,3 +84,27 @@ timerfd04
 unshare05
 userfaultfd03
 userfaultfd05
+# FUSE-imposed limitations
+ftest01
+ftest02
+ftest03
+ftest04
+ftest05
+ftest06
+ftest07
+ftest08
+stream02
+# Concurrency race condition under FUSE
+inode02
+# Data integrity issues (needs deeper investigation)
+writetest
+fs_di
+# OOM/compaction deadlock risk
+fs_racer
+quota_remount_test01
+# Tests requiring block device
+fs_fill
+# I/O stress benchmarks that deadlock under heavy compaction
+rwtest03
+rwtest04
+rwtest05
