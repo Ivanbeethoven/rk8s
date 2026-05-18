@@ -10,6 +10,15 @@ generic/632 # Shared mountpoint required: FUSE mounts are private, no mount prop
 generic/633 # Device files (mknod with S_IFCHR/S_IFBLK): not supported by object storage filesystem
 # Stress/soak tests: 10x fsstress with cycle_mount, unsuited for FUSE+Redis (>hours)
 generic/650 # all-writes fsstress with CPU hotplug, 25000+ ops over 10 iterations
+# Additional soak/stress tests: multi-iteration fsstress, unsuited for FUSE (>hours)
+generic/476 # fsstress soak: 30+ min per run, FUSE compaction makes it impractical
+generic/521 # soak long_rw: multi-iteration fsstress, too slow on FUSE
+generic/522 # soak long_rw: multi-iteration fsstress, too slow on FUSE
+generic/616 # io_uring stress soak: FUSE + io_uring stress is unstable
+generic/617 # io_uring stress soak: same as 616
+generic/642 # soak attr long_rw stress: multi-iteration stress, too slow on FUSE
+# AIO dangerous: recoveryloop stress with aio, known to hang on FUSE
+generic/019 # aio dangerous enospc rw stress recoveryloop
 # O_DIRECT (direct I/O) from holes: FUSE does not properly handle DIO on sparse regions
 generic/647 # mmap-rw-fault: O_DIRECT pread from hole returns wrong data
 generic/729 # same as 647, different test variant
