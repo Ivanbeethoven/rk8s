@@ -721,6 +721,41 @@ mod io_tests {
     }
 
     #[tokio::test]
+    async fn test_set_attr_truncate_flushes_cached_write_without_hanging() {
+        let layout = ChunkLayout::default();
+        let store = InMemoryBlockStore::new();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let fs = VFS::new(layout, store, meta_store).await.unwrap();
+
+        fs.create_file("/setattr-truncate.bin").await.unwrap();
+        let attr = fs.stat("/setattr-truncate.bin").await.unwrap();
+        let data = b"pending-data-before-ftruncate";
+
+        fs.write_cached_ino(attr.ino, 0, data).await.unwrap();
+        let inode = fs.ensure_inode_registered(attr.ino).await.unwrap();
+        let writer = fs.state.writer.ensure_file(inode);
+        assert!(writer.has_pending().await);
+
+        let req = crate::meta::store::SetAttrRequest {
+            size: Some(7),
+            ..Default::default()
+        };
+        let attr = tokio::time::timeout(
+            Duration::from_secs(5),
+            fs.set_attr(attr.ino, &req, crate::meta::store::SetAttrFlags::empty()),
+        )
+        .await
+        .expect("set_attr truncate should not hang behind writeback")
+        .unwrap();
+
+        assert_eq!(attr.size, 7);
+        assert!(!writer.has_pending().await);
+        let out = read_path(&fs, "/setattr-truncate.bin", 0, 32).await;
+        assert_eq!(out, data[..7].to_vec());
+    }
+
+    #[tokio::test]
     async fn test_fs_fallocate_ino_extends_file_and_zero_fills() {
         let layout = ChunkLayout::default();
         let store = InMemoryBlockStore::new();

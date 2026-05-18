@@ -1477,6 +1477,29 @@ impl MetaStore for EtcdMetaStore {
         "etcd"
     }
 
+    fn capabilities(&self) -> crate::meta::store::MetaStoreCapabilities {
+        crate::meta::store::MetaStoreCapabilities {
+            namespace: true,
+            file_data: true,
+            batch_stat: true,
+            hardlinks: true,
+            symlinks: true,
+            rename_exchange: true,
+            open_close_tracking: false,
+            stat_fs: false,
+            sessions: true,
+            global_locks: true,
+            plocks: true,
+            flocks: false,
+            xattr: false,
+            acl: false,
+            quota: false,
+            dump_load: false,
+            compaction: true,
+            watch_invalidation: true,
+        }
+    }
+
     async fn from_config(config: Config) -> Result<Self, MetaError> {
         Self::from_config_inner(config).await
     }

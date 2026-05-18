@@ -1844,6 +1844,29 @@ impl MetaStore for RedisMetaStore {
         "redis-meta-store"
     }
 
+    fn capabilities(&self) -> crate::meta::store::MetaStoreCapabilities {
+        crate::meta::store::MetaStoreCapabilities {
+            namespace: true,
+            file_data: true,
+            batch_stat: true,
+            hardlinks: true,
+            symlinks: true,
+            rename_exchange: true,
+            open_close_tracking: false,
+            stat_fs: true,
+            sessions: true,
+            global_locks: true,
+            plocks: true,
+            flocks: true,
+            xattr: false,
+            acl: false,
+            quota: false,
+            dump_load: false,
+            compaction: true,
+            watch_invalidation: false,
+        }
+    }
+
     async fn from_config(config: Config) -> Result<Self, MetaError> {
         Self::from_config_inner(config).await
     }
@@ -2708,9 +2731,7 @@ impl MetaStore for RedisMetaStore {
                     .arg(0)
                     .arg(&entry_bytes)
                     .ignore();
-                pipe.cmd("INCR")
-                    .arg(&version_key)
-                    .ignore();
+                pipe.cmd("INCR").arg(&version_key).ignore();
             }
 
             pipe.hset(&ds_key, "st", "meta_deleted").ignore();
@@ -3019,9 +3040,7 @@ impl MetaStore for RedisMetaStore {
                         .arg(delayed_id)
                         .ignore();
                 }
-                pipe.query_async::<()>(&mut conn)
-                    .await
-                    .map_err(redis_err)?;
+                pipe.query_async::<()>(&mut conn).await.map_err(redis_err)?;
             }
 
             return Ok(());
@@ -3142,9 +3161,7 @@ impl MetaStore for RedisMetaStore {
                         .arg(slice.slice_id.to_string())
                         .ignore();
                 }
-                pipe.query_async::<()>(&mut conn)
-                    .await
-                    .map_err(redis_err)?;
+                pipe.query_async::<()>(&mut conn).await.map_err(redis_err)?;
             } else {
                 // No delayed slices, still clean up uncommitted records.
                 for slice in new_slices {

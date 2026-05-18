@@ -1167,6 +1167,29 @@ impl MetaStore for DatabaseMetaStore {
         "database"
     }
 
+    fn capabilities(&self) -> crate::meta::store::MetaStoreCapabilities {
+        crate::meta::store::MetaStoreCapabilities {
+            namespace: true,
+            file_data: true,
+            batch_stat: true,
+            hardlinks: true,
+            symlinks: true,
+            rename_exchange: true,
+            open_close_tracking: true,
+            stat_fs: true,
+            sessions: true,
+            global_locks: true,
+            plocks: true,
+            flocks: false,
+            xattr: true,
+            acl: false,
+            quota: false,
+            dump_load: false,
+            compaction: true,
+            watch_invalidation: false,
+        }
+    }
+
     async fn from_config(config: Config) -> Result<Self, MetaError> {
         Self::from_config_inner(config).await
     }

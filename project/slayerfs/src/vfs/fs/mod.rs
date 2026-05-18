@@ -1571,6 +1571,46 @@ where
         self.truncate_inode(ino, size).await
     }
 
+    async fn flush_before_truncate(
+        &self,
+        ino: i64,
+        size: u64,
+        op: &'static str,
+    ) -> Result<(), VfsError> {
+        let start = Instant::now();
+        tracing::debug!(ino, size, op, "truncate path: flush pending writes");
+        self.state
+            .writer
+            .flush_required_for_truncate(ino as u64)
+            .await
+            .map_err(|err| {
+                let message = err.to_string();
+                let is_timeout =
+                    message.contains("flush timeout") || message.contains("timed out");
+                tracing::error!(
+                    ino,
+                    size,
+                    op,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    error = %message,
+                    "truncate path: flush failed"
+                );
+                if is_timeout {
+                    VfsError::TimedOut
+                } else {
+                    VfsError::from(err)
+                }
+            })?;
+        tracing::debug!(
+            ino,
+            size,
+            op,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "truncate path: flush complete"
+        );
+        Ok(())
+    }
+
     /// Truncate/extend file size by inode (metadata only; holes are read as zeros).
     /// Shrinking does not eagerly reclaim block data.
     pub async fn truncate_inode(&self, ino: i64, size: u64) -> Result<(), VfsError> {
@@ -1584,14 +1624,12 @@ where
         // dirty slices that arrived between the pre-flush and the lock acquisition.
         // Those writes lose their data (truncate semantics: last-writer wins at the
         // inode level), and meta_truncate removes any slices committed in that window.
-        self.state
-            .writer
-            .flush_required(ino as u64)
-            .await
-            .map_err(VfsError::from)?;
+        self.flush_before_truncate(ino, size, "truncate_inode").await?;
 
         let mutation_lock = self.state.append_lock(ino);
+        tracing::debug!(ino, size, "truncate_inode: waiting for mutation lock");
         let _mutation_guard = mutation_lock.lock_owned().await;
+        tracing::debug!(ino, size, "truncate_inode: mutation lock acquired");
 
         let handles = self.file_handles_for_inode(ino);
         let mut guards = Vec::with_capacity(handles.len());
@@ -1681,14 +1719,12 @@ where
         // full rationale).  writer.clear() inside the lock discards any dirty slices
         // that arrived between the pre-flush and the lock acquisition.
         let _guards = if let Some(size) = req.size {
-            self.state
-                .writer
-                .flush_required(ino as u64)
-                .await
-                .map_err(VfsError::from)?;
+            self.flush_before_truncate(ino, size, "set_attr").await?;
 
             let mutation_lock = self.state.append_lock(ino);
+            tracing::debug!(ino, size, "set_attr truncate: waiting for mutation lock");
             let _mutation_guard = mutation_lock.lock_owned().await;
+            tracing::debug!(ino, size, "set_attr truncate: mutation lock acquired");
 
             let handles = self.file_handles_for_inode(ino);
             let mut guards = Vec::with_capacity(handles.len());
