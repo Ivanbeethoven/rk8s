@@ -1753,9 +1753,12 @@ mod truncate_flush_tests {
         // slices without an explicit flush — just like the kernel does.
         for i in 0..16 {
             let data = vec![(i as u8).wrapping_mul(17); block * 2];
-            op_timeout("write_cached", fs.write_cached_ino(ino, (i * block) as u64, &data))
-                .await
-                .unwrap();
+            op_timeout(
+                "write_cached",
+                fs.write_cached_ino(ino, (i * block) as u64, &data),
+            )
+            .await
+            .unwrap();
         }
 
         // Now truncate — must flush all the cached writes first.

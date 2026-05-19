@@ -331,21 +331,37 @@ where
     }
 
     fn freeze(&self) -> bool {
-        self.with_mut(|s| {
-            if matches!(s.state, SliceStatus::Writable) {
-                s.state = SliceStatus::Readonly;
-                s.frozen_epoch = self.shared.inode.data_epoch();
-                s.data.freeze();
-
-                if s.uploading.is_none() && !s.has_idle_block() {
-                    s.state = SliceStatus::Uploaded;
-                    s.err = None;
-                    s.notify.notify_waiters();
-                }
-                return true;
+        let mut empty_committed = false;
+        let froze = self.with_mut(|s| {
+            if !matches!(s.state, SliceStatus::Writable) {
+                return false;
             }
-            false
-        })
+
+            if s.data.len() == 0 {
+                s.state = SliceStatus::Committed;
+                s.err = None;
+                s.notify.notify_waiters();
+                empty_committed = true;
+                return false;
+            }
+
+            s.state = SliceStatus::Readonly;
+            s.frozen_epoch = self.shared.inode.data_epoch();
+            s.data.freeze();
+
+            if s.uploading.is_none() && !s.has_idle_block() {
+                s.state = SliceStatus::Uploaded;
+                s.err = None;
+                s.notify.notify_waiters();
+            }
+            true
+        });
+
+        if empty_committed {
+            self.shared.flush_notify.notify_waiters();
+        }
+
+        froze
     }
 
     fn advance_upload(&self, len: u64, _uploaded_blocks: Vec<usize>) {
@@ -471,16 +487,18 @@ where
     /// Called from the upload task when all blocks have been transferred,
     /// so that flush() callers do not wait on the commit_chunk poll loop.
     async fn try_commit(&self) {
+        if !self.runtime_snapshot().can_commit() {
+            return;
+        }
+
         let desc = match self.desc_for_commit() {
             Some(d) => d,
             None => return,
         };
 
-        let (ino, chunk_index) =
-            crate::vfs::extract_ino_and_chunk_index(desc.chunk_id);
-        let new_size = chunk_index * self.shared.config.layout.chunk_size
-            + desc.offset
-            + desc.length;
+        let (ino, chunk_index) = crate::vfs::extract_ino_and_chunk_index(desc.chunk_id);
+        let new_size =
+            chunk_index * self.shared.config.layout.chunk_size + desc.offset + desc.length;
 
         let mut attempts = 0u32;
         loop {
@@ -900,20 +918,47 @@ where
 
     // Write path: split into chunk spans, append to per-chunk slices, and possibly
     // trigger background flush/commit. Updates in-memory inode size at the end.
-    #[tracing::instrument(level = "trace", skip(self, buf), fields(offset, len = buf.len()))]
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, buf),
+        fields(offset, len = buf.len(), bypass_flush_gate = false)
+    )]
     pub(crate) async fn write_at(&self, offset: u64, buf: &[u8]) -> anyhow::Result<usize> {
+        self.write_at_inner(offset, buf, false).await
+    }
+
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, buf),
+        fields(offset, len = buf.len(), bypass_flush_gate = true)
+    )]
+    pub(crate) async fn write_at_cached(&self, offset: u64, buf: &[u8]) -> anyhow::Result<usize> {
+        self.write_at_inner(offset, buf, true).await
+    }
+
+    async fn write_at_inner(
+        &self,
+        offset: u64,
+        buf: &[u8],
+        bypass_flush_gate: bool,
+    ) -> anyhow::Result<usize> {
         self.shared.writeback_result()?;
         self.back_pressure().await?;
         let mut guard = self.shared.inner.lock().await;
 
-        // Wait for any ongoing flush to finish. This serializes writes with flush().
-        guard.write_waiting += 1;
-        while guard.flush_waiting > 0 {
-            drop(guard);
-            self.shared.write_notify.notified().await;
-            guard = self.shared.inner.lock().await;
+        if !bypass_flush_gate {
+            // Wait for any ongoing flush to finish. This serializes ordinary
+            // user writes with flush(). Kernel writeback-cache traffic uses the
+            // bypass path so fsync/sync can continue draining dirty pages while
+            // flush waits for the resulting slices to commit.
+            guard.write_waiting += 1;
+            while guard.flush_waiting > 0 {
+                drop(guard);
+                self.shared.write_notify.notified().await;
+                guard = self.shared.inner.lock().await;
+            }
+            guard.write_waiting -= 1;
         }
-        guard.write_waiting -= 1;
 
         let mut position = 0;
 
@@ -1056,33 +1101,34 @@ where
 
         let start = Instant::now();
         let result = {
-            // Snapshot every slice that exists right now.
-            let slices: Vec<Arc<ParkingMutex<SliceState>>> = {
-                let guard = self.shared.inner.lock().await;
-                guard
-                    .chunks
-                    .values()
-                    .flat_map(|chunk| chunk.slices.iter().cloned())
-                    .collect()
-            };
-
-            // Freeze any that are still writable and kick off their uploads.
-            for slice in &slices {
-                let handle = SliceHandle {
-                    slice,
-                    shared: &self.shared,
+            let mut flushed_gen = self.shared.write_gen.load(Ordering::Acquire);
+            loop {
+                // Snapshot every slice that exists right now.
+                let slices: Vec<Arc<ParkingMutex<SliceState>>> = {
+                    let guard = self.shared.inner.lock().await;
+                    guard
+                        .chunks
+                        .values()
+                        .flat_map(|chunk| chunk.slices.iter().cloned())
+                        .collect()
                 };
-                if handle.freeze() {
-                    Self::spawn_flush_slice(self.shared.clone(), slice.clone());
-                }
-            }
 
-            // Wait for every slice we captured to be committed.
-            // New slices created after the snapshot are for the *next* flush.
-            if slices.is_empty() {
-                Ok(())
-            } else {
-                loop {
+                // Freeze any that are still writable and kick off their uploads.
+                for slice in &slices {
+                    let handle = SliceHandle {
+                        slice,
+                        shared: &self.shared,
+                    };
+                    if handle.freeze() {
+                        Self::spawn_flush_slice(self.shared.clone(), slice.clone());
+                    }
+                }
+
+                // Wait for every slice we captured to be committed.  Cached
+                // writeback may append more data while we are flushing, so once
+                // this batch drains we re-check write_gen and repeat until no
+                // new writes arrived during the wait.
+                let batch_result: anyhow::Result<()> = loop {
                     if let Some(err) = self.shared.writeback_error() {
                         break Err(anyhow::anyhow!("writeback failed: {err}"));
                     }
@@ -1138,7 +1184,15 @@ where
                     {
                         break Ok(());
                     }
+                };
+
+                batch_result?;
+
+                let current_gen = self.shared.write_gen.load(Ordering::Acquire);
+                if current_gen == flushed_gen {
+                    break Ok(());
                 }
+                flushed_gen = current_gen;
             }
         };
 
@@ -1303,7 +1357,10 @@ where
                 .await;
 
                 match result {
-                    Ok(()) => handle.advance_upload(data_len as u64, indices),
+                    Ok(()) => {
+                        handle.advance_upload(data_len as u64, indices);
+                        handle.try_commit().await;
+                    }
                     Err(err) => {
                         warn!(
                             chunk_id,
@@ -1690,9 +1747,10 @@ where
                     ))
                     .await;
                 if let Some(chunk) = guard.chunks.get_mut(&chunk_id)
-                    && let Some(s) = chunk.slices.pop_front() {
-                        chunk.recently_committed.push_back(s);
-                    }
+                    && let Some(s) = chunk.slices.pop_front()
+                {
+                    chunk.recently_committed.push_back(s);
+                }
                 if guard.flush_waiting > 0 {
                     shared.flush_notify.notify_waiters();
                 }
@@ -1966,7 +2024,10 @@ where
                 "truncate flush_required: start"
             );
             writer.flush_with_deadline(deadline).await.map_err(|err| {
-                anyhow::anyhow!("truncate flush failed after {:?} for ino {ino}: {err}", deadline)
+                anyhow::anyhow!(
+                    "truncate flush failed after {:?} for ino {ino}: {err}",
+                    deadline
+                )
             })?;
             tracing::info!(
                 ino,
@@ -2397,6 +2458,60 @@ mod tests {
         assert!(
             matches!(slice.lock().state, SliceStatus::Writable),
             "auto_flush must not freeze an empty slice before write_at appends data"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_commits_empty_slice_without_waiting() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
+        let ino = meta
+            .create_file(1, "empty_flush.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = FileWriter::new(
+            inode.clone(),
+            test_config(layout),
+            backend,
+            reader,
+            Arc::new(AtomicU64::new(0)),
+            None,
+        );
+
+        let cid = chunk_id_for(inode.ino(), 0).unwrap();
+        let slice = Arc::new(ParkingMutex::new(SliceState::new(
+            cid,
+            0,
+            test_config(layout),
+            Arc::new(AtomicU64::new(0)),
+        )));
+        {
+            let mut guard = writer.shared.inner.lock().await;
+            let mut chunk = ChunkState::new(cid);
+            chunk.slices.push_back(slice.clone());
+            chunk.commit_started = true;
+            guard.chunks.insert(cid, chunk);
+        }
+
+        timeout(Duration::from_millis(200), writer.flush())
+            .await
+            .expect("flush should not block on empty slices")
+            .unwrap();
+
+        assert!(
+            matches!(slice.lock().state, SliceStatus::Committed),
+            "flush should mark an empty slice committed instead of waiting forever"
         );
     }
 

@@ -75,13 +75,19 @@ where
     let mount_point = mount_point.as_ref();
     // Prefer unprivileged mount on Linux (requires fusermount3 in PATH)
     if fuse_op_log_enabled() {
-        configure_session(rfuse3::raw::Session::new(default_mount_options()), concurrency)
-            .mount_with_unprivileged(LoggingFileSystem::new(fs), mount_point)
-            .await
+        configure_session(
+            rfuse3::raw::Session::new(default_mount_options()),
+            concurrency,
+        )
+        .mount_with_unprivileged(LoggingFileSystem::new(fs), mount_point)
+        .await
     } else {
-        configure_session(rfuse3::raw::Session::new(default_mount_options()), concurrency)
-            .mount_with_unprivileged(fs, mount_point)
-            .await
+        configure_session(
+            rfuse3::raw::Session::new(default_mount_options()),
+            concurrency,
+        )
+        .mount_with_unprivileged(fs, mount_point)
+        .await
     }
 }
 

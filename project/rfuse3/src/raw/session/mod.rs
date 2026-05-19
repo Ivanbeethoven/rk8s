@@ -1543,7 +1543,12 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         };
 
         let max_background = u16::try_from(self.max_background).unwrap_or(u16::MAX).max(1);
-        let congestion_threshold = (max_background.saturating_mul(3) / 4).max(1);
+        // Use max_background as the congestion threshold so the kernel never
+        // throttles writeback.  With the default 3/4 ratio the kernel stops
+        // sending FUSE_WRITE requests when 75% of background slots are in use,
+        // which can deadlock mmap-heavy workloads (e.g. generic/013 fsstress)
+        // if reply processing is slower than the kernel's dirty-page rate.
+        let congestion_threshold = max_background;
 
         let init_out = fuse_init_out {
             major: FUSE_KERNEL_VERSION,

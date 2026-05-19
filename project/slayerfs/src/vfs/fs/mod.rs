@@ -7,7 +7,9 @@ use crate::meta::client::MetaClient;
 use crate::meta::config::CompactConfig;
 use crate::meta::config::MetaClientConfig;
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
-use crate::meta::store::{AclRule, MetaError, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot};
+use crate::meta::store::{
+    AclRule, MetaError, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
+};
 use dashmap::{DashMap, Entry};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -274,8 +276,8 @@ where
     fn new(config: Arc<VFSConfig>, backend: Arc<Backend<S, M>>) -> Self {
         let prefetch_backend = backend.clone();
         let prefetch_layout = config.read.layout;
-        let prefetcher: Arc<dyn crate::vfs::cache::prefetch::Prefetcher> = Arc::new(
-            crate::vfs::cache::prefetch::GlobalPrefetcher::new(
+        let prefetcher: Arc<dyn crate::vfs::cache::prefetch::Prefetcher> =
+            Arc::new(crate::vfs::cache::prefetch::GlobalPrefetcher::new(
                 16,  // concurrency
                 256, // queue depth
                 move |ino, start, len| {
@@ -296,18 +298,14 @@ where
                             if fetcher.prepare_slices().await.is_err() {
                                 continue;
                             }
-                            let _ = fetcher
-                                .read_at(span.offset.into(), span.len as usize)
-                                .await;
+                            let _ = fetcher.read_at(span.offset.into(), span.len as usize).await;
                         }
                     }
                 },
-            ),
-        );
+            ));
 
         let reader = Arc::new(
-            DataReader::new(config.read.clone(), backend.clone())
-                .with_prefetcher(prefetcher),
+            DataReader::new(config.read.clone(), backend.clone()).with_prefetcher(prefetcher),
         );
 
         let write_back = {
@@ -315,9 +313,9 @@ where
                 .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
                 .join("slayerfs");
             let _ = std::fs::create_dir_all(&cache_root);
-            let wb = Arc::new(
-                crate::vfs::cache::write_back::FsWriteBackCache::new(cache_root),
-            );
+            let wb = Arc::new(crate::vfs::cache::write_back::FsWriteBackCache::new(
+                cache_root,
+            ));
 
             // Crash recovery: scan for dirty slices from a previous session.
             // Skip in test builds to avoid cross-test contamination from
@@ -349,9 +347,9 @@ where
             writer,
             modified: ModifiedTracker::new(),
             append_locks: DashMap::new(),
-            read_cache: Arc::new(
-                crate::vfs::cache::lru_cache::LruReadCache::new(256 * 1024 * 1024),
-            ),
+            read_cache: Arc::new(crate::vfs::cache::lru_cache::LruReadCache::new(
+                256 * 1024 * 1024,
+            )),
         }
     }
 
@@ -389,9 +387,7 @@ where
             }
 
             match record.state {
-                DirtySliceState::Sealed
-                | DirtySliceState::Failed
-                | DirtySliceState::Uploading => {
+                DirtySliceState::Sealed | DirtySliceState::Failed | DirtySliceState::Uploading => {
                     tracing::info!(
                         ino = record.ino,
                         chunk_id = record.chunk_id,
@@ -399,10 +395,7 @@ where
                         state = ?record.state,
                         "re-uploading recovered slice"
                     );
-                    Self::reupload_recovered_slice(
-                        wb, backend, layout, &record,
-                    )
-                    .await;
+                    Self::reupload_recovered_slice(wb, backend, layout, &record).await;
                 }
                 _ => {
                     let _ = wb.remove(&record.key).await;
@@ -438,7 +431,10 @@ where
 
         let uploader = DataUploader::new(layout, backend);
         let chunks = vec![bytes::Bytes::from(data)];
-        if let Err(e) = uploader.write_at_vectored(slice_id, 0u64.into(), &chunks).await {
+        if let Err(e) = uploader
+            .write_at_vectored(slice_id, 0u64.into(), &chunks)
+            .await
+        {
             tracing::warn!(slice_id, error = ?e, "recovery upload failed");
             return;
         }
@@ -449,8 +445,7 @@ where
             offset: record.chunk_offset,
             length: record.length,
         };
-        let (ino, chunk_index) =
-            crate::vfs::extract_ino_and_chunk_index(record.chunk_id);
+        let (ino, chunk_index) = crate::vfs::extract_ino_and_chunk_index(record.chunk_id);
         let file_offset = chunk_index * layout.chunk_size + desc.offset;
         let new_size = file_offset + desc.length;
 
@@ -459,7 +454,11 @@ where
         // cleaned up rather than entering an infinite recovery retry loop.
         match backend.meta().stat(ino).await {
             Ok(None) | Err(MetaError::NotFound(_)) => {
-                tracing::warn!(ino, slice_id, "recovery skipped: inode deleted, removing orphan dirty record");
+                tracing::warn!(
+                    ino,
+                    slice_id,
+                    "recovery skipped: inode deleted, removing orphan dirty record"
+                );
                 let _ = wb.remove(&record.key).await;
                 return;
             }
@@ -476,7 +475,11 @@ where
         {
             // If the inode was deleted between stat and write, clean up and move on.
             if matches!(e, MetaError::NotFound(_)) {
-                tracing::warn!(ino, slice_id, "recovery metadata commit: inode gone, removing orphan dirty record");
+                tracing::warn!(
+                    ino,
+                    slice_id,
+                    "recovery metadata commit: inode gone, removing orphan dirty record"
+                );
                 let _ = wb.remove(&record.key).await;
                 return;
             }
@@ -484,7 +487,12 @@ where
             return;
         }
 
-        tracing::info!(ino, slice_id, length = record.length, "recovery commit success");
+        tracing::info!(
+            ino,
+            slice_id,
+            length = record.length,
+            "recovery commit success"
+        );
         let _ = wb.remove(&record.key).await;
     }
 
@@ -791,9 +799,10 @@ where
 
     pub(crate) fn blocks_for_attr(&self, attr: &FileAttr) -> u64 {
         if let Some(inode) = self.state.inodes.get(&attr.ino)
-            && let Some(blocks) = inode.allocated_blocks_512() {
-                return blocks;
-            }
+            && let Some(blocks) = inode.allocated_blocks_512()
+        {
+            return blocks;
+        }
         // Fall back to the metadata-provided value.  For backends that haven't
         // implemented accurate block tracking yet, this is `size.div_ceil(512)`.
         attr.blocks
@@ -1605,8 +1614,7 @@ where
             .await
             .map_err(|err| {
                 let message = err.to_string();
-                let is_timeout =
-                    message.contains("flush timeout") || message.contains("timed out");
+                let is_timeout = message.contains("flush timeout") || message.contains("timed out");
                 tracing::error!(
                     ino,
                     size,
@@ -1644,7 +1652,8 @@ where
         // dirty slices that arrived between the pre-flush and the lock acquisition.
         // Those writes lose their data (truncate semantics: last-writer wins at the
         // inode level), and meta_truncate removes any slices committed in that window.
-        self.flush_before_truncate(ino, size, "truncate_inode").await?;
+        self.flush_before_truncate(ino, size, "truncate_inode")
+            .await?;
 
         let mutation_lock = self.state.append_lock(ino);
         tracing::debug!(ino, size, "truncate_inode: waiting for mutation lock");
@@ -1953,7 +1962,7 @@ where
 
     /// Write data by inode directly (used by FUSE to avoid path resolution).
     pub async fn write_ino(&self, ino: i64, offset: u64, data: &[u8]) -> Result<usize, VfsError> {
-        self.write_ino_inner(ino, offset, data).await
+        self.write_ino_inner(ino, offset, data, false).await
     }
 
     /// Write back a kernel-cached page by inode. This uses the inode mutation
@@ -1966,10 +1975,16 @@ where
         offset: u64,
         data: &[u8],
     ) -> Result<usize, VfsError> {
-        self.write_ino_inner(ino, offset, data).await
+        self.write_ino_inner(ino, offset, data, true).await
     }
 
-    async fn write_ino_inner(&self, ino: i64, offset: u64, data: &[u8]) -> Result<usize, VfsError> {
+    async fn write_ino_inner(
+        &self,
+        ino: i64,
+        offset: u64,
+        data: &[u8],
+        cached: bool,
+    ) -> Result<usize, VfsError> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -1989,10 +2004,17 @@ where
 
         let inode = self.ensure_inode_registered(ino).await?;
         let writer = self.state.writer.ensure_file(inode);
-        let written = writer
-            .write_at(offset, data)
-            .await
-            .map_err(VfsError::from)?;
+        let written = if cached {
+            writer
+                .write_at_cached(offset, data)
+                .await
+                .map_err(VfsError::from)?
+        } else {
+            writer
+                .write_at(offset, data)
+                .await
+                .map_err(VfsError::from)?
+        };
 
         // Invalidate reader cache for the written range so any subsequent
         // read path flushes pending writer data instead of serving a stale
@@ -2280,11 +2302,7 @@ where
     /// Used by rename and other metadata operations that need write-back
     /// convergence before modifying directory entries.
     pub async fn flush_inode(&self, ino: u64) {
-        let _ = self
-            .state
-            .writer
-            .flush_if_exists(ino)
-            .await;
+        let _ = self.state.writer.flush_if_exists(ino).await;
     }
 
     /// Sync file content (fsync): flush pending writes.

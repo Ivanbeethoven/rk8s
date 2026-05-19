@@ -79,13 +79,14 @@ mod mount_tests {
         let mnt_path = mnt.path().to_path_buf();
 
         // Mount in the background (until unmount)
-        let handle = match mount_vfs_unprivileged(fs, &mnt_path, FuseConcurrencyConfig::default()).await {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("skip fuse test: mount failed: {e}");
-                return;
-            }
-        };
+        let handle =
+            match mount_vfs_unprivileged(fs, &mnt_path, FuseConcurrencyConfig::default()).await {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("skip fuse test: mount failed: {e}");
+                    return;
+                }
+            };
 
         // Give kernel/daemon a bit of time to finish INIT
         tokio::time::sleep(StdDuration::from_millis(2000)).await;
@@ -1351,9 +1352,6 @@ where
     ) -> FuseResult<()> {
         debug!(fh, "fuse.release");
         self.unlock_owner_locks(inode, lock_owner).await;
-        if _flush {
-            self.flush(fh).await.map_err(Errno::from)?;
-        }
         self.close(fh).await.map_err(Errno::from)?;
         Ok(())
     }
@@ -1362,7 +1360,7 @@ where
     async fn flush(&self, _req: Request, inode: u64, fh: u64, lock_owner: u64) -> FuseResult<()> {
         debug!(fh, "fuse.flush");
         self.unlock_owner_locks(inode, lock_owner).await;
-        self.flush(fh).await.map_err(Errno::from)
+        Ok(())
     }
 
     // Sync file content to backend
