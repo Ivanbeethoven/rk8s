@@ -18,6 +18,12 @@ const MAX_CONCURRENT_UPLOADS: usize = 256;
 
 static UPLOAD_SEM: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_UPLOADS));
 
+/// Acquire a permit from the global upload semaphore.  Used by both foreground
+/// flush uploads and background compaction to share S3 bandwidth fairly.
+pub(crate) async fn upload_permit() -> tokio::sync::SemaphorePermit<'static> {
+    UPLOAD_SEM.acquire().await.expect("upload semaphore closed")
+}
+
 struct ChunkCursor<'a> {
     chunks: &'a [Bytes],
     idx: usize,

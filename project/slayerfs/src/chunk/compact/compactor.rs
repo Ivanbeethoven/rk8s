@@ -2,6 +2,7 @@
 use crate::chunk::ChunkLayout;
 use crate::chunk::slice::{SliceDesc, SliceOffset, block_span_iter_chunk, block_span_iter_slice};
 use crate::chunk::store::{BlockKey, BlockStore};
+use crate::chunk::writer::upload_permit;
 use crate::meta::SLICE_ID_KEY;
 use crate::meta::config::CompactConfig;
 use crate::meta::store::{MetaError, MetaStore};
@@ -328,6 +329,9 @@ where
         for span in spans {
             let key: BlockKey = (slice_id, span.index as u32);
             let take = (span.len as usize).min(data.len() - offset);
+            // Acquire a permit from the shared upload semaphore so compaction
+            // yields bandwidth to foreground flush when the pool is contended.
+            let _permit = upload_permit().await;
             self.block_store
                 .write_fresh_range(key, span.offset, &data[offset..offset + take])
                 .await

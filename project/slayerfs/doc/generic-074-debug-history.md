@@ -556,3 +556,349 @@ SLAYERFS_FUSE_OP_LOG=1
 3. 输出不匹配
 
 推进到了完全通过。
+
+---
+
+## 16. 第二轮回归：generic/074 耗时过长 / flush timeout
+
+### 触发现象
+
+在后续回归测试中，`generic/074` 出现以下行为：
+
+1. `fstest.0`、`fstest.1` 几秒内通过
+2. `fstest.2`（单进程 mmap 写入与校验）运行 4+ 分钟后仍未完成
+3. 日志末尾出现 `flush timeout` 错误：
+
+```text
+2026-05-19T06:38:22 ERROR slayerfs::vfs::io::writer: flush timeout, ino: 37856,
+elapsed_ms: 6145, pending_slices: 1, pending_states: ["Uploaded@14520320"]
+```
+
+4. 测试被手动中断（Ctrl+C）
+
+artifact：`docker/compose-xfstests/artifacts/run-1779170794-23960`
+
+### 分析路径
+
+从日志确认测试并未真正死锁——写操作持续推进（auto_flush 冻结、upload 完成、compaction 运行），但整体吞吐显著低于预期。
+
+关键线索是 flush timeout 报出的状态：slice 在 `Uploaded` 但从未进入 `Committed`，说明 `commit_chunk` 背景任务已退出但 slice 仍在等待 metadata commit。
+
+---
+
+## 17. Bug 点 10：commit_chunk 退出后新 slice 无 committer（竞态）
+
+### 现象
+
+`flush_for_close`（CLOSE_FLUSH_DEADLINE = 5s）或 `flush_required`（FLUSH_DEADLINE = 300s）等待某个 slice 从 `Uploaded` 变为 `Committed`，但永远等不到。
+
+### 根因
+
+`commit_chunk` 的退出逻辑存在竞态：
+
+```rust
+// commit_chunk 发现 slices.front() == None
+let Some(slice) = slice else {
+    let mut guard = shared.inner.lock().await;
+    let keep = !recently_committed.is_empty();
+    if !keep { guard.chunks.remove(&chunk_id); }
+    // ↑ keep == true 时：chunk 留在 map，commit_started 仍为 true
+    return; // ← commit_chunk 退出
+};
+```
+
+时序：
+
+1. `commit_chunk` 把最后一个 slice 从 `slices` 移到 `recently_committed`
+2. 下一次循环：`slices.front()` → None
+3. `recently_committed` 非空 → chunk 不被删除，`commit_started` 保持 `true`
+4. `commit_chunk` **return**
+5. 新的 cached write 到来，`get_or_create_chunk` 发现 chunk 已存在
+6. `find_slice_or_create` 检查 `chunk.commit_started` → `true` → **不 spawn 新 commit_chunk**
+7. 新 slice 被 upload 后进入 `Uploaded` 状态，但无人推进到 `Committed`
+8. flush 等待超时
+
+### 修改
+
+在 `commit_chunk` 的"slices 为空但 recently_committed 非空"退出路径中，在持锁状态下：
+
+1. 检查是否有新 slices 出现（有则 `continue` 继续处理）
+2. 若无新 slices，重置 `chunk.commit_started = false`
+
+这保证下一次写入必然 spawn 新的 `commit_chunk` 任务。
+
+同时在 `flush_with_deadline` 的等待循环中增加安全网：如果发现有 `Uploaded` 状态 slice 但 chunk 的 `commit_started == false`，主动重新 spawn `commit_chunk`。
+
+### 相关文件
+
+1. `src/vfs/io/writer.rs`
+
+### 结果
+
+消除了 slice 在 `Uploaded` 状态永远无法 commit 的窗口。flush/close 不再因为等待死去的 committer 而超时。
+
+---
+
+## 18. 性能点 1：write_cached_ino 持 per-inode 互斥锁导致 mmap writeback 串行化
+
+### 现象
+
+`generic/074` 的 `fstest.2`～`fstest.5` 均涉及 mmap 写入。内核 writeback-cache 模式下，多个 dirty page 可能并发通过 `FUSE_WRITE_CACHE` 发送。但原有实现每次 cached write 都获取 per-inode `mutation_lock`，所有并发 page flush 串行化。
+
+### 根因
+
+原 `write_cached_ino` 直接调用 `write_ino_inner`，后者的控制流：
+
+```text
+1. append_lock.lock()           ← 全部 cached write 在此排队
+2. meta_stat_required()         ← 每次都查 metadata 确认 inode 类型
+3. ensure_inode_registered()
+4. writer.write_at_cached()     ← 真正的写入（内部有 slice 级锁）
+5. reader.invalidate()          ← 失效读缓存
+6. extend_local_file_size()
+7. modified.touch()             ← 全局 mutex
+```
+
+对于 4KB page writeback，步骤 1/2/5/7 都是不必要的开销：
+
+- `mutation_lock`：writer 内部已有 slice 级锁，truncate 也走 flush-before-lock
+- `meta_stat_required`：FUSE_WRITE_CACHE 只对已打开的文件触发，类型不可能变
+- `reader.invalidate`：`commit_chunk` 在 commit 成功后已做 invalidate
+- `modified.touch`：flush 路径覆盖此标记，不需要每个 page 写一次
+
+### 修改
+
+将 `write_cached_ino` 从委托 `write_ino_inner` 改为独立快速路径：
+
+```rust
+pub async fn write_cached_ino(&self, ino, offset, data) -> Result<usize> {
+    let inode = self.ensure_inode_registered(ino).await?;
+    let writer = self.state.writer.ensure_file(inode.clone());
+    let written = writer.write_at_cached(offset, data).await?;
+    let new_end = offset + written as u64;
+    if new_end > inode.file_size() {
+        self.extend_local_file_size(ino, new_end);
+    }
+    Ok(written)
+}
+```
+
+关键差异：
+
+| 步骤 | 原路径 | 新路径 |
+|------|--------|--------|
+| mutation_lock | 每次获取 | 不获取 |
+| meta_stat_required | 每次查询 | 跳过 |
+| reader.invalidate | 每次调用 | 跳过（commit 时做） |
+| modified.touch | 每次更新 | 跳过（flush 时做） |
+| extend_size | 比较 attr.size | 比较 inode 原子 size |
+
+### 正确性论证
+
+1. **truncate 安全**：truncate_inode / set_attr 先调用 `flush_before_truncate`（等所有 pending writes 完成），再获取 mutation_lock，再调用 `writer.clear()`。不需要 cached write 侧持 mutation_lock。
+2. **并发写安全**：writer.write_at_cached 内部通过 `shared.inner.lock()` 保证 slice-level 互斥。
+3. **size 安全**：`inode.extend_size()` 使用 CAS 原子操作，多个并发写收敛到最大值。
+4. **类型安全**：FUSE_WRITE_CACHE 只在内核已确认为 regular file 时发送，不存在类型变化可能。
+
+### 相关文件
+
+1. `src/vfs/fs/mod.rs`
+
+### 预期效果
+
+mmap writeback 吞吐从"串行 per-page mutex + metadata lookup"降低到"仅 slice 级锁 + 原子 size 更新"。对 `generic/074` 的 fstest.2～5（大量 4KB page 并发写）应有显著提速。
+
+---
+
+## 19. 性能分析：其它观察到的特征（未在本轮修复）
+
+### 19.1 auto_flush INFO 日志量
+
+每个 slice 冻结时都输出 `INFO` 级别日志。在 mmap 写入峰值时，500ms 内积累的 slice 在同一时刻全部冻结，产生数百条 INFO 消息。日志 I/O 本身成为可测量开销。
+
+**建议**：将 `auto_flush: freezing slice` 降为 `DEBUG` 级别或加 rate-limit。
+
+### 19.2 inner lock 竞争热点
+
+writer 的 `shared.inner.lock()` 被以下路径共用：
+
+- `write_at_cached`（每次 cached write）
+- `overlay_dirty`（每次 read）
+- `flush_with_deadline`（flush 启动 + 等待循环）
+- `commit_chunk`（commit 循环）
+- `auto_flush`（定时扫描）
+- `has_pending`（flush/overlay 前置检查）
+
+在重度 mmap 写入 + 读验证并发场景下，所有路径竞争同一 tokio Mutex。长期方向可考虑：
+
+- 读路径（overlay_dirty）使用 snapshot / 无锁遍历
+- 将 chunks map 改为 per-chunk 独立锁，降低锁粒度
+
+### 19.3 compaction 与前台 IO 带宽竞争
+
+`generic/074` 运行期间，后台 heavy compaction 持续执行（从日志可见每 2-3 秒完成一次 compaction，每次读取 10-20 slices 合并上传）。compaction 与前台 write upload 共享 S3 带宽（max_concurrency=8），在高写入场景下可能抢占上传带宽。
+
+**建议**：考虑在检测到活跃 flush/fsync 时暂停或降低 compaction 并发。
+
+### 19.4 back_pressure 10ms sleep
+
+当 writer buffer usage > soft_limit (300MB) 时，每次 write 固定 sleep 10ms。对于 4KB page 的 cached write，单个 10ms sleep 对应 ~400KB/s 吞吐上限。实际测试中 300MB 阈值可能不容易触达，但值得关注。
+
+---
+
+## 20. 第二轮修改的关键文件
+
+1. `src/vfs/io/writer.rs` — commit_chunk 竞态修复 + flush 安全网
+2. `src/vfs/fs/mod.rs` — write_cached_ino 去锁快速路径
+
+---
+
+## 21. 第二轮结论
+
+本轮问题的核心是：
+
+1. **正确性 bug**：`commit_chunk` 退出时留下 `commit_started=true` 的 orphan chunk，后续 slice 永远无法 commit，导致 flush 等待 300s 超时（表现为测试"卡死"）
+2. **性能缺陷**：`write_cached_ino` 持 per-inode 互斥锁 + 冗余 metadata 查询 + 冗余 reader invalidation，使 mmap writeback 吞吐远低于 writer 实际能力
+
+修复思路可以概括为：
+
+```text
+正确性：确保 chunk 生命周期内始终有活跃的 committer 或可重新 spawn committer 的条件
+性能：把 cached writeback 热路径从"per-page 全局串行"改为"slice 级并发 + 原子 size"
+```
+
+---
+
+## 22. 第三轮优化：inner lock 竞争缓解
+
+基于 §19.2 分析出的 inner lock 热点，本轮针对三个高频获取锁的路径进行优化，减少锁持有时间和获取频率。
+
+### 22.1 flush_with_deadline 安全网锁获取优化
+
+**问题**：safety-net 代码（检查 orphan Uploaded slices 并 re-spawn commit_chunk）在每次 notify 唤醒后都获取 inner lock，但 notify 唤醒说明正在有进展，不需要安全网介入。
+
+**修复**：重构条件判断，仅当 `FLUSH_WAIT`（3 秒）超时触发（即无进展）时才获取 inner lock 执行安全网检查。正常 notify 唤醒（有 commit 完成）直接回到循环顶部重新检查 all_done，无需加锁。
+
+```rust
+// 修改前：无论 notify 还是 timeout 都执行安全网（获取 inner lock）
+// 修改后：
+if timeout(FLUSH_WAIT, notify).await.is_err() {
+    // 仅超时路径才获取 inner lock 做安全网检查
+    let mut guard = self.shared.inner.lock().await;
+    // ... re-spawn orphan commit_chunk
+}
+```
+
+**效果**：高频 commit 场景下（每秒数十次 notify），inner lock 的获取从"每次唤醒"降为"每 3 秒超时一次"。
+
+### 22.2 has_pending() 无锁快速路径
+
+**问题**：`has_pending()` 被 `auto_flush`（每 500ms）、`flush_required`（每次 close/fsync）等多处调用，每次都获取 inner lock 仅为检查 `has_chunks()`。
+
+**修复**：利用已有的 `write_gen` / `last_flushed_gen` 原子计数器（flush 成功后会同步两者），添加快速路径：当 `write_gen == last_flushed_gen` 时直接返回 false，跳过锁获取。
+
+```rust
+pub(crate) async fn has_pending(&self) -> bool {
+    // ... error check ...
+    let gen = self.shared.write_gen.load(Ordering::Acquire);
+    let flushed = self.shared.last_flushed_gen.load(Ordering::Acquire);
+    if gen == flushed {
+        return false;  // 无锁快速返回
+    }
+    let guard = self.shared.inner.lock().await;
+    guard.has_chunks()
+}
+```
+
+**效果**：文件空闲时（已 flush 完成、无新写入），`auto_flush` 每 500ms 的轮询不再获取 inner lock。
+
+### 22.3 overlay_dirty 缩短锁持有时间
+
+**问题**：读路径 `overlay_dirty` 获取 inner lock 后遍历所有相关 slices 并执行数据复制（`copy_into`），锁持有期间写路径完全阻塞。对于跨多 slice 的大范围读取，持锁时间可达微秒到毫秒级。
+
+**修复**：将操作拆分为两阶段：
+1. 持锁阶段：仅 snapshot 相关 slice 的 `Arc` 引用（O(n) clone Arc）
+2. 无锁阶段：遍历 snapshot，通过 ParkingMutex 逐个锁定 slice 进行数据复制
+
+```rust
+// 持锁：仅获取 Arc 引用
+let slice_refs: Vec<Option<Vec<Arc<ParkingMutex<SliceState>>>>> = {
+    let guard = self.shared.inner.lock().await;
+    // ... collect Arc clones ...
+};
+// 无锁：数据复制不再阻塞 write 路径
+for (span, slices_opt) in spans.iter().zip(slice_refs.iter()) { ... }
+```
+
+**效果**：inner lock 持有时间从"扫描 + 复制全部数据"缩短为"扫描 + clone Arc 指针"。写路径在读覆盖期间不再被长时间阻塞。
+
+### 22.4 本轮修改文件
+
+1. `src/vfs/io/writer.rs` — flush_with_deadline 安全网重构、has_pending 快速路径、overlay_dirty 锁拆分
+
+### 22.5 优化总结
+
+| 路径 | 优化前 | 优化后 |
+|------|--------|--------|
+| flush 安全网 | 每次 notify/timeout 获取 inner lock | 仅 3s 超时获取 |
+| has_pending | 每次调用获取 inner lock | write_gen==last_flushed_gen 时无锁返回 |
+| overlay_dirty | 持 inner lock 期间完成全部数据复制 | 持锁仅 snapshot Arc，数据复制在锁外 |
+
+这三个优化共同减少了 inner lock 的竞争压力，尤其在 generic/074 的"高频 mmap 写 + 并发读验证"场景下，读写路径的相互阻塞大幅降低。
+
+---
+
+## 23. 第四轮优化：带宽竞争与背压调优
+
+### 23.1 compaction 写入纳入全局上传信号量
+
+**问题**：前台 flush 通过 `DataUploader` 使用全局 `UPLOAD_SEM`（256 permits）控制并发上传。但 compaction 的 `write_merged_data` 直接调用 `block_store.write_fresh_range()` 绕过信号量，在重度 compaction 期间可以不受限地发起 S3 写请求，与前台 flush 上传竞争带宽。
+
+**修复**：在 `compactor.rs` 的 `write_merged_data` 中，每次写 block 前获取 `upload_permit()`。这使 compaction 和前台 flush 共享同一个并发池，前台繁忙时 compaction 自然退让。
+
+```rust
+// src/chunk/compact/compactor.rs
+async fn write_merged_data(&self, slice_id: u64, data: &[u8]) -> ... {
+    for span in spans {
+        let _permit = upload_permit().await;  // 新增：共享信号量
+        self.block_store.write_fresh_range(key, ...).await?;
+    }
+}
+```
+
+**新增公开函数**：`src/chunk/writer.rs` 中暴露 `pub(crate) async fn upload_permit()` 供 compact 模块调用。
+
+**效果**：当前台有 200+ 并发上传时，compaction 的写入会被信号量排队，自动降速。空闲时信号量余量充足，compaction 不受影响。
+
+### 23.2 back_pressure soft-limit 改为 yield
+
+**问题**：当 `buffer_usage > soft_limit`（默认 300MB）时，每次 `write_at_inner` 固定 sleep 10ms。对于 4KB 的 mmap writeback 页面，单次 10ms 对应最多 ~400KB/s 的写入吞吐，严重限制 mmap writeback 速率。
+
+**根因**：soft limit 的目的是给 flush/upload 任务运行机会来释放 buffer。固定 10ms sleep 过于保守——在 tokio 运行时中，yield 即可让出执行权给同优先级的 flush 任务。
+
+**修复**：将 soft limit 路径的 `sleep(10ms)` 改为 `tokio::task::yield_now()`。Hard limit（2x soft）仍保留 100ms sleep 作为 OOM 防护。
+
+```rust
+// 修改前：
+tokio::time::sleep(Duration::from_millis(10)).await;
+
+// 修改后：
+tokio::task::yield_now().await;
+```
+
+**效果**：soft limit 触发时，写入任务仅让出一次调度轮次（微秒级），而非固定等待 10ms。在 flush 任务能及时消耗 buffer 的正常场景下，mmap writeback 吞吐不再被人为限制。
+
+### 23.3 本轮修改文件
+
+1. `src/chunk/writer.rs` — 新增 `upload_permit()` 公开函数
+2. `src/chunk/compact/compactor.rs` — `write_merged_data` 每次写 block 前获取信号量
+3. `src/vfs/io/writer.rs` — `back_pressure` soft limit 从 sleep(10ms) 改为 yield_now()
+
+### 23.4 综合影响
+
+| 瓶颈 | 修改 | 预期效果 |
+|------|------|----------|
+| compaction 抢带宽 | 纳入 UPLOAD_SEM | 前台 flush 优先级自然提升 |
+| back_pressure 过度限流 | yield 代替 sleep | mmap writeback 吞吐从 ~400KB/s 恢复到线速 |
+
+两项改动共同确保：在 generic/074 的高频 mmap 写入 + fsync 场景下，前台 IO 获得更多 S3 带宽和 CPU 时间，测试整体耗时应有明显下降。

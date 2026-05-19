@@ -874,7 +874,11 @@ where
             return Ok(());
         }
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Soft limit exceeded: yield to let flush/upload tasks drain the
+        // buffer rather than sleeping a fixed duration.  This avoids
+        // throttling high-frequency 4KB mmap writeback pages to ~400KB/s.
+        tokio::task::yield_now().await;
+
         let hard_limit = soft_limit.saturating_mul(2);
         let mut total_wait = Duration::ZERO;
 
@@ -1008,11 +1012,34 @@ where
 
         let layout = self.shared.config.layout;
         let spans = split_chunk_spans(layout, offset, buf.len());
-        let guard = self.shared.inner.lock().await;
 
-        for span in spans {
-            let cid = chunk_id_for(self.shared.inode.ino(), span.index)?;
-            let Some(chunk) = guard.chunks.get(&cid) else {
+        // Pre-compute chunk IDs (propagate errors immediately).
+        let span_cids: Vec<_> = spans
+            .iter()
+            .map(|s| chunk_id_for(self.shared.inode.ino(), s.index))
+            .collect::<std::io::Result<Vec<_>>>()?;
+
+        // Snapshot relevant slice Arcs under the inner lock, then release
+        // immediately so that writes are not blocked during the data copy.
+        let slice_refs: Vec<Option<Vec<Arc<ParkingMutex<SliceState>>>>> = {
+            let guard = self.shared.inner.lock().await;
+            span_cids
+                .iter()
+                .map(|cid| {
+                    guard.chunks.get(cid).map(|chunk| {
+                        chunk
+                            .slices
+                            .iter()
+                            .chain(chunk.recently_committed.iter())
+                            .cloned()
+                            .collect()
+                    })
+                })
+                .collect()
+        };
+
+        for (span, slices_opt) in spans.iter().zip(slice_refs.iter()) {
+            let Some(slices) = slices_opt else {
                 continue;
             };
 
@@ -1022,32 +1049,7 @@ where
 
             // Slices are append-only in creation order; later slices must win
             // over earlier dirty data for overlapping rewrites.
-            for slice in &chunk.slices {
-                let state = slice.lock();
-                if !state.can_overlay_read() {
-                    continue;
-                }
-
-                let slice_start = state.offset;
-                let slice_end = state.offset + state.data.len();
-                let read_start = span_start.max(slice_start);
-                let read_end = span_end.min(slice_end);
-                if read_start >= read_end {
-                    continue;
-                }
-
-                let dst_start = (chunk_start + read_start - offset).as_usize();
-                let dst_end = (chunk_start + read_end - offset).as_usize();
-                state
-                    .data
-                    .copy_into(read_start - slice_start, &mut buf[dst_start..dst_end])?;
-            }
-
-            // Also check recently-committed slices.  These have been committed
-            // to metadata but are kept for a grace period so that readers who
-            // fetched from the reader cache before the commit can still see
-            // the latest data via this overlay pass.
-            for slice in &chunk.recently_committed {
+            for slice in slices {
                 let state = slice.lock();
                 if !state.can_overlay_read() {
                     continue;
@@ -1144,45 +1146,51 @@ where
                     if timeout(FLUSH_WAIT, self.shared.flush_notify.notified())
                         .await
                         .is_err()
-                        && start.elapsed() > deadline
                     {
-                        let pending: Vec<_> = slices
-                            .iter()
-                            .filter(|s| !matches!(s.lock().state, SliceStatus::Committed))
-                            .map(|s| {
-                                let g = s.lock();
-                                format!("{:?}@{}", g.state, g.offset)
-                            })
-                            .collect();
-                        let ino = self.shared.inode.ino();
-                        tracing::error!(
-                            ino,
-                            elapsed_ms = start.elapsed().as_millis() as u64,
-                            pending_slices = pending.len(),
-                            pending_states = ?pending,
-                            "flush timeout"
-                        );
-                        break Err(anyhow::anyhow!(
-                            "flush timeout after {:?} for ino {ino}, {}/{} slices still pending: {:?}",
-                            deadline,
-                            ino,
-                            pending.len(),
-                            pending
-                        ));
-                    }
+                        if start.elapsed() > deadline {
+                            let pending: Vec<_> = slices
+                                .iter()
+                                .filter(|s| !matches!(s.lock().state, SliceStatus::Committed))
+                                .map(|s| {
+                                    let g = s.lock();
+                                    format!("{:?}@{}", g.state, g.offset)
+                                })
+                                .collect();
+                            let ino = self.shared.inode.ino();
+                            tracing::error!(
+                                ino,
+                                elapsed_ms = start.elapsed().as_millis() as u64,
+                                pending_slices = pending.len(),
+                                pending_states = ?pending,
+                                "flush timeout"
+                            );
+                            break Err(anyhow::anyhow!(
+                                "flush timeout after {:?} for ino {ino}, {}/{} slices still pending: {:?}",
+                                deadline,
+                                ino,
+                                pending.len(),
+                                pending
+                            ));
+                        }
 
-                    // If the notify fired spuriously or for a different chunk,
-                    // re-poll the slice statuses inline so that a continuous
-                    // stream of commit completions doesn't keep us sleeping
-                    // for the full FLUSH_WAIT interval.
-                    if let Some(err) = self.shared.writeback_error() {
-                        break Err(anyhow::anyhow!("writeback failed: {err}"));
-                    }
-                    if slices
-                        .iter()
-                        .all(|s| matches!(s.lock().state, SliceStatus::Committed))
-                    {
-                        break Ok(());
+                        // Safety net: FLUSH_WAIT elapsed without progress.  If
+                        // any slice is Uploaded but commit_chunk is not running,
+                        // re-spawn commit_chunk so flush does not wait forever.
+                        let mut guard = self.shared.inner.lock().await;
+                        for (cid, chunk) in guard.chunks.iter_mut() {
+                            if !chunk.commit_started
+                                && chunk.slices.iter().any(|s| {
+                                    matches!(s.lock().state, SliceStatus::Uploaded)
+                                })
+                            {
+                                chunk.commit_started = true;
+                                let shared = self.shared.clone();
+                                let cid = *cid;
+                                tokio::spawn(
+                                    async move { Self::commit_chunk(shared, cid).await },
+                                );
+                            }
+                        }
                     }
                 };
 
@@ -1243,6 +1251,13 @@ where
     pub(crate) async fn has_pending(&self) -> bool {
         if self.shared.writeback_error().is_some() {
             return true;
+        }
+        // Fast path: if no writes arrived since the last successful flush,
+        // there cannot be any unflushed chunks.
+        let gen_val = self.shared.write_gen.load(Ordering::Acquire);
+        let flushed = self.shared.last_flushed_gen.load(Ordering::Acquire);
+        if gen_val == flushed {
+            return false;
         }
         let guard = self.shared.inner.lock().await;
         guard.has_chunks()
@@ -1438,6 +1453,18 @@ where
                     .unwrap_or(false);
                 if !keep {
                     guard.chunks.remove(&chunk_id);
+                } else if let Some(chunk) = guard.chunks.get_mut(&chunk_id) {
+                    // recently_committed keeps the chunk alive but slices is
+                    // empty.  A new cached write can race in and add a slice
+                    // while commit_chunk is about to return.  Re-check under
+                    // the lock: if new slices appeared, keep processing them.
+                    if !chunk.slices.is_empty() {
+                        drop(guard);
+                        continue;
+                    }
+                    // No new slices yet — reset commit_started so the next
+                    // write will spawn a fresh commit_chunk task.
+                    chunk.commit_started = false;
                 }
 
                 if !guard.has_chunks() && guard.flush_waiting > 0 {
@@ -1832,7 +1859,7 @@ where
                         }
 
                         if should && handle.freeze() {
-                            tracing::info!(
+                            tracing::debug!(
                                 age_ms = age.as_millis(),
                                 idle_ms = idle_time.as_millis(),
                                 "auto_flush: freezing slice"
@@ -2018,7 +2045,7 @@ where
         {
             let deadline = truncate_flush_deadline();
             let start = Instant::now();
-            tracing::info!(
+            tracing::debug!(
                 ino,
                 timeout_ms = deadline.as_millis() as u64,
                 "truncate flush_required: start"
@@ -2029,7 +2056,7 @@ where
                     deadline
                 )
             })?;
-            tracing::info!(
+            tracing::debug!(
                 ino,
                 elapsed_ms = start.elapsed().as_millis() as u64,
                 "truncate flush_required: completed"
