@@ -1062,9 +1062,9 @@ where
                 .map(|cid| {
                     guard.chunks.get(cid).map(|chunk| {
                         chunk
-                            .slices
+                            .recently_committed
                             .iter()
-                            .chain(chunk.recently_committed.iter())
+                            .chain(chunk.slices.iter())
                             .cloned()
                             .collect()
                     })
@@ -1082,7 +1082,10 @@ where
             let span_end = span.offset + span.len;
 
             // Slices are append-only in creation order; later slices must win
-            // over earlier dirty data for overlapping rewrites.
+            // over earlier dirty data for overlapping rewrites.  A slice in
+            // `recently_committed` is always older than any live slice still
+            // queued in `chunk.slices`, so apply committed grace-period data
+            // first and let live dirty slices overwrite it when ranges overlap.
             for slice in slices {
                 let state = slice.lock();
                 if !state.can_overlay_read() {
@@ -1295,6 +1298,14 @@ where
         }
         let guard = self.shared.inner.lock().await;
         guard.has_chunks()
+    }
+
+    pub(crate) async fn has_overlay_state(&self) -> bool {
+        let guard = self.shared.inner.lock().await;
+        guard
+            .chunks
+            .values()
+            .any(|chunk| !chunk.slices.is_empty() || !chunk.recently_committed.is_empty())
     }
 
     /// Spawn a background task to upload a frozen slice's data.
@@ -2056,7 +2067,7 @@ where
     ) -> anyhow::Result<()> {
         let writer = self.files.get(&ino).map(|entry| entry.value().clone());
         match writer {
-            Some(ref writer) if writer.has_pending().await => {
+            Some(ref writer) if writer.has_overlay_state().await => {
                 writer.overlay_dirty(offset, buf).await?;
             }
             #[cfg(not(test))]
@@ -2464,6 +2475,128 @@ mod tests {
         reader.prepare_slices().await.unwrap();
         let out = reader.read_at(0u64.into(), len).await.unwrap();
         assert_eq!(out, second);
+    }
+
+    #[tokio::test]
+    async fn test_overlay_dirty_prefers_live_slice_over_recently_committed() {
+        let layout = ChunkLayout::default();
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store, meta.clone()));
+        let ino = meta
+            .create_file(1, "overlay_live_wins.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = FileWriter::new(
+            inode.clone(),
+            test_config(layout),
+            backend,
+            reader.clone(),
+            Arc::new(AtomicU64::new(0)),
+            None,
+        );
+
+        let len = (layout.block_size / 4) as usize;
+        let first = vec![7u8; len];
+        writer.write_at(0, &first).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let file_reader = reader.open_for_handle(inode.clone(), 11);
+        let cached = file_reader.read(0, len).await.unwrap();
+        assert_eq!(cached, first);
+
+        let second = vec![8u8; len];
+        writer.write_at(0, &second).await.unwrap();
+
+        let mut combined = file_reader.read(0, len).await.unwrap();
+        writer.overlay_dirty(0, &mut combined).await.unwrap();
+        assert_eq!(combined, second);
+    }
+
+    #[tokio::test]
+    async fn test_reader_cache_sees_overwrite_after_flush() {
+        let layout = ChunkLayout::default();
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store, meta.clone()));
+        let ino = meta
+            .create_file(1, "flush_invalidate_overwrite.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = FileWriter::new(
+            inode.clone(),
+            test_config(layout),
+            backend,
+            reader.clone(),
+            Arc::new(AtomicU64::new(0)),
+            None,
+        );
+
+        let len = (layout.block_size / 4) as usize;
+        let first = vec![7u8; len];
+        writer.write_at(0, &first).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let file_reader = reader.open_for_handle(inode, 12);
+        let cached = file_reader.read(0, len).await.unwrap();
+        assert_eq!(cached, first);
+
+        let second = vec![8u8; len];
+        writer.write_at(0, &second).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let out = file_reader.read(0, len).await.unwrap();
+        assert_eq!(out, second);
+    }
+
+    #[tokio::test]
+    async fn test_recently_committed_keeps_overlay_state_after_flush() {
+        let layout = ChunkLayout::default();
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store, meta.clone()));
+        let ino = meta
+            .create_file(1, "recently_committed_overlay.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = FileWriter::new(
+            inode,
+            test_config(layout),
+            backend,
+            reader,
+            Arc::new(AtomicU64::new(0)),
+            None,
+        );
+
+        writer.write_at(0, &[1u8; 4096]).await.unwrap();
+        writer.flush().await.unwrap();
+
+        assert!(
+            !writer.has_pending().await,
+            "flush should drain live pending writes"
+        );
+        assert!(
+            writer.has_overlay_state().await,
+            "recently_committed slices must remain visible to overlay after flush"
+        );
     }
 
     #[tokio::test]
