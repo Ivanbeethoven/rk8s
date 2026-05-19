@@ -992,11 +992,13 @@ where
                 tokio::spawn(async move { Self::commit_chunk(shared, ckey).await });
             }
 
-            guard = self.shared.inner.lock().await;
             position += span_len;
+            if position >= buf.len() {
+                break;
+            }
+            guard = self.shared.inner.lock().await;
         }
 
-        drop(guard);
         let new_len = offset + buf.len() as u64;
         if new_len > self.shared.inode.file_size() {
             self.shared.inode.extend_size(new_len);
@@ -1798,6 +1800,15 @@ where
             let Some(shared) = shared.upgrade() else {
                 return;
             };
+
+            // Fast path: skip lock acquisition when no unflushed data exists.
+            let gen_val = shared.write_gen.load(Ordering::Acquire);
+            let flushed = shared.last_flushed_gen.load(Ordering::Acquire);
+            if gen_val == flushed && !tick.is_multiple_of(100) {
+                tick += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
 
             let mut to_flush = Vec::new();
             {

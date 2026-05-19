@@ -150,11 +150,11 @@ SCRIPTEOF
         cat >>"$helper" <<SCRIPTEOF
 mkdir -p "\$(dirname "${baked_fuse_log_file}")"
 SLAYERFS_FUSE_OP_LOG=1 SLAYERFS_FUSE_LOG_FILE="${baked_fuse_log_file}" \\
-    /usr/local/bin/slayerfs mount --config "\$config_path" "\$target" >>"\$log_file" 2>&1 &
+    /usr/local/bin/slayerfs mount --privileged --config "\$config_path" "\$target" >>"\$log_file" 2>&1 &
 SCRIPTEOF
     else
         cat >>"$helper" <<'SCRIPTEOF'
-/usr/local/bin/slayerfs mount --config "$config_path" "$target" >>"$log_file" 2>&1 &
+/usr/local/bin/slayerfs mount --privileged --config "$config_path" "$target" >>"$log_file" 2>&1 &
 SCRIPTEOF
     fi
 

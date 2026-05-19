@@ -107,6 +107,11 @@ pub struct MountArgs {
     /// Maximum in-flight FUSE requests when rfuse3 worker mode is enabled.
     #[arg(long)]
     pub fuse_max_background: Option<usize>,
+
+    /// Use privileged mount mode (requires root or fuse group membership).
+    /// Uses /dev/fuse directly instead of fusermount3.
+    #[arg(long, default_value_t = false)]
+    pub privileged: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -201,6 +206,7 @@ pub struct LayoutFileConfig {
 pub struct FuseFileConfig {
     pub workers: Option<usize>,
     pub max_background: Option<usize>,
+    pub privileged: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +227,7 @@ pub struct MountConfig {
     pub block_size: u32,
     pub fuse_workers: usize,
     pub fuse_max_background: usize,
+    pub privileged: bool,
 }
 
 impl MountConfig {
@@ -305,6 +312,7 @@ impl MountConfig {
                 .fuse_max_background
                 .or(fuse_cfg.max_background)
                 .unwrap_or(DEFAULT_FUSE_MAX_BACKGROUND),
+            privileged: args.privileged || fuse_cfg.privileged.unwrap_or(false),
         })
     }
 }
@@ -368,6 +376,7 @@ mod tests {
             block_size: None,
             fuse_workers: None,
             fuse_max_background: None,
+            privileged: false,
         })
         .unwrap();
 

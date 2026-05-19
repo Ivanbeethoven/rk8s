@@ -146,7 +146,7 @@ log_file="${SLAYERFS_LOG_FILE:-/artifacts/slayerfs.log}"
 
 mkdir -p "$target" "$(dirname "$log_file")"
 
-/usr/local/bin/slayerfs mount --config "$config_path" "$target" >>"$log_file" 2>&1 &
+/usr/local/bin/slayerfs mount --privileged --config "$config_path" "$target" >>"$log_file" 2>&1 &
 sleep "${SLAYERFS_MOUNT_WAIT_SECS:-1}"
 exit 0
 EOF

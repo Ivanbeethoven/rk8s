@@ -266,7 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("Mounting filesystem...");
 
-        let handle = mount_vfs_unprivileged(fs, &mount_point)
+        let handle = mount_vfs_unprivileged(fs, &mount_point, Default::default())
             .await
             .map_err(|e| format!("Failed to mount filesystem: {}", e))?;
 

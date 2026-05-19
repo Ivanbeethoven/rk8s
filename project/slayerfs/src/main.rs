@@ -44,7 +44,7 @@ use crate::control::client::send_request;
 use crate::control::job::JobOutcome;
 use crate::control::protocol::{ControlRequest, ControlResponse};
 use crate::control::runtime::RuntimeRegistry;
-use crate::fuse::mount::{FuseConcurrencyConfig, mount_vfs_unprivileged};
+use crate::fuse::mount::{FuseConcurrencyConfig, mount_vfs_privileged, mount_vfs_unprivileged};
 use crate::meta::MetaStore;
 use crate::meta::client::MetaClient;
 use crate::meta::config::{
@@ -339,7 +339,11 @@ where
         worker_count: args.fuse_workers,
         max_background: args.fuse_max_background,
     };
-    let handle = mount_vfs_unprivileged(fs, mount_point, concurrency).await?;
+    let handle = if args.privileged {
+        mount_vfs_privileged(fs, mount_point, concurrency).await?
+    } else {
+        mount_vfs_unprivileged(fs, mount_point, concurrency).await?
+    };
 
     println!("mounted at {}", mount_point.display());
     let mut handle = handle;

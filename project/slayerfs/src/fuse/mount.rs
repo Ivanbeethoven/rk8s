@@ -1,7 +1,8 @@
 //! Mount helpers for starting/stopping FUSE
 //!
 //! Notes:
-//! - Only supported on Unix-like systems. On Linux we support unprivileged mount via fusermount3.
+//! - Only supported on Unix-like systems. On Linux we support unprivileged mount via fusermount3
+//!   and privileged mount via /dev/fuse.
 //! - These helpers are thin wrappers over rfuse3 raw Session APIs.
 
 use std::num::NonZeroU32;
@@ -91,9 +92,56 @@ where
     }
 }
 
-/// Fallback stub for non-Linux targets.
+/// Mount a VFS instance to the given empty directory using privileged mode (via /dev/fuse).
+/// Requires root or fuse group membership. Supports allow_other without /etc/fuse.conf tweaks.
+#[cfg(target_os = "linux")]
+pub async fn mount_vfs_privileged<S, M>(
+    fs: VFS<S, M>,
+    mount_point: impl AsRef<Path>,
+    concurrency: FuseConcurrencyConfig,
+) -> std::io::Result<rfuse3::raw::MountHandle>
+where
+    S: BlockStore + Send + Sync + 'static,
+    M: MetaLayer + Send + Sync + 'static,
+{
+    let mount_point = mount_point.as_ref();
+    if fuse_op_log_enabled() {
+        configure_session(
+            rfuse3::raw::Session::new(default_mount_options()),
+            concurrency,
+        )
+        .mount(LoggingFileSystem::new(fs), mount_point)
+        .await
+    } else {
+        configure_session(
+            rfuse3::raw::Session::new(default_mount_options()),
+            concurrency,
+        )
+        .mount(fs, mount_point)
+        .await
+    }
+}
+
+/// Fallback stub for non-Linux targets (unprivileged).
 #[cfg(not(target_os = "linux"))]
 pub async fn mount_vfs_unprivileged<S, M>(
+    _fs: VFS<S, M>,
+    _mount_point: impl AsRef<Path>,
+    _concurrency: FuseConcurrencyConfig,
+) -> std::io::Result<rfuse3::raw::MountHandle>
+where
+    S: BlockStore + Send + Sync + 'static,
+    M: MetaLayer + Send + Sync + 'static,
+{
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "FUSE mount is only supported on Linux in this build",
+    ))
+}
+
+/// Fallback stub for non-Linux targets (privileged).
+#[cfg(not(target_os = "linux"))]
+pub async fn mount_vfs_privileged<S, M>(
     _fs: VFS<S, M>,
     _mount_point: impl AsRef<Path>,
     _concurrency: FuseConcurrencyConfig,
