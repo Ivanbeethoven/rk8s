@@ -38,7 +38,7 @@ use std::time::Duration;
 use futures_util::stream::{self, BoxStream};
 use rfuse3::raw::Filesystem;
 use rfuse3::{FileType as FuseFileType, SetAttr, Timestamp};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 const FUSE_CACHE_TTL: Duration = Duration::ZERO;
 #[cfg(all(test, target_os = "linux"))]
@@ -494,7 +494,7 @@ where
         let n = if write_flags & FUSE_WRITE_CACHE != 0 {
             // Cached writes already contain the page data at the supplied
             // offset; applying O_APPEND again would duplicate the prefix.
-            debug!(
+            trace!(
                 ino,
                 fh,
                 offset,

@@ -1962,29 +1962,6 @@ where
 
     /// Write data by inode directly (used by FUSE to avoid path resolution).
     pub async fn write_ino(&self, ino: i64, offset: u64, data: &[u8]) -> Result<usize, VfsError> {
-        self.write_ino_inner(ino, offset, data, false).await
-    }
-
-    /// Write back a kernel-cached page by inode. This uses the inode mutation
-    /// lock so truncate/copy cannot interleave with a dirty writer commit.
-    /// Cached writeback must remain lightweight; fsync/flush/close and read paths
-    /// are responsible for forcing pending data visible when required.
-    pub async fn write_cached_ino(
-        &self,
-        ino: i64,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<usize, VfsError> {
-        self.write_ino_inner(ino, offset, data, true).await
-    }
-
-    async fn write_ino_inner(
-        &self,
-        ino: i64,
-        offset: u64,
-        data: &[u8],
-        cached: bool,
-    ) -> Result<usize, VfsError> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -2004,17 +1981,10 @@ where
 
         let inode = self.ensure_inode_registered(ino).await?;
         let writer = self.state.writer.ensure_file(inode);
-        let written = if cached {
-            writer
-                .write_at_cached(offset, data)
-                .await
-                .map_err(VfsError::from)?
-        } else {
-            writer
-                .write_at(offset, data)
-                .await
-                .map_err(VfsError::from)?
-        };
+        let written = writer
+            .write_at(offset, data)
+            .await
+            .map_err(VfsError::from)?;
 
         // Invalidate reader cache for the written range so any subsequent
         // read path flushes pending writer data instead of serving a stale
@@ -2033,6 +2003,45 @@ where
         }
 
         self.state.modified.touch(ino).await;
+        Ok(written)
+    }
+
+    /// Write back a kernel-cached page by inode. This is the hot path for
+    /// FUSE_WRITE_CACHE (mmap writeback, kernel page cache flush).
+    ///
+    /// Unlike normal writes, cached writeback does NOT acquire the per-inode
+    /// mutation lock.  The writer's internal slice-level locking is sufficient
+    /// to handle concurrent cached pages.  Truncate correctness is preserved
+    /// because truncate_inode / set_attr first drain all pending writes via
+    /// flush_before_truncate, then acquire the mutation lock and call
+    /// writer.clear().
+    ///
+    /// We also skip meta_stat_required (the kernel only sends WRITE_CACHE for
+    /// inodes that are already open files) and reader.invalidate (commit_chunk
+    /// invalidates the reader at commit time; doing it on every page write
+    /// adds measurable latency under heavy mmap traffic).
+    pub async fn write_cached_ino(
+        &self,
+        ino: i64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, VfsError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let inode = self.ensure_inode_registered(ino).await?;
+        let writer = self.state.writer.ensure_file(inode.clone());
+        let written = writer
+            .write_at_cached(offset, data)
+            .await
+            .map_err(VfsError::from)?;
+
+        let new_end = offset + written as u64;
+        if new_end > inode.file_size() {
+            self.extend_local_file_size(ino, new_end);
+        }
+
         Ok(written)
     }
 

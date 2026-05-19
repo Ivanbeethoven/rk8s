@@ -21,3 +21,11 @@ project/rkforge/tests/dockers/output
 project/docs
 **/artifacts/**
 **/xfstests/**
+**/.claude/**
+
+
+
+
+
+
+  "includeCoAuthoredBy": false,

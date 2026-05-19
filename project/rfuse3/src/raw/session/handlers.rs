@@ -2216,7 +2216,7 @@ pub(super) async fn handle_poll_inline<FS: Filesystem + Send + Sync + 'static>(
         "poll (worker)"
     );
 
-    let notify = Notify::new(ctx.resp_for(item.unique));
+    let notify = Notify::new(ctx.resp_for(item.unique).clone());
     let reply_poll = match ctx
         .fs
         .poll(

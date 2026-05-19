@@ -69,8 +69,8 @@ pub(crate) struct DispatchCtx<FS: Filesystem + Send + Sync + 'static> {
 
 impl<FS: Filesystem + Send + Sync + 'static> DispatchCtx<FS> {
     #[inline]
-    pub(crate) fn resp_for(&self, unique: u64) -> UnboundedSender<FuseData> {
-        self.resp[unique as usize % self.resp.len()].clone()
+    pub(crate) fn resp_for(&self, unique: u64) -> &UnboundedSender<FuseData> {
+        &self.resp[unique as usize % self.resp.len()]
     }
 }
 
@@ -100,14 +100,21 @@ impl<FS: Filesystem + Send + Sync + 'static> Workers<FS> {
             #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
             let handle = task::spawn(async move {
                 while let Some(item) = rx.next().await {
-                    process_work_item(&ctx_clone, idx, item).await;
+                    let ctx = ctx_clone.clone();
+                    task::spawn(async move {
+                        process_work_item(&ctx, idx, item).await;
+                    })
+                    .detach();
                 }
                 debug!(worker=%idx, "worker exit");
             });
             #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
             let handle = task::spawn(async move {
                 while let Some(item) = rx.next().await {
-                    process_work_item(&ctx_clone, idx, item).await;
+                    let ctx = ctx_clone.clone();
+                    task::spawn(async move {
+                        process_work_item(&ctx, idx, item).await;
+                    });
                 }
                 debug!(worker=%idx, "worker exit");
             });

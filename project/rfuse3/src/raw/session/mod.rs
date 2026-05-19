@@ -742,6 +742,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
             // Retry loop: keep writing this reply until it succeeds, the kernel
             // forgets the request (NotFound), or the channel is closed.
+            let mut retry_delay_us: u64 = 100; // start at 100μs
             loop {
                 let ((ret_data, ret_ext), result) =
                     fuse_connection.write_vectored(data, extend_data).await;
@@ -769,7 +770,12 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         } else {
                             warn!("reply fuse write error, retrying: {}", err);
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+                        tokio::time::sleep(std::time::Duration::from_micros(retry_delay_us)).await;
+                        #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+                        async_io::Timer::after(std::time::Duration::from_micros(retry_delay_us)).await;
+                        // Exponential backoff capped at 10ms
+                        retry_delay_us = (retry_delay_us * 2).min(10_000);
                     }
                 }
             }
@@ -955,7 +961,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let buffer_size = (max_write + FUSE_WRITE_IN_SIZE).max(FUSE_MIN_READ_BUFFER_SIZE);
         debug!(buffer_size, "buffer size calculated");
 
-        // Create buffers for main loop (reused each iteration)
+        // Create buffers for main loop (reused each iteration in legacy mode)
         let mut header_buffer = vec![0; FUSE_IN_HEADER_SIZE];
         let mut data_buffer = AlignedBuffer::try_new(buffer_size).map_err(IoError::other)?;
 
@@ -1020,7 +1026,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             if let Some(workers) = &self.workers {
                 let unique = request.unique;
                 let opcode_raw = in_header.opcode;
-                // Keep the shared read buffer for reuse; copy only request payload
+                // Copy request payload into Bytes for worker.
+                // We must copy because data_buffer is reused for the next read.
                 let body_bytes = Bytes::copy_from_slice(data_ref);
 
                 let lite = InHeaderLite {

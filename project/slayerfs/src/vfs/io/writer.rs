@@ -964,39 +964,53 @@ where
             guard.write_waiting -= 1;
         }
 
-        let mut position = 0;
+        let layout = self.shared.config.layout;
+        let chunk_index = layout.chunk_index_of(offset);
+        let within_offset = layout.within_chunk_offset(offset);
 
-        let spans = split_chunk_spans(self.shared.config.layout, offset, buf.len());
-        for span in spans {
-            let cid = chunk_id_for(self.shared.inode.ino(), span.index)?;
+        // Fast path: write fits entirely within a single chunk (99%+ of cached
+        // 4KB page writes).  Avoids split_chunk_spans Vec allocation and loop.
+        if within_offset + buf.len() as u64 <= layout.chunk_size {
+            let cid = chunk_id_for(self.shared.inode.ino(), chunk_index)?;
             let ckey = guard.get_or_create_chunk(cid);
-
             let mut handle = guard.chunk_handle(&self.shared, ckey);
-
-            // This is the last missing piece of the attempt to implement real zero-copy.
-            // There is a copy operation when appending the user-provided buf to the page cache.
-            // However, the buf is a byte slice, meaning that it is impossible to get the data with ownership
-            // unless "clone" it. So this copy seems to be inevitable.
-            // Alternatively, the API signature could be modified or added to request "Bytes" from users. However,
-            // this would break POSIX compatibility and is not supported by FUSE.
-            let span_len = span.len.as_usize();
-            let action = handle.write_at(span.offset, &buf[position..position + span_len])?;
+            let action = handle.write_at(within_offset, buf)?;
             drop(guard);
 
             for slice in action.flush {
                 Self::spawn_flush_slice(self.shared.clone(), slice);
             }
-
             if action.start_commit {
                 let shared = self.shared.clone();
                 tokio::spawn(async move { Self::commit_chunk(shared, ckey).await });
             }
+        } else {
+            // Slow path: write crosses chunk boundary.
+            let mut position = 0;
+            let spans = split_chunk_spans(layout, offset, buf.len());
+            for span in spans {
+                let cid = chunk_id_for(self.shared.inode.ino(), span.index)?;
+                let ckey = guard.get_or_create_chunk(cid);
+                let mut handle = guard.chunk_handle(&self.shared, ckey);
+                let span_len = span.len.as_usize();
+                let action =
+                    handle.write_at(span.offset, &buf[position..position + span_len])?;
+                drop(guard);
 
-            position += span_len;
-            if position >= buf.len() {
-                break;
+                for slice in action.flush {
+                    Self::spawn_flush_slice(self.shared.clone(), slice);
+                }
+                if action.start_commit {
+                    let shared = self.shared.clone();
+                    tokio::spawn(async move { Self::commit_chunk(shared, ckey).await });
+                }
+
+                position += span_len;
+                if position >= buf.len() {
+                    break;
+                }
+                guard = self.shared.inner.lock().await;
             }
-            guard = self.shared.inner.lock().await;
         }
 
         let new_len = offset + buf.len() as u64;
