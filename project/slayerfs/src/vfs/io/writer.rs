@@ -482,7 +482,13 @@ where
         });
         self.shared.flush_notify.notify_waiters();
     }
+}
 
+impl<'a, B, M> SliceHandle<'a, B, M>
+where
+    B: BlockStore + Send + Sync + 'static,
+    M: MetaLayer + Send + Sync + 'static,
+{
     /// Attempt to commit a fully-uploaded slice immediately.
     /// Called from the upload task when all blocks have been transferred,
     /// so that flush() callers do not wait on the commit_chunk poll loop.
@@ -510,11 +516,23 @@ where
                 .await
             {
                 Ok(()) => {
-                    self.mark_committed();
-
                     self.shared
                         .inode
                         .add_estimated_allocated_bytes(desc.length.as_usize() as u64);
+
+                    // Invalidate reader cache BEFORE marking committed so that
+                    // when the flush loop sees the Committed state, the reader
+                    // already has fresh data.  Otherwise flush can return while
+                    // the reader still serves stale cached pages.
+                    let file_offset =
+                        chunk_index * self.shared.config.layout.chunk_size + desc.offset;
+                    let _ = self
+                        .shared
+                        .reader
+                        .invalidate(ino as u64, file_offset, desc.length.as_usize())
+                        .await;
+
+                    self.mark_committed();
 
                     if let Some(wb) = &self.shared.write_back {
                         let key = crate::vfs::cache::keys::DirtySliceKey {
@@ -1558,12 +1576,16 @@ where
                                 .is_ok();
 
                             if ok {
+                                shared.inode.set_committed_size(new_size);
+                                let _ = shared
+                                    .reader
+                                    .invalidate(ino as u64, file_offset, desc.length.as_usize())
+                                    .await;
                                 SliceHandle {
                                     slice: &slice,
                                     shared: &shared,
                                 }
                                 .mark_committed();
-                                shared.inode.set_committed_size(new_size);
                             }
                             ok
                         } else {
@@ -1717,11 +1739,6 @@ where
                             }
                         } else {
                             commit_failures = 0;
-                            SliceHandle {
-                                slice: &slice,
-                                shared: &shared,
-                            }
-                            .mark_committed();
 
                             // Track committed bytes on the inode for accurate st_blocks.
                             shared
@@ -1739,6 +1756,9 @@ where
                                 let _ = wb.remove(&key).await;
                             }
 
+                            // Invalidate reader cache BEFORE marking committed.
+                            // This ensures that when the flush loop observes
+                            // Committed, the reader already serves fresh data.
                             let _ = shared
                                 .reader
                                 .invalidate(ino as u64, file_offset, desc.length.as_usize())
@@ -1749,6 +1769,13 @@ where
                                     len = desc.length
                                 ))
                                 .await;
+
+                            SliceHandle {
+                                slice: &slice,
+                                shared: &shared,
+                            }
+                            .mark_committed();
+
                             should_pop = true;
                         }
                     } else {
@@ -1756,6 +1783,24 @@ where
                     }
                 } // end epoch-ok else block
             } else if matches!(runtime.status, SliceStatus::Committed) {
+                // Slice was already committed by try_commit in the upload task.
+                // We must still invalidate the reader cache for this range so
+                // that reads after flush (where overlay_dirty is skipped because
+                // has_pending() returns false) fetch fresh data from S3.
+                let desc = SliceHandle {
+                    slice: &slice,
+                    shared: &shared,
+                }
+                .desc_for_commit();
+                if let Some(desc) = desc {
+                    let (ino_val, chunk_index) = extract_ino_and_chunk_index(desc.chunk_id);
+                    let file_offset =
+                        chunk_index * shared.config.layout.chunk_size + desc.offset;
+                    let _ = shared
+                        .reader
+                        .invalidate(ino_val as u64, file_offset, desc.length.as_usize())
+                        .await;
+                }
                 should_pop = true;
             }
 

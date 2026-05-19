@@ -666,7 +666,10 @@ where
         let hard_limit = self.config.buffer_size * 2;
         // buffer size limit is just a soft limit. It is perfectly normal to see that the current memory usage exceed it.
         if self.buffer_usage.load(Ordering::Relaxed) > self.config.buffer_size {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Yield instead of sleeping a fixed 10ms: this allows other tasks
+            // (upload, eviction) to make progress without unnecessarily throttling
+            // hot-path reads that happen to briefly exceed the soft limit.
+            tokio::task::yield_now().await;
 
             // `2 * buffer size limit` is a hard limit. A read operation idle until memory pressure is relieved.
             while self.buffer_usage.load(Ordering::Relaxed) > hard_limit {

@@ -406,6 +406,35 @@ const UNCOMMITTED_PENDING_INDEX_KEY: &str = "uc_pending_idx";
 const UNCOMMITTED_ORPHAN_INDEX_KEY: &str = "uc_orphan_idx";
 const COMPACT_RETRY_LIMIT: usize = 64;
 
+// Lua script for atomically appending a slice AND extending file size in one RTT.
+// KEYS[1] = chunk_key, KEYS[2] = version_key, KEYS[3] = node_key
+// ARGV[1] = serialized slice data, ARGV[2] = new_size, ARGV[3] = timestamp
+const WRITE_SLICE_LUA: &str = r#"
+    redis.call('RPUSH', KEYS[1], ARGV[1])
+    redis.call('INCR', KEYS[2])
+    local node_json = redis.call('GET', KEYS[3])
+    if not node_json then
+        return cjson.encode({ok=false, error="node_not_found"})
+    end
+    local ok, node = pcall(cjson.decode, node_json)
+    if not ok or not node or not node.attr or not node.attr.size then
+        return cjson.encode({ok=false, error="corrupt_node"})
+    end
+    local new_size = tonumber(ARGV[2])
+    local timestamp = tonumber(ARGV[3])
+    if new_size <= node.attr.size then
+        return cjson.encode({ok=true, updated=false})
+    end
+    node.attr.size = new_size
+    node.attr.mtime = timestamp
+    node.attr.ctime = timestamp
+    if node.attr.mode then
+        node.attr.mode = bit.band(node.attr.mode, bit.bnot(6144))
+    end
+    redis.call('SET', KEYS[3], cjson.encode(node))
+    return cjson.encode({ok=true, updated=true})
+"#;
+
 // Lua script for atomically extending file size
 const EXTEND_FILE_SIZE_LUA: &str = r#"
     local node_json = redis.call('GET', KEYS[1])
@@ -2838,8 +2867,35 @@ impl MetaStore for RedisMetaStore {
         slice: SliceDesc,
         new_size: u64,
     ) -> Result<(), MetaError> {
-        self.append_slice(chunk_id, slice).await?;
-        self.extend_file_size(ino, new_size).await
+        // Combined Lua script: append slice + extend file size in a single RTT.
+        let chunk_key = self.chunk_key(chunk_id);
+        let version_key = self.chunk_version_key(chunk_id);
+        let node_key = self.node_key(ino);
+        let data = crate::meta::serialization::serialize_meta(&slice)?;
+        let now = current_time();
+
+        let script = redis::Script::new(WRITE_SLICE_LUA);
+        let result: String = script
+            .key(&chunk_key)
+            .key(&version_key)
+            .key(&node_key)
+            .arg(data)
+            .arg(new_size)
+            .arg(now)
+            .invoke_async(&mut self.conn.clone())
+            .await
+            .map_err(redis_err)?;
+
+        let response: LuaResponse = serde_json::from_str(&result)
+            .map_err(|e| MetaError::Internal(format!("Lua response parse error: {e}")))?;
+
+        match response.error.as_deref() {
+            Some("node_not_found") => Err(MetaError::NotFound(ino)),
+            Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
+            Some(other) => Err(MetaError::Internal(format!("Lua error: {other}"))),
+            None if response.ok => Ok(()),
+            None => Err(MetaError::Internal("unexpected Lua response".into())),
+        }
     }
 
     #[tracing::instrument(level = "trace", skip(self), fields(limit))]
