@@ -292,6 +292,7 @@ async fn create_s3_client(args: &MountConfig) -> anyhow::Result<ObjectClient<S3B
         max_concurrency: args.s3_max_concurrency,
         endpoint: args.s3_endpoint.clone(),
         force_path_style: args.s3_force_path_style,
+        disable_payload_checksum: args.s3_disable_payload_checksum,
         ..Default::default()
     };
 
