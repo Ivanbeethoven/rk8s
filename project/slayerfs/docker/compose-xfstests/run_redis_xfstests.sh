@@ -100,6 +100,10 @@ fi
 
 mkdir -p "$ARTIFACTS_DIR"
 
+ts="$(date +%s)-$RANDOM"
+PROJECT_NAME="slayerfs-${ts}"
+COMPOSE_ARGS=(-f "$COMPOSE_FILE" -p "$PROJECT_NAME")
+
 cleanup() {
     if [[ "$KEEP" == true ]]; then
         info "跳过 compose down (--keep)"
@@ -111,10 +115,6 @@ trap cleanup EXIT INT TERM
 
 info "构建宿主机 slayerfs release 二进制（供镜像 COPY）"
 bash "$DOCKER_DIR/build_slayerfs_host_binary.sh"
-
-ts="$(date +%s)-$RANDOM"
-PROJECT_NAME="slayerfs-${ts}"
-COMPOSE_ARGS=(-f "$COMPOSE_FILE" -p "$PROJECT_NAME")
 
 info "构建 xfstests runner 镜像"
 docker compose "${COMPOSE_ARGS[@]}" build xfstests

@@ -62,6 +62,10 @@ done
 
 mkdir -p "$ARTIFACTS_DIR"
 
+ts="$(date +%s)-$RANDOM"
+PROJECT_NAME="slayerfs-ltp-sqlite-${ts}"
+COMPOSE_ARGS=(-f "$COMPOSE_FILE" -p "$PROJECT_NAME")
+
 cleanup() {
     if [[ "$KEEP" == true ]]; then
         info "skip compose down (--keep)"
@@ -73,10 +77,6 @@ trap cleanup EXIT INT TERM
 
 info "build slayerfs release binary on host (for COPY in Dockerfile)"
 bash "$DOCKER_DIR/build_slayerfs_host_binary.sh"
-
-ts="$(date +%s)-$RANDOM"
-PROJECT_NAME="slayerfs-ltp-sqlite-${ts}"
-COMPOSE_ARGS=(-f "$COMPOSE_FILE" -p "$PROJECT_NAME")
 
 info "build LTP runner image"
 docker compose "${COMPOSE_ARGS[@]}" build ltp
