@@ -139,8 +139,10 @@ impl S3Backend {
         ByteStream::from_body_0_4(Body::wrap_stream(stream))
     }
 
+    #[tracing::instrument(level = "debug", skip(self, chunks), fields(key, total_size))]
     async fn put_object_vectored_simple(&self, key: &str, chunks: Vec<Bytes>) -> Result<()> {
         let total_size = chunks.iter().map(|c| c.len()).sum::<usize>();
+        tracing::Span::current().record("total_size", total_size);
         let checksum = if self.config.enable_md5 && total_size > 0 {
             Some(Self::md5_base64_chunks(&chunks))
         } else {
@@ -177,6 +179,7 @@ impl S3Backend {
     }
 
     /// Put small objects directly (simpler than multipart upload)
+    #[tracing::instrument(level = "debug", skip(self, data), fields(key, size = data.len()))]
     async fn put_object_simple(&self, key: &str, data: &[u8]) -> Result<()> {
         let mut attempt = 0;
         loop {
@@ -329,6 +332,7 @@ impl S3Backend {
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", skip(self, chunks), fields(key, parts))]
     async fn multipart_upload_vectored(&self, key: &str, chunks: Vec<Bytes>) -> Result<()> {
         let create = self
             .client
@@ -501,16 +505,14 @@ impl ObjectBackend for S3Backend {
             return self.put_object_simple(key, &[]).await;
         }
         if total_size <= self.config.part_size {
-            let mut data = Vec::with_capacity(total_size);
-            for chunk in chunks {
-                data.extend_from_slice(&chunk);
-            }
-            return self.put_object_simple(key, &data).await;
+            // Use streaming body to avoid copying chunks into a contiguous Vec.
+            return self.put_object_vectored_simple(key, chunks).await;
         }
 
         self.multipart_upload_vectored(key, chunks).await
     }
 
+    #[tracing::instrument(level = "debug", skip(self, data), fields(key, size = data.len()))]
     async fn put_object(&self, key: &str, data: &[u8]) -> Result<()> {
         // Small objects use direct put_object; large objects use multipart upload
         if data.len() <= self.config.part_size {
@@ -521,6 +523,7 @@ impl ObjectBackend for S3Backend {
         self.multipart_upload(key, data).await
     }
 
+    #[tracing::instrument(level = "debug", skip(self), fields(key))]
     async fn get_object(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let resp = self
             .client
@@ -545,6 +548,7 @@ impl ObjectBackend for S3Backend {
 
     /// Get a range of bytes from an object.
     /// Used for small range reads in intelligent read strategy.
+    #[tracing::instrument(level = "debug", skip(self, buf), fields(key, offset, len = buf.len()))]
     async fn get_object_range(&self, key: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -594,6 +598,7 @@ impl ObjectBackend for S3Backend {
         Ok(resp.e_tag().unwrap_or_default().to_string())
     }
 
+    #[tracing::instrument(level = "debug", skip(self), fields(key))]
     async fn delete_object(&self, key: &str) -> Result<()> {
         let mut attempt = 0;
 

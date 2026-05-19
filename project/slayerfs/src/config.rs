@@ -7,8 +7,8 @@ use crate::chunk::layout::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
 pub const DEFAULT_DATA_DIR: &str = "./data";
 pub const DEFAULT_META_URL: &str = "sqlite::memory:";
 pub const DEFAULT_S3_PART_SIZE: usize = 16 * 1024 * 1024;
-pub const DEFAULT_S3_MAX_CONCURRENCY: usize = 8;
-pub const DEFAULT_FUSE_MAX_BACKGROUND: usize = 256;
+pub const DEFAULT_S3_MAX_CONCURRENCY: usize = 16;
+pub const DEFAULT_FUSE_MAX_BACKGROUND: usize = 512;
 
 fn default_fuse_workers() -> usize {
     std::thread::available_parallelism()
