@@ -19,7 +19,7 @@ log_file="${SLAYERFS_LOG_FILE:-/artifacts/slayerfs.log}"
 xfstests_dir="${XFSTESTS_DIR:-/opt/xfstests-dev}"
 artifact_root="${SLAYERFS_ARTIFACT_ROOT:-/artifacts}"
 artifact_dir="${SLAYERFS_ARTIFACT_DIR:-}"
-perf_tools="${PERF_TOOLS:-dirstress metaperf looptest fio-seqread fio-seqwrite fio-randread fio-randwrite}"
+perf_tools="${PERF_TOOLS:-dirstress dirperf metaperf looptest fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw}"
 
 env_or_default() {
     local specific_var="$1"
@@ -135,19 +135,26 @@ install_mount_helper() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH"
 
-src="${1:-}"
-target="${2:-}"
+src="\${1:-}"
+target="\${2:-}"
 shift 2 || true
 
-config_path="${SLAYERFS_CONFIG_PATH:-/run/slayerfs/config.yaml}"
-log_file="${SLAYERFS_LOG_FILE:-/artifacts/slayerfs.log}"
+config_path="\${SLAYERFS_CONFIG_PATH:-/run/slayerfs/config.yaml}"
+log_file="\${SLAYERFS_LOG_FILE:-/artifacts/slayerfs.log}"
 
-mkdir -p "$target" "$(dirname "$log_file")"
+mkdir -p "\$target" "\$(dirname "\$log_file")"
 
-/usr/local/bin/slayerfs mount --privileged --config "$config_path" "$target" >>"$log_file" 2>&1 &
-sleep "${SLAYERFS_MOUNT_WAIT_SECS:-1}"
+# Enable FUSE op tracing when PERF_FUSE_OPS_LOG=1 for detailed profiling
+if [[ "\${PERF_FUSE_OPS_LOG:-0}" == "1" ]]; then
+    export RUST_LOG="\${RUST_LOG:-slayerfs=info,rfuse3::raw::logfs=debug}"
+else
+    export RUST_LOG="\${RUST_LOG:-error}"
+fi
+
+/usr/local/bin/slayerfs mount --privileged --config "\$config_path" "\$target" >>"\$log_file" 2>&1 &
+sleep "\${SLAYERFS_MOUNT_WAIT_SECS:-1}"
 exit 0
 EOF
     chmod +x "$helper"
@@ -615,7 +622,10 @@ run_fio_profile() {
         prepare_fio_dataset "$tool" "$work_dir" "$size" "$direct" || return $?
     fi
 
+    # Collect per-second latency logs for time-series analysis
+    local lat_log_prefix="$artifact_dir/results/${tool}_lat"
     args+=(--output-format=json --output="$json_path")
+    args+=(--write_lat_log="$lat_log_prefix" --log_avg_msec=1000)
     run_logged_tool "$tool" fio "${args[@]}"
     append_fio_log_summary "$json_path" "$artifact_dir/tools/${tool}.log" "$tool"
 }
@@ -748,6 +758,121 @@ if fio_json_paths:
             )
     except Exception as exc:
         lines.extend(["", "## Fio", "", f"Failed to parse fio JSON: {exc}"])
+
+# --- Detailed Latency Percentiles ---
+if fio_json_paths:
+    try:
+        pct_keys = ["1.000000", "5.000000", "25.000000", "50.000000",
+                    "75.000000", "90.000000", "95.000000", "99.000000", "99.900000"]
+        pct_labels = ["p1", "p5", "p25", "p50", "p75", "p90", "p95", "p99", "p99.9"]
+
+        lines.extend([
+            "",
+            "## Latency Percentiles",
+            "",
+            "### Read",
+            "",
+            "| Workload | " + " | ".join(pct_labels) + " |",
+            "| --- |" + " ---: |" * len(pct_labels),
+        ])
+        for fio_json_path in fio_json_paths:
+            data = json.loads(fio_json_path.read_text())
+            jobs = data.get("jobs", [])
+            if not jobs:
+                continue
+            read_op = jobs[0].get("read", {})
+            percs = read_op.get("clat_ns", {}).get("percentile", {})
+            if not percs or num(read_op.get("bw_bytes")) == 0:
+                continue
+            cols = [fio_json_path.stem]
+            for k in pct_keys:
+                cols.append(fmt_ms_from_ns(percs.get(k, 0)))
+            lines.append("| " + " | ".join(cols) + " |")
+
+        lines.extend([
+            "",
+            "### Write",
+            "",
+            "| Workload | " + " | ".join(pct_labels) + " |",
+            "| --- |" + " ---: |" * len(pct_labels),
+        ])
+        for fio_json_path in fio_json_paths:
+            data = json.loads(fio_json_path.read_text())
+            jobs = data.get("jobs", [])
+            if not jobs:
+                continue
+            write_op = jobs[0].get("write", {})
+            percs = write_op.get("clat_ns", {}).get("percentile", {})
+            if not percs or num(write_op.get("bw_bytes")) == 0:
+                continue
+            cols = [fio_json_path.stem]
+            for k in pct_keys:
+                cols.append(fmt_ms_from_ns(percs.get(k, 0)))
+            lines.append("| " + " | ".join(cols) + " |")
+    except Exception:
+        pass
+
+# --- Metadata Performance ---
+metaperf_log = artifact_dir / "tools" / "metaperf.log"
+if metaperf_log.exists():
+    try:
+        lines.extend([
+            "",
+            "## Metadata Performance",
+            "",
+            "| Operation | Ops/sec | Latency (µs/op) |",
+            "| --- | ---: | ---: |",
+        ])
+        for mline in metaperf_log.read_text().splitlines():
+            if "ops/sec=" in mline and "usec/op" in mline:
+                op = mline.split(":")[0].strip()
+                ops_sec = mline.split("ops/sec=")[1].split(",")[0]
+                usec_op = mline.split("usec/op")[1].strip().lstrip("= ")
+                lines.append(f"| {op} | {float(ops_sec):.1f} | {float(usec_op):.0f} |")
+    except Exception:
+        pass
+
+# --- Bottleneck Analysis ---
+if fio_json_paths:
+    try:
+        findings = []
+        for fio_json_path in fio_json_paths:
+            data = json.loads(fio_json_path.read_text())
+            jobs = data.get("jobs", [])
+            if not jobs:
+                continue
+            job = jobs[0]
+            options = job.get("job options", {})
+            name = fio_json_path.stem
+            numjobs = int(options.get("numjobs", 1))
+
+            read_op = job.get("read", {})
+            write_op = job.get("write", {})
+
+            rpercs = read_op.get("clat_ns", {}).get("percentile", {})
+            wpercs = write_op.get("clat_ns", {}).get("percentile", {})
+
+            if rpercs and num(read_op.get("bw_bytes")) > 0:
+                p50 = num(rpercs.get("50.000000")) / 1e6
+                p99 = num(rpercs.get("99.000000")) / 1e6
+                if p50 > 100:
+                    findings.append(f"- **{name}**: Read p50={p50:.0f}ms — network RTT dominates. Consider local SSD cache or prefetch tuning.")
+                elif p99 > p50 * 5 and p99 > 50:
+                    findings.append(f"- **{name}**: Read tail latency p99/p50={p99/p50:.1f}x ({p50:.1f}ms→{p99:.0f}ms). Likely S3 retry or cache miss.")
+
+            if wpercs and num(write_op.get("bw_bytes")) > 0:
+                p50 = num(wpercs.get("50.000000")) / 1e6
+                p99 = num(wpercs.get("99.000000")) / 1e6
+                if p50 < 10 and p99 > 200:
+                    findings.append(f"- **{name}**: Write stall p50={p50:.1f}ms p99={p99:.0f}ms — auto_flush/buffer-limit triggers S3 upload backpressure.")
+                elif p99 > 500:
+                    findings.append(f"- **{name}**: Write P99={p99:.0f}ms > 500ms — consider increasing write buffer or S3 concurrency.")
+
+        if findings:
+            lines.extend(["", "## Bottleneck Analysis", ""])
+            lines.extend(findings)
+    except Exception:
+        pass
 
 report_path.write_text("\n".join(lines) + "\n")
 PY

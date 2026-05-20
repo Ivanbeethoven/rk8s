@@ -89,12 +89,13 @@ impl Default for WriteConfig {
             freeze_min_bytes: 8 * 1024 * 1024,
             #[cfg(test)]
             freeze_min_bytes: 4096,
-            // Start upload quickly so flush() finds most slices already committed.
-            // At 200ms, sequential writes at ~100 MiB/s accumulate ~20MB before
-            // freeze, which is only ~5 block uploads. With 16 concurrent uploads
-            // this completes in well under 1s for most slices.
+            // Balance between flush latency and sustained write throughput.
+            // Too aggressive (200ms) causes frequent small S3 PUTs that reduce BW.
+            // Too lazy (1000ms) means flush() must wait longer for in-flight uploads.
+            // 500ms at ~160 MiB/s accumulates ~80MB per slice (10 blocks), which
+            // with 16 concurrent uploads completes in ~2s during flush().
             #[cfg(not(test))]
-            auto_flush_max_age: Duration::from_millis(200),
+            auto_flush_max_age: Duration::from_millis(500),
             #[cfg(test)]
             auto_flush_max_age: Duration::from_millis(5),
             writeback_mode,

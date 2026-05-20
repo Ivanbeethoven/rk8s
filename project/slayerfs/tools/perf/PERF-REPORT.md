@@ -1,238 +1,165 @@
-# SlayerFS 性能分析报告
+# SlayerFS Detailed Performance Profile
 
-**测试日期**: 2026-05-20 (v2, io_uring + flush fix)  
-**后端**: Redis (元数据) + RustFS/S3 (数据存储, 本机 docker)  
-**挂载模式**: privileged (`/dev/fuse` 直通, io_uring FUSE 连接)  
-**配置**: chunk_size=256MiB, block_size=4MiB, S3 part_size=16MiB, fuse_workers=8, max_background=512  
+Artifact: `perf-run-1779281478-692`
 
----
+## Throughput Summary
 
-## 1. FIO 基准测试结果
+| Workload | Mode | BS | Jobs | Read BW | Write BW | Read IOPS | Write IOPS |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| fio-randread | randread | 4m | 4 | 109.5 MiB/s | - | 27.4 | - |
+| fio-randrw | randrw | 4m | 4 | 74.0 MiB/s | 33.4 MiB/s | 18.5 | 8.3 |
+| fio-randwrite | randwrite | 4m | 4 | - | 146.0 MiB/s | - | 36.5 |
+| fio-seqread | read | 4m | 1 | 217.4 MiB/s | - | 54.4 | - |
+| fio-seqwrite | write | 4m | 1 | - | 160.3 MiB/s | - | 40.1 |
 
-### 1.1 大块 IO (bs=4M)
+## Latency Summary
 
-| 工作负载 | 吞吐量 | IOPS | 平均延迟 | P99 延迟 | 说明 |
-|----------|--------|------|----------|----------|------|
-| 顺序写 (1job) | **92.7 MiB/s** | 23.2 | 42.69ms | 566ms | 含 FUSE flush 持久化 |
-| 顺序读 (1job, 冷) | **164.3 MiB/s** | 41.1 | 23.96ms | 45.88ms | 并发块预取 |
-| 随机写 (4jobs) | **113 MiB/s** | 28.2 | 138ms | — | 4 线程随机写+flush |
-| 随机读 (4jobs, 冷) | **94 MiB/s** | 23.4 | 168ms | — | 4 线程冷缓存 |
-| 混合读写 (4j, 70/30) | **60/29 MiB/s** | 15/7.1 | 251/20ms | — | 读写混合竞争 |
+| Workload | Read Mean | Read P50 | Read P99 | Write Mean | Write P50 | Write P99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| fio-randread | 145.17 ms | 127.40 ms | 513.80 ms | - | - | - |
+| fio-randrw | 208.49 ms | 122.16 ms | 767.56 ms | 13.99 ms | 7.63 ms | 63.70 ms |
+| fio-randwrite | - | - | - | 108.94 ms | 51.64 ms | 658.51 ms |
+| fio-seqread | 18.02 ms | 17.69 ms | 33.42 ms | - | - | - |
+| fio-seqwrite | - | - | - | 24.39 ms | 3.46 ms | 308.28 ms |
 
-### 1.2 中等块 IO (bs=1M)
+## Latency Distribution
 
-| 工作负载 | 吞吐量 | IOPS | 平均延迟 | P99 延迟 | 说明 |
-|----------|--------|------|----------|----------|------|
-| 顺序写 (2jobs) | **138.8 MiB/s** | 138.8 | 14.24ms | 154ms | 双线程并发写 |
-| 顺序读 (2jobs) | **156.5 MiB/s** | 156.5 | 12.60ms | 33.82ms | 双线程并发读 |
+### Read Latency Percentiles
 
-### 1.3 随机 IO (bs=64K)
+| Workload | p1 | p5 | p25 | p50 | p75 | p90 | p95 | p99 | p99.9 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| fio-randread | 26.08 ms | 71.83 ms | - | 127.40 ms | - | 217.06 ms | 287.31 ms | 513.80 ms | 759.17 ms |
+| fio-randrw | 25.82 ms | 32.64 ms | - | 122.16 ms | - | 501.22 ms | 616.56 ms | 767.56 ms | 1.02 s |
+| fio-seqread | 8.85 ms | 10.42 ms | - | 17.69 ms | - | 20.58 ms | 25.03 ms | 33.42 ms | 102.24 ms |
 
-| 工作负载 | 吞吐量 | IOPS | 平均延迟 | P99 延迟 | 说明 |
-|----------|--------|------|----------|----------|------|
-| 随机写 (4jobs) | **57.0 MiB/s** | 911 | 4.37ms | 42.73ms | 中等块随机写 |
-| 随机读 (4jobs) | **24.7 MiB/s** | 394 | 10.12ms | 45.35ms | 中等块冷缓存读 |
+### Write Latency Percentiles
 
-### 1.4 小块 IO (bs=4K)
+| Workload | p1 | p5 | p25 | p50 | p75 | p90 | p95 | p99 | p99.9 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| fio-randrw | 2.97 ms | 3.49 ms | - | 7.63 ms | - | 32.37 ms | 35.91 ms | 63.70 ms | 95.94 ms |
+| fio-randwrite | 2.24 ms | 4.08 ms | - | 51.64 ms | - | 304.09 ms | 404.75 ms | 658.51 ms | 960.50 ms |
+| fio-seqwrite | 1.88 ms | 2.01 ms | - | 3.46 ms | - | 43.25 ms | 86.51 ms | 308.28 ms | 1.84 s |
 
-| 工作负载 | 吞吐量 | IOPS | 平均延迟 | 说明 |
-|----------|--------|------|----------|------|
-| 随机写 (4jobs) | **7.0 MiB/s** | 1799 | 2.22ms | io_uring 降低 syscall 开销 |
-| 随机读 (4jobs) | **1.8 MiB/s** | 462 | 8.64ms | S3 GET 延迟为主 |
+## Metadata Performance
 
-### 关键观察
+| Operation | Ops/sec | Latency (µs/op) |
+| --- | ---: | ---: |
+| create | 176.2 | 5675 |
+| open | 1110.6 | 900 |
+| stat | 4861.2 | 206 |
+| readdir | 21892.1 | 46 |
+| rename | 722.8 | 1384 |
 
-- **顺序读 164 MiB/s**：受限于本机 docker S3 带宽，block 级并发 GET 已充分利用
-- **顺序写 92.7 MiB/s (真实持久化)**：修复了 FUSE flush 语义后，close() 确保数据落盘到 S3
-- **4K 随机写 1799 IOPS**：io_uring FUSE 通道显著降低了系统调用开销 (2.22ms avg vs 旧 12.6ms)
-- **4K 随机读 462 IOPS**：受限于 S3 GET 延迟 (8.64ms avg)
-- **P99 尾延迟**：顺序写 P99=566ms 表明偶发 S3 上传慢（可能触发重试或连接重建）
+## Bottleneck Analysis
 
----
+### fio-randread (randread, bs=4m, jobs=4)
 
-## 2. ON-CPU 火焰图分析
+  - **High read baseline**: p50=127ms. Network RTT to S3 dominates. Consider prefetch tuning or local cache.
+  - **Read scaling**: 27 MiB/s/job (4 jobs). May be limited by S3 connection pool or prefetch contention.
 
-### 2.1 CPU 采样总览 (3,755 样本, frame-pointer 模式)
+### fio-randrw (randrw, bs=4m, jobs=4)
 
-对 slayerfs 进程的 on-CPU 样本按功能模块分类：
+  - **Read tail latency**: p99/p50 = 6.3x (122.16 ms → 767.56 ms). Likely cause: S3 GET retry or cache miss on cold blocks.
+  - **High read baseline**: p50=122ms. Network RTT to S3 dominates. Consider prefetch tuning or local cache.
+  - **Read scaling**: 19 MiB/s/job (4 jobs). May be limited by S3 connection pool or prefetch contention.
 
-| 类别 | 占比 | 说明 |
-|------|------|------|
-| **网络 I/O (libc syscalls)** | ~78.4% | recv/send → S3 GET/PUT 网络传输 |
-| **预取/Readahead** | ~73% | GlobalPrefetcher → DataFetcher → S3 GET |
-| **对象存储读** | ~49% | ObjectBlockStore::read_range → S3Backend |
-| **缓存查找** | ~41% | moka ChunksCache::get (缓存 miss → fetch) |
-| **AWS SDK** | ~4.8% | aws_sdk_s3 GetObject + orchestrator |
-| **io_uring FUSE** | ~3% | fuse-io-uring 线程 (readv/writev) |
-| **Tokio 调度** | ~1% | multi_thread::worker::Context::run |
+### fio-randwrite (randwrite, bs=4m, jobs=4)
 
-### 2.2 核心发现：系统完全受限于 S3 网络 I/O
+  - **Write P99 > 500ms** (659ms): Consider increasing write buffer capacity or S3 upload concurrency.
 
-| 层级 | Self% | 含义 |
-|------|-------|------|
-| `libc 0x198c89` (recv) | **54.3%** | S3 响应接收 |
-| `libc 0x19943a` (send) | **13.8%** | S3 请求发送 |
-| `libc 0x198c2d` (poll/recv) | **10.3%** | 网络事件等待 |
+### fio-seqread (read, bs=4m, jobs=1)
 
-> 合计 78.4% 的 CPU 时间花在 libc 网络系统调用上。用户态计算开销（缓存、调度、内存分配）不到 5%。
+  - **Read outliers**: p99.9/p99 = 3.1x. Possible GC pause, TCP retransmit, or lock contention.
 
----
+### fio-seqwrite (write, bs=4m, jobs=1)
 
-## 3. io_uring FUSE 连接分析
+  - **Write stall pattern**: p50=3.5ms, p99=308ms. Most writes are buffered (fast), but auto_flush/freeze triggers S3 upload that blocks subsequent writes (write buffer hard limit).
 
-### 3.1 架构
 
-```
-用户进程 write()/read() → 内核 VFS → FUSE 模块
-  → /dev/fuse fd
-    → io_uring readv (ring thread) → FUSE request dispatch
-    → io_uring writev (reply ring threads) → FUSE reply
+## Optimization Roadmap
 
-每个 FuseConnection 拥有独立 ring thread + 64-entry io_uring ring
-Reply task 使用 try_clone() 获取独立 fd + ring (避免死锁)
-```
+### 1. Write Buffer Management
 
-### 3.2 io_uring 效果
+Write P99=659ms in fio-randwrite. Consider: increase write_buffer_hard_limit, use adaptive auto_flush based on upload throughput feedback, or implement S3 upload pipelining to avoid blocking writes during uploads.
 
-| 指标 | 旧 (tokio read/write) | 新 (io_uring) | 改善 |
-|------|----------------------|---------------|------|
-| 4K 随机写 IOPS | 308 | **1799** | **+484%** |
-| 4K 随机写延迟 | 12.6ms | **2.22ms** | **-82%** |
-| 4K 随机读 IOPS | 354 | **462** | +30% |
-| FUSE 通道 CPU | ~3% worker | **~3%** ring thread | 持平 |
+### 2. Random Read Prefetch
 
-> 4K 写延迟从 12.6ms 降至 2.22ms，主要因为 io_uring 避免了每次 FUSE 操作的 read()/write() 系统调用上下文切换。
+Random read p50=127ms in fio-randread. Each 4MB block requires a full S3 GET. Consider: smaller block size for random workloads, read-ahead pattern detection, or tiered block cache with SSD backing.
 
----
+### 3. Parallel Read Scaling
 
-## 4. 写管线分析
+Only 27 MiB/s/job in fio-randread (4 jobs). May be limited by: connection pool size, prefetch contention, or per-inode lock granularity. Consider per-chunk parallelism.
 
-```
-fio write → FUSE_WRITE → VFS::write_ino / write_cached_ino
-  → FileWriter::write_at (切片拆分)
-    → auto_flush (冻结切片, 4MiB 阈值)
-      → spawn_flush_slice (上传到 S3)
-        → DataUploader::write_at_vectored
-          → ObjectBlockStore::write_fresh_vectored
-            → ObjectClient::put_object_vectored
-              → S3Backend (HTTP PUT, payload checksum 已禁用)
-                → TCP send (io_uring writev 通道)
-  → FUSE FLUSH → VFS::flush → flush_required (等待所有 slice committed)
-  → commit_chunk (元数据提交)
-    → MetaClient (Redis RPUSH)
-```
 
-### 4.1 flush 语义修正
+## Comparison (Baseline → Current)
 
-**修复前**：FUSE `flush` handler 是空操作，`close()` 路径仅有 5s deadline → 大文件 flush timeout  
-**修复后**：FUSE `flush` 调用 VFS::flush (300s deadline)，确保 close() 语义正确
+| Workload | Metric | Baseline | Current | Delta |
+| --- | --- | ---: | ---: | ---: |
+| fio-randread | Read BW | 107.1 MiB/s | 109.5 MiB/s | +2.2% |
+| fio-randread | Read P99 | 505.41 ms | 513.80 ms | +1.7% |
+| fio-randrw | Read BW | 82.1 MiB/s | 74.0 MiB/s | -9.9% |
+| fio-randrw | Write BW | 37.2 MiB/s | 33.4 MiB/s | -10.4% |
+| fio-randrw | Read P99 | 750.78 ms | 767.56 ms | +2.2% |
+| fio-randrw | Write P99 | 89.65 ms | 63.70 ms | -28.9% |
+| fio-randwrite | Write BW | 229.9 MiB/s | 146.0 MiB/s | -36.5% |
+| fio-randwrite | Write P99 | 530.58 ms | 658.51 ms | +24.1% |
+| fio-seqread | Read BW | 204.7 MiB/s | 217.4 MiB/s | +6.2% |
+| fio-seqread | Read P99 | 58.98 ms | 33.42 ms | -43.3% |
+| fio-seqwrite | Write BW | 219.2 MiB/s | 160.3 MiB/s | -26.9% |
+| fio-seqwrite | Write P99 | 223.35 ms | 308.28 ms | +38.0% |
 
-影响：顺序写基准从 146→92.7 MiB/s（因为现在包含 S3 持久化等待），但消除了 flush timeout 错误。
+## Current Run Details
 
----
+- **fio-randread** (randread, bs=4m, 4j):, Read 109.5 MiB/s
+- **fio-randrw** (randrw, bs=4m, 4j):, Read 74.0 MiB/s, Write 33.4 MiB/s
+- **fio-randwrite** (randwrite, bs=4m, 4j):, Write 146.0 MiB/s
+- **fio-seqread** (read, bs=4m, 1j):, Read 217.4 MiB/s
+- **fio-seqwrite** (write, bs=4m, 1j):, Write 160.3 MiB/s
 
-## 5. 性能优化建议
 
-### 5.1 已完成优化 ✅
+## Next-Step Optimization Plan
 
-| 优化项 | 效果 | 状态 |
-|--------|------|------|
-| 禁用 S3 payload checksum | 消除 ~20% CPU (SHA-256/MD5/CRC) | ✅ `disable_payload_checksum: true` |
-| 增大 chunk_size 到 256MiB | 降低 commit 频率 | ✅ 配置 |
-| 增加 fuse_workers=8 | 提升并发处理能力 | ✅ 配置 |
-| 增加 max_background=512 | 允许更多并发 FUSE 后台请求 | ✅ 配置 |
-| 移除 FUSE read 的 stat_ino 检查 | 减少每次读的元数据查询 | ✅ 代码优化 |
-| **并发块读取 (DataFetcher)** | 随机读 58→156 MiB/s (+169%) | ✅ FuturesUnordered |
-| **S3 上传并发 4→16** | 随机写 117→129 MiB/s (+10%) | ✅ max_concurrency=16 |
-| **io_uring FUSE 通道** | 4K 写 IOPS 308→1799 (+484%) | ✅ ring thread 架构 |
-| **FUSE flush 语义修正** | 消除 flush timeout 错误 | ✅ flush 持久化数据 |
+Based on the profiling data, these are the prioritized optimizations:
 
-### 5.2 下一步优化方向
+### Priority 1: Write Buffer Back-Pressure (P99 reduction)
 
-| 优化项 | 预期收益 | 实现难度 | 说明 |
-|--------|----------|----------|------|
-| **S3 GET 请求合并** | 大文件读 +30% | 中 | 合并相邻 block 的 GET Range 请求，减少 HTTP 往返 |
-| **S3 连接池预热** | P99 延迟 -50% | 低 | 预建立 HTTP/2 连接，避免首次请求的 TCP+TLS 握手 |
-| **写管线流水线** | 顺序写 +40% | 高 | 上传与写入重叠：在上传 slice N 的同时填充 slice N+1 |
-| **本地 SSD 缓存层** | 重复读 +10x | 中 | 使用 SSD 做 L2 cache，S3 只在 cache miss 时访问 |
-| **io_uring 批量提交** | 系统调用 -30% | 中 | 批量提交多个 writev（reply），减少 submit_and_wait 调用 |
-| **预取窗口自适应** | 顺序读延迟 -20% | 中 | 根据访问模式动态调整预取块数 |
-| **Zero-copy read** | memcpy 开销 -5% | 高 | splice/registered buffers 直接传递 S3 数据到 FUSE |
+**Problem**: Sequential write P99=308ms, random write P99=659ms caused by write buffer hard
+limit blocking FUSE writes while waiting for S3 uploads.
 
-### 5.3 性能瓶颈优先级
+**Approach**:
+- Implement adaptive auto_flush: when upload throughput drops, increase slice size to reduce
+  PUT overhead; when upload is fast, keep current 500ms age limit.
+- Increase write_buffer_hard_limit or make it configurable per-workload.
+- Pipeline S3 uploads: start next slice upload before previous completes (overlap compression/
+  serialization with network).
 
-```
-1. S3 网络延迟 (78.4% CPU 时间) ←← 主要瓶颈
-   → 解法：连接复用、请求合并、本地缓存
-   
-2. FUSE flush 等待 (P99=566ms)
-   → 解法：写管线流水线化、异步上传 overlap
-   
-3. 小 IO FUSE 开销 (2.22ms per 4K op)
-   → 解法：io_uring 已优化，进一步需 kernel FUSE passthrough
-   
-4. 内存分配/缓存 (<5%)
-   → 暂不需要优化
-```
+### Priority 2: Random Read Latency (p50=127ms)
 
----
+**Problem**: Each 4MB random read requires a full S3 GET (127ms RTT). No benefit from
+sequential prefetch for random access patterns.
 
-## 6. 与历史数据对比
+**Approach**:
+- Implement SSD-backed block cache tier (already partially implemented in ChunksCache disk layer).
+- Add random access detection in prefetcher — disable sequential read-ahead for random
+  patterns, reducing wasted bandwidth.
+- Consider smaller block size option (512KB-1MB) for random-read-heavy workloads to reduce
+  amplification.
 
-| 指标 | v0 (chunk=64M, tokio) | v1 (chunk=256M, 并发块读) | v2 (io_uring + flush fix) | 说明 |
-|------|----------------------|---------------------------|---------------------------|------|
-| 顺序写 4M | 99 MiB/s | 146 MiB/s | **92.7 MiB/s** | v2 含真实持久化 |
-| 顺序读 4M (冷) | — | 147 MiB/s | **164 MiB/s** | 读路径改善 |
-| 随机写 4j 4M | 109 MiB/s | 129 MiB/s | **113 MiB/s** | 含 flush |
-| 随机读 4j 4M | 58 MiB/s | 156 MiB/s | **94 MiB/s** | 测试条件不同 |
-| 4K 随机写 IOPS | — | 308 | **1799** | **+484%** io_uring |
-| 4K 随机写延迟 | — | 12.6ms | **2.22ms** | **-82%** |
-| 4K 随机读 IOPS | — | 354 | **462** | +30% |
+### Priority 3: Multi-Job Read Scaling (27 MiB/s/job)
 
-**注意**：
-- v2 的顺序写/随机写看似"降低"，实际是因为修复了 FUSE flush 语义——数据在 close() 时必须落盘到 S3
-- v1 的高写吞吐是假象：flush 是空操作，数据可能丢失
-- 4K IOPS 大幅提升 (+484%) 来自 io_uring 消除 FUSE read/write 系统调用开销
+**Problem**: 4 parallel readers only achieve 27 MiB/s each (109 MiB/s total vs 217 MiB/s
+single-job). Contention in S3 connection pool or prefetch scheduling.
 
----
+**Approach**:
+- Increase S3 connection pool size (currently limited by hyper/reqwest defaults).
+- Per-inode prefetch isolation — ensure one inode's prefetch doesn't starve another.
+- Measure if TCP connection reuse is working correctly (HTTP/1.1 keep-alive vs HTTP/2).
 
-## 7. 产物清单
+### Priority 4: Metadata Create Latency (5.7ms/op)
 
-| 文件 | 路径 |
-|------|------|
-| 性能分析脚本 | `tools/perf/run_perf.sh` |
-| 火焰图分析脚本 | `tools/perf/analyze_flame.py` |
-| Docker 基础设施 | `tools/perf/docker-compose.yml` |
+**Problem**: File creation takes 5.7ms — acceptable but could be improved for workloads
+with many small files.
 
----
-
-## 8. 复现命令
-
-```bash
-# 完整运行 (编译 + 60s 每项基准测试 + 火焰图)
-cd tools/perf && ./run_perf.sh
-
-# 快速运行 (15s 每项)
-./run_perf.sh --quick
-
-# 跳过编译 + 保留环境
-./run_perf.sh --no-build --no-cleanup
-
-# 仅 on-CPU 分析 (跳过耗时的 off-CPU sched_switch 采集)
-./run_perf.sh --quick --skip-offcpu
-```
-
-### 手动 perf 分析 (推荐)
-
-```bash
-# 找到 slayerfs PID
-PID=$(pgrep -f "slayerfs mount")
-
-# frame-pointer 模式录制 (兼容性最好)
-perf record -F 99 --call-graph fp -p $PID -o perf.data -- sleep 20
-
-# 处理为火焰图
-perf script -i perf.data | inferno-collapse-perf > stacks.folded
-grep slayerfs stacks.folded > slayerfs.folded
-inferno-flamegraph slayerfs.folded > flame.svg
-```
+**Approach**:
+- Batch metadata writes where possible (directory entries + inode in single Redis pipeline).
+- Add metadata write-behind: return success immediately, commit asynchronously.
