@@ -150,7 +150,7 @@ mod tests {
     async fn test_compaction_worker_config_default() {
         let config = CompactionWorkerConfig::default();
 
-        assert_eq!(config.scan_interval, Duration::from_secs(3600));
+        assert_eq!(config.scan_interval, Duration::from_secs(600));
         assert_eq!(config.max_chunks_per_run, 100);
         assert!(config.enabled);
     }
