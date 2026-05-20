@@ -89,8 +89,12 @@ impl Default for WriteConfig {
             freeze_min_bytes: 8 * 1024 * 1024,
             #[cfg(test)]
             freeze_min_bytes: 4096,
+            // Start upload quickly so flush() finds most slices already committed.
+            // At 200ms, sequential writes at ~100 MiB/s accumulate ~20MB before
+            // freeze, which is only ~5 block uploads. With 16 concurrent uploads
+            // this completes in well under 1s for most slices.
             #[cfg(not(test))]
-            auto_flush_max_age: Duration::from_millis(500),
+            auto_flush_max_age: Duration::from_millis(200),
             #[cfg(test)]
             auto_flush_max_age: Duration::from_millis(5),
             writeback_mode,

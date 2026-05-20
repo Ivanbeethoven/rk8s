@@ -275,10 +275,16 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
         }
         parts.extend(chunks);
 
+        // Assemble full block for write-through cache population.
+        let full_block: Vec<u8> = parts.iter().flat_map(|b| b.iter().copied()).collect();
+
         self.client
             .put_object_vectored(&key_str, parts)
             .await
             .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
+
+        // Write-through: populate read cache so subsequent reads avoid S3 round-trip.
+        let _ = self.block_cache.insert(&key_str, &full_block).await;
 
         Ok(total_len as u64)
     }
@@ -301,10 +307,16 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
         }
         parts.push(Bytes::copy_from_slice(data));
 
+        // Assemble full block for write-through cache.
+        let full_block: Vec<u8> = parts.iter().flat_map(|b| b.iter().copied()).collect();
+
         self.client
             .put_object_vectored(&key_str, parts)
             .await
             .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
+
+        // Write-through: populate read cache.
+        let _ = self.block_cache.insert(&key_str, &full_block).await;
 
         Ok(data.len() as u64)
     }

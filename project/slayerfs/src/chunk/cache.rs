@@ -1233,15 +1233,15 @@ impl ChunksCache {
         let hot_bytes_evict = hot_bytes.clone();
         let hot_cache_builder = moka::future::Cache::builder()
             .max_capacity(config.hot_cache_size as u64)
-            .time_to_idle(Duration::from_secs(30))
-            .time_to_live(Duration::from_secs(120))
+            .time_to_idle(Duration::from_secs(300))
+            .time_to_live(Duration::from_secs(3600))
             .eviction_listener(move |_key, value: Vec<u8>, _cause| {
                 hot_bytes_evict.fetch_sub(value.len() as u64, Ordering::Relaxed);
             });
         let cold_cache_builder = moka::future::Cache::builder()
             .max_capacity(config.cold_cache_size as u64)
-            .time_to_idle(Duration::from_secs(30))
-            .time_to_live(Duration::from_secs(120));
+            .time_to_idle(Duration::from_secs(300))
+            .time_to_live(Duration::from_secs(3600));
 
         debug!(
             "Creating policy with adaptive threshold: {}",
