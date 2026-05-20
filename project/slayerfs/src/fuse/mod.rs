@@ -417,10 +417,6 @@ where
         size: u32,
     ) -> FuseResult<ReplyData> {
         debug!(ino, fh, offset, size, "fuse.read");
-        // Verify inode exists
-        if self.stat_ino(ino as i64).await.is_none() {
-            return Err(libc::ENOENT.into());
-        };
 
         let data = if fh != 0 {
             match self.read(fh, offset, size as usize).await {

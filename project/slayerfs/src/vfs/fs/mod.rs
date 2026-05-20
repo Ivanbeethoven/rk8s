@@ -1859,7 +1859,11 @@ where
         }
 
         let handle = self.file_handle_required(fh)?;
-        if !handle.flags.read {
+        // With writeback cache enabled, the kernel may issue reads on O_WRONLY
+        // handles to fill partial pages before writing them back.  The handle
+        // always has a reader attached (opened for all write handles), so we
+        // only reject reads when neither read nor write flags are set.
+        if !handle.flags.read && !handle.flags.write {
             return Err(VfsError::PermissionDenied {
                 path: PathHint::none(),
             });
