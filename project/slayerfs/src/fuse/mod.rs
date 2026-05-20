@@ -1358,10 +1358,13 @@ where
         Ok(())
     }
 
-    // Flush file (close path callback)
+    // Flush file data to backend (called on every close of a file descriptor).
+    // Must actually persist dirty data so that close() semantics are honored.
     async fn flush(&self, _req: Request, inode: u64, fh: u64, lock_owner: u64) -> FuseResult<()> {
-        debug!(fh, "fuse.flush");
+        debug!(fh, inode, "fuse.flush");
         self.unlock_owner_locks(inode, lock_owner).await;
+        // VFS::flush persists pending writes (full 300s deadline).
+        self.flush(fh).await.map_err(Errno::from)?;
         Ok(())
     }
 
