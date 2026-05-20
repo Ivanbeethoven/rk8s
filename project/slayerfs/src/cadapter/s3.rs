@@ -49,8 +49,8 @@ impl Default for S3Config {
         Self {
             bucket: String::new(),
             region: None,
-            part_size: 8 * 1024 * 1024, // 8MB
-            max_concurrency: 4,
+            part_size: 16 * 1024 * 1024, // 16MB — larger parts reduce HTTP overhead
+            max_concurrency: 16, // Match global upload concurrency for better pipe utilization
             max_retries: 1,
             retry_base_delay: 100,
             enable_md5: false,

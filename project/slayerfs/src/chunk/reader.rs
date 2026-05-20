@@ -13,6 +13,25 @@ use futures_util::stream::FuturesUnordered;
 use std::cmp::{max, min};
 use tracing::Instrument;
 
+/// A Send-able wrapper around a mutable buffer pointer.
+///
+/// SAFETY: The caller must guarantee that:
+/// 1. The pointed-to memory is valid for the lifetime of any future using this.
+/// 2. No two futures share overlapping regions (exclusive access).
+struct SendBuf {
+    ptr: *mut u8,
+    len: usize,
+}
+
+unsafe impl Send for SendBuf {}
+
+impl SendBuf {
+    /// SAFETY: caller must ensure exclusive access and valid lifetime.
+    unsafe fn as_mut_slice(&self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
 pub(crate) struct DataFetcher<'a, B, M> {
     layout: ChunkLayout,
     id: u64,
@@ -110,40 +129,49 @@ where
                 tail = rest;
                 cursor = start + len;
 
-                // The blocks to fetch must be computed relative to the slice itself;
-                // otherwise we may read the wrong block/range for this slice and populate
-                // the wrong region of the output buffer.
+                // The blocks to fetch must be computed relative to the slice itself.
                 let slice_offset = SliceOffset::from(l - slice.offset);
                 let slice_len = r - l;
                 let slice_id = slice.slice_id;
 
-                let span = tracing::trace_span!(
-                    "fetch.read_slice",
-                    slice_id,
-                    offset = slice_offset.0,
-                    len = slice_len,
-                    blocks = tracing::field::Empty
-                );
+                // Flatten block reads into the FuturesUnordered for maximum
+                // concurrency — blocks within the same slice are now fetched
+                // in parallel rather than sequentially.
+                let mut pos = 0_usize;
+                for block in block_span_iter_slice(slice_offset, slice_len, layout) {
+                    let take = block.len.as_usize();
+                    let block_buf = &mut seg[pos..pos + take];
+                    pos += take;
 
-                futures.push(
-                    async move {
-                        let mut pos = 0_usize;
-                        let mut blocks = 0usize;
-                        for block in block_span_iter_slice(slice_offset, slice_len, layout) {
-                            blocks += 1;
-                            let take = block.len.as_usize();
-                            let out = &mut seg[pos..pos + take];
+                    let block_key = (slice_id, block.index.as_u32());
+                    let block_offset = block.offset;
+                    let span = tracing::trace_span!(
+                        "fetch.read_block",
+                        slice_id,
+                        block_idx = block.index.as_u32(),
+                    );
+
+                    // SAFETY: each block_buf is a non-overlapping sub-slice of
+                    // `seg` (which itself is a non-overlapping sub-slice of `buf`).
+                    // Only one future writes to each region.
+                    let send_buf = SendBuf {
+                        ptr: block_buf.as_mut_ptr(),
+                        len: block_buf.len(),
+                    };
+
+                    futures.push(
+                        async move {
+                            // SAFETY: exclusive access guaranteed by non-overlapping split
+                            let out = unsafe { send_buf.as_mut_slice() };
                             backend
                                 .store()
-                                .read_range((slice_id, block.index.as_u32()), block.offset, out)
+                                .read_range(block_key, block_offset, out)
                                 .await?;
-                            pos += take;
+                            Ok::<_, anyhow::Error>(())
                         }
-                        tracing::Span::current().record("blocks", blocks);
-                        Ok::<_, anyhow::Error>(())
-                    }
-                    .instrument(span),
-                );
+                        .instrument(span),
+                    );
+                }
             }
 
             while let Some(res) = futures.next().await {
