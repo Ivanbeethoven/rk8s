@@ -5,6 +5,7 @@
 //! inode or do the path<->inode map on yourself, use [`Filesystem`][crate::raw::Filesystem].
 
 pub use path_filesystem::PathFilesystem;
+#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime", feature = "io-uring-runtime"))]
 pub use session::Session;
 
 pub use crate::raw::Request;
@@ -20,6 +21,7 @@ pub mod prelude {
     pub use super::reply::*;
     pub use super::PathFilesystem;
     pub use super::Request;
+    #[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime", feature = "io-uring-runtime"))]
     pub use super::Session;
     pub use crate::notify::Notify;
     pub use crate::FileType;

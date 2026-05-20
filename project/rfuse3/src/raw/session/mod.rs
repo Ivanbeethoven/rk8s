@@ -68,13 +68,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(all(
     target_os = "linux",
     not(feature = "async-io-runtime"),
-    feature = "tokio-runtime",
+    any(feature = "tokio-runtime", feature = "io-uring-runtime"),
     feature = "unprivileged"
 ))]
 use tokio::process::Command;
-#[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+#[cfg(any(
+    all(not(feature = "async-io-runtime"), feature = "tokio-runtime"),
+    feature = "io-uring-runtime"
+))]
 use tokio::task::JoinHandle;
-#[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+#[cfg(any(
+    all(not(feature = "async-io-runtime"), feature = "tokio-runtime"),
+    feature = "io-uring-runtime"
+))]
 use tokio::{fs::read_dir, task};
 use tracing::{debug, debug_span, error, instrument, warn};
 
@@ -84,7 +90,7 @@ use crate::helper::*;
 use crate::notify::Notify;
 use crate::raw::abi::*;
 use crate::raw::buffer_pool::AlignedBuffer;
-#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
+#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime", feature = "io-uring-runtime"))]
 use crate::raw::connection::FuseConnection;
 use crate::raw::filesystem::Filesystem;
 use crate::raw::reply::ReplyXAttr;
@@ -167,12 +173,15 @@ impl Drop for MountHandle {
                 return;
             }
 
-            #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+            #[cfg(all(not(feature = "tokio-runtime"), not(feature = "io-uring-runtime"), feature = "async-io-runtime"))]
             {
                 task::spawn(inner.inner_unmount()).detach();
             }
 
-            #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+            #[cfg(any(
+                all(not(feature = "async-io-runtime"), feature = "tokio-runtime"),
+                feature = "io-uring-runtime"
+            ))]
             {
                 task::spawn(inner.inner_unmount());
             }
@@ -297,12 +306,12 @@ impl MountHandleInner {
 impl Future for MountHandle {
     type Output = IoResult<()>;
 
-    #[cfg(feature = "async-io-runtime")]
+    #[cfg(all(not(feature = "tokio-runtime"), not(feature = "io-uring-runtime"), feature = "async-io-runtime"))]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.inner.as_mut().expect("inner should be Some()").task).poll(cx)
     }
 
-    #[cfg(feature = "tokio-runtime")]
+    #[cfg(any(feature = "tokio-runtime", feature = "io-uring-runtime"))]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // The unwrap is necessary in order to provide the same API for both runtimes, and actually
         // unwrap should not panic, when MountHandle is canceled by unmount method, user has no
@@ -312,7 +321,7 @@ impl Future for MountHandle {
             .map(Result::unwrap)
     }
 }
-#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
+#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime", feature = "io-uring-runtime"))]
 /// FUSE filesystem session with inode-based operations.
 ///
 /// # Concurrency Model
@@ -362,7 +371,7 @@ pub struct Session<FS: Filesystem + Send + Sync + 'static> {
     inflight_notify: Arc<async_notify::Notify>,
 }
 
-#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
+#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime", feature = "io-uring-runtime"))]
 impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     /// new a fuse filesystem session.
     pub fn new(mount_options: MountOptions) -> Self {
@@ -444,7 +453,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     }
 }
 
-#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
+#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime", feature = "io-uring-runtime"))]
 impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     async fn mount_empty_check(&self, mount_path: &Path) -> IoResult<()> {
         use std::io::ErrorKind;
@@ -691,11 +700,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         // potentially losing replies for in-flight FUSE requests and causing the
         // kernel to hang in wait_sb_inodes.
         for (i, rx) in rx_vec.into_iter().enumerate() {
-            let conn = if i == 0 {
-                fuse_write_connection.clone()
-            } else {
-                Arc::new(fuse_write_connection.try_clone()?)
-            };
+            // Each reply task gets its own cloned connection to avoid deadlock:
+            // with io_uring, sharing the dispatch connection's ring thread between
+            // reads and writes causes the ring to block in submit_and_wait while
+            // write requests queue up unsent.
+            let conn = Arc::new(fuse_write_connection.try_clone()?);
 
             task::spawn(async move {
                 if let Err(e) = Self::reply_fuse(conn, rx).await {

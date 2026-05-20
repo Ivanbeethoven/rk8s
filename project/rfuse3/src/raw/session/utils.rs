@@ -12,7 +12,10 @@ use tracing::Span;
 
 #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
 use async_global_executor as task;
-#[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+#[cfg(any(
+    all(not(feature = "async-io-runtime"), feature = "tokio-runtime"),
+    feature = "io-uring-runtime"
+))]
 use tokio::task;
 use tracing::Instrument;
 
@@ -84,10 +87,13 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    #[cfg(any(
+        all(not(feature = "async-io-runtime"), feature = "tokio-runtime"),
+        feature = "io-uring-runtime"
+    ))]
     task::spawn(fut.instrument(span));
 
-    #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+    #[cfg(all(not(feature = "tokio-runtime"), not(feature = "io-uring-runtime"), feature = "async-io-runtime"))]
     task::spawn(fut.instrument(span)).detach()
 }
 

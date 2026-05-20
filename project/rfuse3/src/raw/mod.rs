@@ -11,7 +11,7 @@ pub use filesystem::Filesystem;
 use futures_util::future::Either;
 pub use object_safe_filesystem::{DirectoryPlusStream, DirectoryStream, ObjectSafeFilesystem};
 pub use request::Request;
-#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
+#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime", feature = "io-uring-runtime"))]
 pub use session::{MountHandle, Session};
 
 pub(crate) type FuseData = Either<Vec<u8>, (Vec<u8>, Bytes)>;

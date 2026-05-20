@@ -8,11 +8,17 @@ use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_util::stream::StreamExt;
 use tracing::debug;
 
-#[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+#[cfg(all(not(feature = "tokio-runtime"), not(feature = "io-uring-runtime"), feature = "async-io-runtime"))]
 use async_global_executor::{self as task, Task as JoinHandle};
-#[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+#[cfg(any(
+    all(not(feature = "async-io-runtime"), feature = "tokio-runtime"),
+    feature = "io-uring-runtime"
+))]
 use tokio::task;
-#[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+#[cfg(any(
+    all(not(feature = "async-io-runtime"), feature = "tokio-runtime"),
+    feature = "io-uring-runtime"
+))]
 use tokio::task::JoinHandle;
 
 use crate::raw::abi::fuse_opcode;
@@ -97,7 +103,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Workers<FS> {
         for idx in 0..worker_count {
             let (tx, mut rx): (UnboundedSender<WorkItem>, UnboundedReceiver<WorkItem>) = unbounded();
             let ctx_clone = _ctx.clone();
-            #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+            #[cfg(all(not(feature = "tokio-runtime"), not(feature = "io-uring-runtime"), feature = "async-io-runtime"))]
             let handle = task::spawn(async move {
                 while let Some(item) = rx.next().await {
                     let ctx = ctx_clone.clone();
@@ -108,7 +114,10 @@ impl<FS: Filesystem + Send + Sync + 'static> Workers<FS> {
                 }
                 debug!(worker=%idx, "worker exit");
             });
-            #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+            #[cfg(any(
+                all(not(feature = "async-io-runtime"), feature = "tokio-runtime"),
+                feature = "io-uring-runtime"
+            ))]
             let handle = task::spawn(async move {
                 while let Some(item) = rx.next().await {
                     let ctx = ctx_clone.clone();

@@ -15,6 +15,7 @@ repository = "https://github.com/r2cn-dev/rk8s/tree/main/project/rfuse3"
 [features]
 default = ["tokio-runtime", "unprivileged"]
 tokio-runtime = ["dep:tokio"]
+io-uring-runtime = ["dep:io-uring", "tokio-runtime"]
 async-io-runtime = [
   "dep:async-fs",
   "dep:async-global-executor",
@@ -48,6 +49,7 @@ trait-make = { workspace = true }
 async-trait = { workspace = true }
 which = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["full"], optional = true }
+io-uring = { workspace = true, optional = true }
 aligned_box = { workspace = true }
 
 [dev-dependencies]
