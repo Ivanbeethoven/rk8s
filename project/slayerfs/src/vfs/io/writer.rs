@@ -160,6 +160,9 @@ pub(crate) struct SliceState {
     /// Inode data_epoch captured when this slice is frozen.
     /// If the inode epoch advances (truncate/setattr), stale commits are skipped.
     frozen_epoch: u64,
+    /// Set to `true` when a meta.write() has been initiated (or completed)
+    /// to prevent both try_commit and commit_chunk from writing the same slice.
+    meta_write_started: bool,
 }
 
 impl SliceState {
@@ -184,6 +187,7 @@ impl SliceState {
             started: now,
             last_mod: now,
             frozen_epoch: 0,
+            meta_write_started: false,
         }
     }
 
@@ -492,9 +496,43 @@ where
     /// Attempt to commit a fully-uploaded slice immediately.
     /// Called from the upload task when all blocks have been transferred,
     /// so that flush() callers do not wait on the commit_chunk poll loop.
+    ///
+    /// To preserve metadata ordering (later slices must appear after earlier
+    /// ones), we only commit if this slice is at the front of the chunk's
+    /// deque — i.e. all preceding slices have already been popped.
     async fn try_commit(&self) {
         if !self.runtime_snapshot().can_commit() {
             return;
+        }
+
+        // Claim the right to write metadata for this slice.  Both try_commit
+        // (from upload task) and commit_chunk (from commit loop) race here;
+        // the first to set `meta_write_started` wins and the other skips.
+        let chunk_id = {
+            let mut s = self.slice.lock();
+            if s.meta_write_started {
+                return;
+            }
+            s.meta_write_started = true;
+            s.chunk_id
+        };
+
+        // Only commit if we are the front slice.  Out-of-order metadata
+        // appends would let an older slice win over a newer one in the
+        // "last writer wins" resolution used by readers.
+        {
+            let guard = self.shared.inner.lock().await;
+            let is_front = guard
+                .chunks
+                .get(&chunk_id)
+                .and_then(|c| c.slices.front())
+                .is_some_and(|front| Arc::ptr_eq(front, self.slice));
+            if !is_front {
+                // Revert the flag so commit_chunk can handle it when it
+                // becomes the front slice.
+                self.slice.lock().meta_write_started = false;
+                return;
+            }
         }
 
         let desc = match self.desc_for_commit() {
@@ -561,6 +599,8 @@ where
                             error = ?err,
                             "try_commit exhausted retries, deferring to commit_chunk"
                         );
+                        // Reset so commit_chunk can pick this up.
+                        self.slice.lock().meta_write_started = false;
                     } else {
                         self.mark_failed(anyhow::anyhow!(
                             "try_commit failed for ino {ino}, chunk {}, slice {}: {err}",
@@ -1651,6 +1691,26 @@ where
                     .mark_committed();
                     should_pop = true;
                 } else {
+                    // Claim the right to write metadata.  try_commit (from
+                    // the upload task) may have already claimed it.
+                    let claimed = {
+                        let mut s = slice.lock();
+                        if s.meta_write_started {
+                            false
+                        } else {
+                            s.meta_write_started = true;
+                            true
+                        }
+                    };
+
+                    if !claimed {
+                        // try_commit is handling this slice; wait for it to
+                        // mark Committed so we can pop it on the next pass.
+                        let notify = slice.lock().notify.clone();
+                        let _ = timeout(COMMIT_WAIT_SLICE, notify.notified()).await;
+                        continue;
+                    }
+
                     let desc = SliceHandle {
                         slice: &slice,
                         shared: &shared,

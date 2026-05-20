@@ -25,7 +25,7 @@ use bytes::Bytes;
 use rfuse3::Errno;
 use rfuse3::Result as FuseResult;
 use rfuse3::raw::Request;
-use rfuse3::raw::flags::FUSE_WRITE_CACHE;
+use rfuse3::raw::flags::{FOPEN_KEEP_CACHE, FUSE_WRITE_CACHE};
 use rfuse3::raw::reply::{
     DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyCopyFileRange, ReplyCreated, ReplyData,
     ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyIoctl, ReplyLSeek, ReplyLock,
@@ -377,9 +377,15 @@ where
             .map_err(Into::<Errno>::into)?;
 
         // ReplyOpen.flags carries FUSE FOPEN_* bits, not the caller's O_* flags.
-        // Passing O_RDWR/O_WRONLY through here accidentally enables KEEP_CACHE or
-        // DIRECT_IO and can break buffered mmap/truncate visibility semantics.
-        Ok(ReplyOpen { fh, flags: 0 })
+        // With writeback cache enabled, set FOPEN_KEEP_CACHE so that the kernel
+        // does not invalidate clean page-cache pages on every open().  Without it
+        // any concurrent open (even from an unrelated process) evicts clean pages
+        // that may have been written back, forcing FUSE_READ on the next access
+        // and exposing a window where overlay_dirty may miss in-flight data.
+        Ok(ReplyOpen {
+            fh,
+            flags: FOPEN_KEEP_CACHE,
+        })
     }
 
     // Open directory: create handle for caching
@@ -1089,7 +1095,7 @@ where
             attr,
             generation: 0,
             fh,
-            flags: 0,
+            flags: FOPEN_KEEP_CACHE,
         })
     }
 
