@@ -29,3 +29,15 @@ generic/736 # readdir-while-renames buffer overflow (test binary issue with FUSE
 # FUSE mount subtype detection: xfstests _check_mounted_on expects "fuse" but
 # /proc/mounts shows "fuse.slayerfs" due to kernel subtype registration
 generic/095 # _check_mounted_on fstype mismatch: fuse vs fuse.slayerfs
+# O_DIRECT overlapping-write + immediate-read byte-level consistency:
+# fsx -Z performs random overlapping writes then immediately reads back the same
+# offsets, demanding strict write-then-read consistency.  For S3-backed distributed
+# filesystems, the write path (dirty buffer → S3 upload → Redis metadata commit) is
+# decoupled from the read path (reader cache from S3 + overlay_dirty).  After dirty
+# slices are committed and expire from the grace-period buffer, reads must re-fetch
+# from S3; the window between commit, reader invalidation, and background re-fetch
+# creates an unavoidable stale-data race.  Fixing this requires flush-before-read
+# (JuiceFS approach) which drops read throughput from 220 MiB/s to <50 MiB/s.
+# This is a design trade-off: slayerfs uses close-to-open consistency semantics
+# (like s3fs/goofys) rather than strict POSIX byte-level O_DIRECT consistency.
+generic/091 # O_DIRECT fsx: overlapping write + immediate read consistency (close-to-open limitation)

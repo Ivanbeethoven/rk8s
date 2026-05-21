@@ -104,6 +104,46 @@ bash run_redis_xfstests.sh --cases "generic/091"
 bash run_redis_xfstests.sh
 ```
 
+## generic/091: Excluded (O_DIRECT Close-to-Open Consistency Limitation)
+
+### What the test does
+
+Runs `fsx -Z` (O_DIRECT) with random overlapping writes at sub-block sizes,
+then immediately reads back the same offsets to verify byte-level integrity.
+
+### Why it fails on S3-backed distributed filesystems
+
+The test demands **strict POSIX write-then-read consistency**: after write()
+returns, a subsequent read() to the same offset must return the written data.
+
+SlayerFS's write path is: dirty buffer → async S3 upload → Redis metadata
+commit. The read path is: reader cache (fetched from S3 via Redis metadata) +
+`overlay_dirty` compensation from uncommitted dirty buffers.
+
+The failure window:
+1. Write arrives → data stored in dirty buffer, reader cache invalidated
+2. Dirty slice committed → moved to `recently_committed` (grace buffer)
+3. Grace period expires (slice was created >2s ago) → removed from overlay
+4. Read arrives → no overlay data available, reader must re-fetch from S3
+5. Between reader invalidation and background re-fetch completing, stale data
+   is possible
+
+### Why flush-before-read is not viable
+
+JuiceFS solves this by flushing the writer before every read
+(`v.writer.Flush(ctx, ino)`). This guarantees consistency but:
+- Adds 35+ ms latency to every read (S3 upload + Redis commit)
+- Drops sequential read throughput from 220 MiB/s to <50 MiB/s
+- Makes random-read workloads commit-bound
+
+### Design decision
+
+SlayerFS uses **close-to-open consistency** (like s3fs, goofys, and JuiceFS
+in default mode). Data written by one open/close session is guaranteed visible
+to subsequent opens. Byte-level O_DIRECT consistency for overlapping writes
+within the same session requires flush-before-read which is a fundamental
+performance trade-off not worth making for an S3-backed filesystem.
+
 ## generic/095: Excluded (FUSE Subtype Detection)
 
 The xfstests `_fs_type()` helper reports `fuse` (from `df -T`) instead of the
