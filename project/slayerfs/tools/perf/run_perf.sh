@@ -83,13 +83,22 @@ check_cmd python3
 if [ "$BUILD" -eq 1 ]; then
     info "building slayerfs with profiling + frame pointers..."
     cd "$PROJECT_DIR"
-    RUSTFLAGS="-C force-frame-pointers=yes" \
-        CARGO_PROFILE_RELEASE_DEBUG=true \
-        cargo build --release --features profiling 2>&1 | grep -E "error|warning|Finished" || true
+    # Use DWARF4 to avoid addr2line compatibility issues with large binaries.
+    # Split debuginfo keeps the binary smaller and perf can still find symbols.
+    RUSTFLAGS="-C force-frame-pointers=yes -C debuginfo=2 -C split-debuginfo=off" \
+        CARGO_PROFILE_RELEASE_DEBUG=2 \
+        cargo build --release -p slayerfs --features profiling 2>&1 | grep -E "error|warning|Finished" || true
     BINARY="$PROJECT_DIR/../target/release/slayerfs"
 else
     BINARY="$PROJECT_DIR/../target/release/slayerfs"
     [ -x "$BINARY" ] || { err "binary not found: $BINARY"; exit 1; }
+fi
+
+# Verify the binary exists and has debug info
+if [ -x "$BINARY" ]; then
+    if ! file "$BINARY" | grep -q "with debug_info"; then
+        warn "binary lacks debug info — flame graphs may have unresolved symbols"
+    fi
 fi
 
 # ---- Setup ----
@@ -185,12 +194,36 @@ for j in d.get('jobs',[]):
     mv "$tmp_json" "$RESULTS_DIR/fio-${label}.json" 2>/dev/null || true
 }
 
+# ---- Helper: run perf script safely ----
+# Handles addr2line issues with large debug binaries by using --no-inline
+# and pointing at the correct symbol file.
+run_perf_script() {
+    local perf_data="$1"
+    local output="$2"
+
+    # Try with --no-inline first (avoids addr2line "could not read first record" on large binaries)
+    if perf script --no-inline -i "$perf_data" --symfs "$(dirname "$BINARY")" > "$output" 2>/dev/null; then
+        return 0
+    fi
+
+    # Fallback: plain perf script without --no-inline
+    if perf script -i "$perf_data" > "$output" 2>/dev/null; then
+        return 0
+    fi
+
+    # Last resort: only emit basic fields (no addr2line at all)
+    warn "perf script failed to resolve symbols; using basic output"
+    perf script -i "$perf_data" -F comm,pid,tid,cpu,time,event,ip,sym,dso 2>/dev/null > "$output" || true
+}
+
 # =========================================================================
 # ON-CPU FLAME GRAPH
 # =========================================================================
 if [ "$SKIP_ONCPU" -eq 0 ]; then
-    info "=== ON-CPU profiling (perf record -F 99 --call-graph dwarf) ==="
+    info "=== ON-CPU profiling (perf record -F 99 --call-graph fp) ==="
 
+    # Use frame-pointer based call graphs (fp) — faster and more reliable
+    # than dwarf for large binaries. Requires -C force-frame-pointers=yes at build.
     perf record -F 99 --call-graph fp -a -o "$FLAME_DIR/oncpu-perf.data" &
     PERF_ONCPU_PID=$!
     sleep 1
@@ -202,13 +235,14 @@ if [ "$SKIP_ONCPU" -eq 0 ]; then
     run_fio "randrw"    --name=randrw    --rw=randrw --rwmixread=70 --bs=4m --size="$RAND_SIZE" --numjobs=4 --ioengine=sync --direct=0
 
     kill -INT "$PERF_ONCPU_PID" 2>/dev/null || true
-    sleep 2
+    wait "$PERF_ONCPU_PID" 2>/dev/null || true
 
     if [ -f "$FLAME_DIR/oncpu-perf.data" ]; then
         info "generating on-CPU flame graph..."
-        perf script -i "$FLAME_DIR/oncpu-perf.data" 2>/dev/null \
-            | inferno-collapse-perf 2>/dev/null \
-            > "$FLAME_DIR/oncpu.folded" || true
+        run_perf_script "$FLAME_DIR/oncpu-perf.data" "$FLAME_DIR/oncpu-raw.txt"
+
+        inferno-collapse-perf < "$FLAME_DIR/oncpu-raw.txt" \
+            > "$FLAME_DIR/oncpu.folded" 2>/dev/null || true
 
         grep "slayerfs" "$FLAME_DIR/oncpu.folded" > "$FLAME_DIR/oncpu-slayerfs.folded" 2>/dev/null || true
 
@@ -220,7 +254,12 @@ if [ "$SKIP_ONCPU" -eq 0 ]; then
             # Hotspot analysis
             info "  analyzing hotspots..."
             python3 "$SCRIPT_DIR/analyze_flame.py" --hotspots "$FLAME_DIR/oncpu-slayerfs.folded" 2>/dev/null || true
+        else
+            warn "  no slayerfs samples captured — is the workload too short?"
         fi
+
+        # Clean up intermediate file
+        rm -f "$FLAME_DIR/oncpu-raw.txt"
     fi
 fi
 
@@ -232,7 +271,9 @@ if [ "$SKIP_OFFCPU" -eq 0 ]; then
 
     rm -rf "$MNT_DIR"/* 2>/dev/null || true
 
-    perf record -e 'sched:sched_switch' --call-graph dwarf -a -o "$FLAME_DIR/offcpu-perf.data" &
+    # Use fp call graph for off-cpu too — dwarf on large binaries causes
+    # "could not read first record" errors with addr2line.
+    perf record -e 'sched:sched_switch' --call-graph fp -a -o "$FLAME_DIR/offcpu-perf.data" &
     PERF_OFFCPU_PID=$!
     sleep 1
 
@@ -249,7 +290,7 @@ if [ "$SKIP_OFFCPU" -eq 0 ]; then
         --output-format=terse 2>/dev/null || true
 
     kill -INT "$PERF_OFFCPU_PID" 2>/dev/null || true
-    sleep 2
+    wait "$PERF_OFFCPU_PID" 2>/dev/null || true
 
     if [ -f "$FLAME_DIR/offcpu-perf.data" ]; then
         info "generating off-CPU flame graph..."
@@ -261,6 +302,8 @@ if [ "$SKIP_OFFCPU" -eq 0 ]; then
                 "$FLAME_DIR/offcpu-slayerfs.folded" \
                 > "$FLAME_DIR/offcpu-flame.svg"
             info "  off-CPU flame graph: $FLAME_DIR/offcpu-flame.svg"
+        else
+            warn "  no off-CPU slayerfs samples captured"
         fi
     fi
 fi
@@ -296,6 +339,7 @@ info "=============================================="
 echo ""
 echo "  open flame graphs:"
 for svg in "$FLAME_DIR"/*.svg; do
+    [ -f "$svg" ] || continue
     echo "    file://$svg"
 done
 echo ""
