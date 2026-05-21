@@ -2003,6 +2003,48 @@ async fn test_batch_stat_mixed_flow() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn test_get_node_cache_expires_after_ttl() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let original = store.get_node(root).await.unwrap().unwrap();
+    let mut mutated = original.clone();
+    mutated.attr.mode = 0o040700;
+
+    let data = serde_json::to_vec(&mutated).unwrap();
+    let mut conn = store.conn.clone();
+    let _: () = conn.set(store.node_key(root), data).await.unwrap();
+
+    let cached = store.get_node(root).await.unwrap().unwrap();
+    assert_eq!(cached.attr.mode, original.attr.mode);
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let refreshed = store.get_node(root).await.unwrap().unwrap();
+    assert_eq!(refreshed.attr.mode, mutated.attr.mode);
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_create_entry_invalidates_parent_node_cache() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let root_before = store.get_node(root).await.unwrap().unwrap();
+    assert!(store.node_cache.get(&root).await.is_some());
+
+    store.mkdir(root, "cache_dir".to_string()).await.unwrap();
+
+    assert!(store.node_cache.get(&root).await.is_none());
+
+    let root_after = store.get_node(root).await.unwrap().unwrap();
+    assert_eq!(root_after.attr.nlink, root_before.attr.nlink + 1);
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_symlink_lookup_path_flow() {
     let store = new_test_store().await;
     let root = store.root_ino();
