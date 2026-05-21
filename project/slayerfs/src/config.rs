@@ -7,7 +7,7 @@ use crate::chunk::layout::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
 pub const DEFAULT_DATA_DIR: &str = "./data";
 pub const DEFAULT_META_URL: &str = "sqlite::memory:";
 pub const DEFAULT_S3_PART_SIZE: usize = 16 * 1024 * 1024;
-pub const DEFAULT_S3_MAX_CONCURRENCY: usize = 16;
+pub const DEFAULT_S3_MAX_CONCURRENCY: usize = 32;
 pub const DEFAULT_FUSE_MAX_BACKGROUND: usize = 512;
 
 fn default_fuse_workers() -> usize {
@@ -395,5 +395,34 @@ mod tests {
         assert_eq!(config.fuse_workers, default_fuse_workers());
         assert!(config.fuse_workers > 1);
         assert_eq!(config.fuse_max_background, DEFAULT_FUSE_MAX_BACKGROUND);
+    }
+
+    #[test]
+    fn mount_config_defaults_raise_s3_concurrency() {
+        let config = MountConfig::from_sources(MountArgs {
+            config: None,
+            mount_point: Some(PathBuf::from("/mnt/slayer")),
+            data_backend: None,
+            data_dir: None,
+            s3_bucket: None,
+            s3_endpoint: None,
+            s3_region: None,
+            s3_part_size: None,
+            s3_max_concurrency: None,
+            s3_force_path_style: None,
+            s3_disable_payload_checksum: None,
+            meta_backend: None,
+            meta_url: None,
+            meta_etcd_urls: None,
+            chunk_size: None,
+            block_size: None,
+            fuse_workers: None,
+            fuse_max_background: None,
+            privileged: false,
+        })
+        .unwrap();
+
+        assert_eq!(config.s3_max_concurrency, DEFAULT_S3_MAX_CONCURRENCY);
+        assert_eq!(config.s3_max_concurrency, 32);
     }
 }

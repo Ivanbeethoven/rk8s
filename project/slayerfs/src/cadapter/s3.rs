@@ -4,6 +4,7 @@ use crate::cadapter::client::ObjectBackend;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
+use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::config::RequestChecksumCalculation;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::{ByteStream, SdkBody};
@@ -50,7 +51,7 @@ impl Default for S3Config {
             bucket: String::new(),
             region: None,
             part_size: 16 * 1024 * 1024, // 16MB — larger parts reduce HTTP overhead
-            max_concurrency: 16, // Match global upload concurrency for better pipe utilization
+            max_concurrency: 32,         // Raise S3 parallelism to keep multi-job reads saturated
             max_retries: 1,
             retry_base_delay: 100,
             enable_md5: false,
@@ -87,6 +88,14 @@ impl S3Backend {
 
         let mut aws_config_loader = aws_config::defaults(BehaviorVersion::latest());
 
+        // Prevent indefinite hangs on stalled S3 connections.
+        let timeout_config = TimeoutConfig::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(30))
+            .operation_timeout(Duration::from_secs(120))
+            .build();
+        aws_config_loader = aws_config_loader.timeout_config(timeout_config);
+
         if let Some(region) = &config.region {
             aws_config_loader = aws_config_loader.region(Region::new(region.clone()));
         }
@@ -107,9 +116,8 @@ impl S3Backend {
             // Skip payload checksum (SigV4 SHA-256 of request body) to send
             // UNSIGNED-PAYLOAD. This matches JuiceFS behavior and avoids wasting
             // ~20% CPU on cryptographic hashing for non-AWS S3 backends (MinIO, RustFS, etc.).
-            s3_config_builder = s3_config_builder.request_checksum_calculation(
-                RequestChecksumCalculation::WhenRequired,
-            );
+            s3_config_builder = s3_config_builder
+                .request_checksum_calculation(RequestChecksumCalculation::WhenRequired);
             s3_config_builder = s3_config_builder.response_checksum_validation(
                 aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
             );
@@ -630,6 +638,13 @@ mod tests {
     use aws_sdk_s3::Config;
     use aws_sdk_s3::config::{Credentials, Region};
     use tokio::time::timeout;
+
+    #[test]
+    fn s3_config_defaults_raise_parallelism() {
+        let config = S3Config::default();
+
+        assert_eq!(config.max_concurrency, 32);
+    }
 
     fn test_backend() -> S3Backend {
         let endpoint = std::env::var("SLAYERFS_S3_ENDPOINT")

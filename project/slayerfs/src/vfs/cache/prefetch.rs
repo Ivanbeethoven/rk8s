@@ -76,10 +76,18 @@ impl GlobalPrefetcher {
         let fetch_fn = Arc::new(fetch_fn);
 
         tokio::spawn(Self::worker_loop(
-            rx, sem, worker_in_flight, worker_cancelled, fetch_fn,
+            rx,
+            sem,
+            worker_in_flight,
+            worker_cancelled,
+            fetch_fn,
         ));
 
-        Self { tx, in_flight, cancelled }
+        Self {
+            tx,
+            in_flight,
+            cancelled,
+        }
     }
 
     async fn worker_loop<F, Fut>(
@@ -88,8 +96,7 @@ impl GlobalPrefetcher {
         in_flight: Arc<Mutex<HashSet<RangeKey>>>,
         cancelled: Arc<Mutex<HashSet<(i64, u64)>>>,
         fetch_fn: Arc<F>,
-    )
-    where
+    ) where
         F: Fn(i64, u64, u64) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {

@@ -72,10 +72,22 @@ impl Default for CacheConfig {
             prefetch_enabled: true,
             prefetch_initial_bytes: 4 * 1024 * 1024,
             prefetch_max_bytes: 128 * 1024 * 1024,
-            prefetch_concurrency: 32,
+            prefetch_concurrency: 64,
             strict_posix: true,
             writeback_mode: WriteBackMode::UploadBeforeCommit,
             min_free_disk_bytes: 1024 * 1024 * 1024,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_config_defaults_raise_prefetch_concurrency() {
+        let config = CacheConfig::default();
+
+        assert_eq!(config.prefetch_concurrency, 64);
     }
 }
