@@ -341,8 +341,8 @@ where
             let now: Timestamp = std::time::SystemTime::now().into();
             let attr = rfuse3::raw::reply::FileAttr {
                 ino: STATS_INODE,
-                size: 0,
-                blocks: 0,
+                size: 4096,
+                blocks: 1,
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -623,8 +623,8 @@ where
             let now: Timestamp = std::time::SystemTime::now().into();
             let attr = rfuse3::raw::reply::FileAttr {
                 ino: STATS_INODE,
-                size: 0,
-                blocks: 0,
+                size: 4096,
+                blocks: 1,
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -1455,6 +1455,10 @@ where
         lock_owner: u64,
         _flush: bool,
     ) -> FuseResult<()> {
+        // Virtual .stats file: no real handle to close.
+        if inode == STATS_INODE {
+            return Ok(());
+        }
         debug!(fh, "fuse.release");
         self.unlock_owner_locks(inode, lock_owner).await;
         self.close(fh).await.map_err(Errno::from)?;
@@ -1464,6 +1468,10 @@ where
     // Flush file data to backend (called on every close of a file descriptor).
     // Must actually persist dirty data so that close() semantics are honored.
     async fn flush(&self, _req: Request, inode: u64, fh: u64, lock_owner: u64) -> FuseResult<()> {
+        // Virtual .stats file: nothing to flush.
+        if inode == STATS_INODE {
+            return Ok(());
+        }
         debug!(fh, inode, "fuse.flush");
         self.unlock_owner_locks(inode, lock_owner).await;
         // VFS::flush persists pending writes (full 300s deadline).
