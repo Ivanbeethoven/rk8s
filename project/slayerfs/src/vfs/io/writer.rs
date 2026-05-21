@@ -46,6 +46,9 @@ const TRUNCATE_FLUSH_DEADLINE: Duration = Duration::from_secs(10);
 /// Shorter deadline for close-triggered flushes.  FUSE already calls flush()
 /// before close(), so close() only needs to drain residual in-flight work.
 const CLOSE_FLUSH_DEADLINE: Duration = Duration::from_secs(5);
+/// Maximum time commit_chunk will wait for a single slice's upload before
+/// marking it failed.  Prevents indefinite hangs on stalled S3 connections.
+const COMMIT_UPLOAD_MAX_WAIT: Duration = Duration::from_secs(180);
 const UPLOAD_MAX_RETRIES: u64 = 5;
 const COMMIT_RETRY_BASE_MS: u64 = 20;
 const COMMIT_RETRY_MAX_MS: u64 = 2000;
@@ -166,6 +169,10 @@ pub(crate) struct SliceState {
     /// FUSE request unique id that created this slice, used to order overlapping
     /// slices for correct commit sequencing (lower unique = older data = commit first).
     creation_unique: u64,
+    /// Highest FUSE unique that has written to this slice.  A write with
+    /// unique < max_write_unique is rejected (must go to its own slice) to
+    /// prevent an older concurrent write from overwriting newer data.
+    max_write_unique: u64,
 }
 
 impl SliceState {
@@ -193,6 +200,7 @@ impl SliceState {
             frozen_epoch: 0,
             meta_write_started: false,
             creation_unique,
+            max_write_unique: creation_unique,
         }
     }
 
@@ -700,6 +708,16 @@ where
             };
 
             if handle.can_write(offset, len).is_some() {
+                // Reject reuse if this write is older than the newest write
+                // already in the slice.  Without this check, an older concurrent
+                // FUSE write (lower unique) processed after a newer one could
+                // overwrite the newer data in the overlapping region.
+                if creation_unique != 0 {
+                    let max_u = slice.lock().max_write_unique;
+                    if max_u != 0 && creation_unique < max_u {
+                        continue;
+                    }
+                }
                 found = Some(slice.clone());
                 break;
             }
@@ -711,7 +729,16 @@ where
         }
 
         let slice = match found {
-            Some(slice) => slice,
+            Some(slice) => {
+                // Update max_write_unique so future older writes won't reuse this slice.
+                if creation_unique != 0 {
+                    let mut s = slice.lock();
+                    if creation_unique > s.max_write_unique {
+                        s.max_write_unique = creation_unique;
+                    }
+                }
+                slice
+            }
             None => {
                 let slice = Arc::new(ParkingMutex::new(SliceState::new(
                     chunk_id,
@@ -1678,6 +1705,23 @@ where
 
                     if handle.can_continue_upload() {
                         Self::spawn_flush_slice(shared.clone(), slice.clone());
+                    }
+
+                    // If the slice has been waiting too long for upload, give up
+                    // to prevent indefinite hangs from stalled S3 connections.
+                    if runtime.started.elapsed() > COMMIT_UPLOAD_MAX_WAIT {
+                        warn!(
+                            chunk_id,
+                            age_secs = runtime.started.elapsed().as_secs(),
+                            "commit_chunk: upload stalled too long, marking slice failed"
+                        );
+                        handle.mark_failed(anyhow::anyhow!(
+                            "upload stalled for {:?}, giving up",
+                            runtime.started.elapsed()
+                        ));
+                        if Self::pop_front_slice(&shared, chunk_id).await {
+                            return;
+                        }
                     }
                     continue;
                 }
