@@ -1151,6 +1151,7 @@ struct LuaResponse {
 pub struct RedisMetaStore {
     conn: ConnectionManager,
     _config: Config,
+    node_cache: moka::future::Cache<i64, Option<StoredNode>>,
     /// Current session id.  Wrapped in a Mutex so it can be updated on
     /// session restart (OnceLock would permanently fail on second start).
     sid: std::sync::Mutex<Option<Uuid>>,
@@ -1247,6 +1248,10 @@ impl RedisMetaStore {
         let store = Self {
             conn,
             _config: config,
+            node_cache: moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(2))
+                .build(),
             sid: std::sync::Mutex::new(None),
             epoch: std::sync::Mutex::new(None),
             chunk_scan_cursor: std::sync::Mutex::new(None),
@@ -1446,14 +1451,70 @@ impl RedisMetaStore {
     }
 
     async fn get_node(&self, ino: i64) -> Result<Option<StoredNode>, MetaError> {
+        if let Some(cached) = self.node_cache.get(&ino).await {
+            return Ok(cached);
+        }
+
         let mut conn = self.conn.clone();
         let data: Option<Vec<u8>> = conn.get(self.node_key(ino)).await.map_err(redis_err)?;
-        if let Some(bytes) = data {
-            let node =
-                serde_json::from_slice(&bytes).map_err(|e| MetaError::Internal(e.to_string()))?;
-            Ok(Some(node))
+        let result = if let Some(bytes) = data {
+            Some(serde_json::from_slice(&bytes).map_err(|e| MetaError::Internal(e.to_string()))?)
         } else {
-            Ok(None)
+            None
+        };
+        self.node_cache.insert(ino, result.clone()).await;
+        Ok(result)
+    }
+
+    async fn get_nodes(&self, inodes: &[i64]) -> Result<Vec<Option<StoredNode>>, MetaError> {
+        if inodes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = vec![None; inodes.len()];
+        let mut missing = HashMap::<i64, Vec<usize>>::new();
+        for (idx, ino) in inodes.iter().copied().enumerate() {
+            if let Some(cached) = self.node_cache.get(&ino).await {
+                results[idx] = cached;
+            } else {
+                missing.entry(ino).or_default().push(idx);
+            }
+        }
+
+        if missing.is_empty() {
+            return Ok(results);
+        }
+
+        let missing_inodes: Vec<i64> = missing.keys().copied().collect();
+        let keys: Vec<String> = missing_inodes
+            .iter()
+            .map(|&ino| self.node_key(ino))
+            .collect();
+        let mut conn = self.conn.clone();
+        let values: Vec<Option<Vec<u8>>> = conn.get(&keys).await.map_err(redis_err)?;
+
+        for (ino, value) in missing_inodes.into_iter().zip(values.into_iter()) {
+            let node = match value {
+                Some(bytes) => Some(
+                    serde_json::from_slice(&bytes)
+                        .map_err(|e| MetaError::Internal(e.to_string()))?,
+                ),
+                None => None,
+            };
+            self.node_cache.insert(ino, node.clone()).await;
+            if let Some(indexes) = missing.remove(&ino) {
+                for idx in indexes {
+                    results[idx] = node.clone();
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    async fn invalidate_nodes(&self, inodes: &[i64]) {
+        for &ino in inodes {
+            self.node_cache.invalidate(&ino).await;
         }
     }
 
@@ -1464,12 +1525,17 @@ impl RedisMetaStore {
             .set(self.node_key(node.ino), data)
             .await
             .map_err(redis_err)?;
+        self.node_cache.insert(node.ino, Some(node.clone())).await;
         Ok(())
     }
 
     async fn delete_node(&self, ino: i64) -> Result<(), MetaError> {
         let mut conn = self.conn.clone();
-        conn.del(self.node_key(ino)).await.map_err(redis_err)
+        let result = conn.del(self.node_key(ino)).await.map_err(redis_err);
+        if result.is_ok() {
+            self.node_cache.invalidate(&ino).await;
+        }
+        result
     }
 
     async fn load_link_parents(&self, ino: i64) -> Result<Vec<(i64, String)>, MetaError> {
@@ -1599,6 +1665,7 @@ impl RedisMetaStore {
                 let new_ino = response
                     .ino
                     .ok_or_else(|| MetaError::Internal("missing ino in response".into()))?;
+                self.invalidate_nodes(&[parent, new_ino]).await;
                 Ok(new_ino)
             }
             None => Err(MetaError::Internal("unexpected Lua response".into())),
@@ -1912,33 +1979,11 @@ impl MetaStore for RedisMetaStore {
         fields(inode_count = inodes.len())
     )]
     async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
-        if inodes.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Build keys for all inodes
-        let keys: Vec<String> = inodes.iter().map(|&ino| self.node_key(ino)).collect();
-
-        // Use MGET to fetch all nodes in a single round trip
-        let mut conn = self.conn.clone();
-        let values: Vec<Option<String>> = conn.get(&keys).await.map_err(redis_err)?;
-
-        // Parse results and convert to FileAttr
-        let mut results = Vec::with_capacity(inodes.len());
-        for value in values {
-            match value {
-                Some(json_str) => match serde_json::from_str::<StoredNode>(&json_str) {
-                    Ok(node) => results.push(Some(node.as_file_attr())),
-                    Err(e) => {
-                        error!("Failed to deserialize node from Redis: {}", e);
-                        results.push(None);
-                    }
-                },
-                None => results.push(None),
-            }
-        }
-
-        Ok(results)
+        let nodes = self.get_nodes(inodes).await?;
+        Ok(nodes
+            .into_iter()
+            .map(|node| node.map(|node| node.as_file_attr()))
+            .collect())
     }
 
     #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
@@ -1977,9 +2022,12 @@ impl MetaStore for RedisMetaStore {
         let mut conn = self.conn.clone();
         let entries: Vec<(String, i64)> =
             conn.hgetall(self.dir_key(ino)).await.map_err(redis_err)?;
-        let mut result = Vec::new();
-        for (name, child) in entries {
-            if let Some(node) = self.get_node(child).await? {
+        let child_inodes: Vec<i64> = entries.iter().map(|(_, child)| *child).collect();
+        let nodes = self.get_nodes(&child_inodes).await?;
+
+        let mut result = Vec::with_capacity(entries.len());
+        for ((name, child), node) in entries.into_iter().zip(nodes.into_iter()) {
+            if let Some(node) = node {
                 result.push(DirEntry {
                     name,
                     ino: child,
@@ -2037,7 +2085,10 @@ impl MetaStore for RedisMetaStore {
             }
             Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
             Some(other) => Err(MetaError::Internal(format!("Lua error: {other}"))),
-            None if response.ok => Ok(()),
+            None if response.ok => {
+                self.invalidate_nodes(&[parent, child]).await;
+                Ok(())
+            }
             None => Err(MetaError::Internal("unexpected Lua response".into())),
         }
     }
@@ -2112,6 +2163,7 @@ impl MetaStore for RedisMetaStore {
                 let stored_attr: StoredAttr = serde_json::from_value(attr_json)
                     .map_err(|e| MetaError::Internal(format!("attr parse error: {e}")))?;
 
+                self.invalidate_nodes(&[ino, parent]).await;
                 self.bump_dir_times(parent, now).await?;
                 Ok(stored_attr.to_file_attr(ino, node.kind.into()))
             }
@@ -2235,6 +2287,7 @@ impl MetaStore for RedisMetaStore {
                     }
                 }
 
+                self.invalidate_nodes(&[parent, child]).await;
                 self.bump_dir_times(parent, now).await?;
                 Ok(())
             }
@@ -2263,6 +2316,7 @@ impl MetaStore for RedisMetaStore {
         let Some(child) = self.lookup(old_parent, old_name).await? else {
             return Err(MetaError::NotFound(old_parent));
         };
+        let replaced_ino = self.lookup(new_parent, &new_name).await?;
 
         // Step 2: Construct Redis keys
         let old_parent_dir_key = self.dir_key(old_parent);
@@ -2315,7 +2369,14 @@ impl MetaStore for RedisMetaStore {
                 "expected link parent binding {old_parent}/{old_name} for inode {child}"
             ))),
             Some(other) => Err(MetaError::Internal(format!("Lua error: {other}"))),
-            None if response.ok => Ok(()),
+            None if response.ok => {
+                let mut invalidated = vec![old_parent, new_parent, child];
+                if let Some(replaced_ino) = replaced_ino {
+                    invalidated.push(replaced_ino);
+                }
+                self.invalidate_nodes(&invalidated).await;
+                Ok(())
+            }
             None => Err(MetaError::Internal("unexpected Lua response".into())),
         }
     }
@@ -2390,7 +2451,11 @@ impl MetaStore for RedisMetaStore {
                 "expected link parent binding not found during exchange".into(),
             )),
             Some(other) => Err(MetaError::Internal(format!("Lua error: {other}"))),
-            None if response.ok => Ok(()),
+            None if response.ok => {
+                self.invalidate_nodes(&[old_parent, new_parent, old_ino, new_ino])
+                    .await;
+                Ok(())
+            }
             None => Err(MetaError::Internal("unexpected Lua response".into())),
         }
     }
@@ -2468,6 +2533,7 @@ impl MetaStore for RedisMetaStore {
             node.attr.ctime = now;
         }
 
+        self.node_cache.invalidate(&ino).await;
         self.save_node(&node).await?;
         Ok(node.attr.to_file_attr(node.ino, node.kind.into()))
     }
@@ -2503,7 +2569,10 @@ impl MetaStore for RedisMetaStore {
             Some("node_not_found") => Err(MetaError::NotFound(ino)),
             Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
             Some(other) => Err(MetaError::Internal(format!("Lua error: {other}"))),
-            None if response.ok => Ok(()),
+            None if response.ok => {
+                self.node_cache.invalidate(&ino).await;
+                Ok(())
+            }
             None => Err(MetaError::Internal("unexpected Lua response".into())),
         }
     }
@@ -2893,7 +2962,12 @@ impl MetaStore for RedisMetaStore {
             Some("node_not_found") => Err(MetaError::NotFound(ino)),
             Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
             Some(other) => Err(MetaError::Internal(format!("Lua error: {other}"))),
-            None if response.ok => Ok(()),
+            None if response.ok => {
+                // The Lua script may have updated the node's size; invalidate the
+                // local cache so subsequent stat() calls see the new value.
+                self.node_cache.invalidate(&ino).await;
+                Ok(())
+            }
             None => Err(MetaError::Internal("unexpected Lua response".into())),
         }
     }

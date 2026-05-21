@@ -163,6 +163,9 @@ pub(crate) struct SliceState {
     /// Set to `true` when a meta.write() has been initiated (or completed)
     /// to prevent both try_commit and commit_chunk from writing the same slice.
     meta_write_started: bool,
+    /// FUSE request unique id that created this slice, used to order overlapping
+    /// slices for correct commit sequencing (lower unique = older data = commit first).
+    creation_unique: u64,
 }
 
 impl SliceState {
@@ -171,6 +174,7 @@ impl SliceState {
         offset: u64,
         config: Arc<WriteConfig>,
         usage: Arc<AtomicU64>,
+        creation_unique: u64,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -188,6 +192,7 @@ impl SliceState {
             last_mod: now,
             frozen_epoch: 0,
             meta_write_started: false,
+            creation_unique,
         }
     }
 
@@ -669,6 +674,7 @@ where
         &mut self,
         offset: u64,
         len: usize,
+        creation_unique: u64,
     ) -> anyhow::Result<(Arc<ParkingMutex<SliceState>>, WriteAction)> {
         let (chunk_id, mut slices) = {
             let chunk = self
@@ -712,8 +718,23 @@ where
                     offset,
                     self.shared.config.clone(),
                     self.shared.buffer_usage.clone(),
+                    creation_unique,
                 )));
-                slices.push_back(slice.clone());
+                // Insert in sorted position by creation_unique so that slices
+                // committed in FIFO (front-first) order reflect the kernel's
+                // temporal write ordering. This prevents a race where concurrent
+                // FUSE request processing reorders overlapping writes.
+                // creation_unique=0 means the ordering is unknown (non-cached
+                // write path); append to back to preserve original FIFO behavior.
+                let insert_pos = if creation_unique == 0 {
+                    slices.len()
+                } else {
+                    slices
+                        .iter()
+                        .position(|s| s.lock().creation_unique > creation_unique)
+                        .unwrap_or(slices.len())
+                };
+                slices.insert(insert_pos, slice.clone());
                 slice
             }
         };
@@ -745,7 +766,7 @@ where
 
     /// Append data to a writable slice. If the slice reaches chunk end, freeze + flush it.
     #[tracing::instrument(level = "trace", skip(self, buf), fields(len = buf.len()))]
-    fn write_at(&mut self, offset: u64, buf: &[u8]) -> anyhow::Result<WriteAction> {
+    fn write_at(&mut self, offset: u64, buf: &[u8], creation_unique: u64) -> anyhow::Result<WriteAction> {
         let mut start_commit = false;
         let mut flush = Vec::new();
 
@@ -757,7 +778,7 @@ where
         let mut failed_cnt = 0;
 
         loop {
-            let (slice, action) = self.find_slice_or_create(offset, buf.len())?;
+            let (slice, action) = self.find_slice_or_create(offset, buf.len(), creation_unique)?;
             start_commit |= action.start_commit;
             flush.extend(action.flush);
 
@@ -986,7 +1007,7 @@ where
         fields(offset, len = buf.len(), bypass_flush_gate = false)
     )]
     pub(crate) async fn write_at(&self, offset: u64, buf: &[u8]) -> anyhow::Result<usize> {
-        self.write_at_inner(offset, buf, false).await
+        self.write_at_inner(offset, buf, false, 0).await
     }
 
     #[tracing::instrument(
@@ -994,8 +1015,13 @@ where
         skip(self, buf),
         fields(offset, len = buf.len(), bypass_flush_gate = true)
     )]
-    pub(crate) async fn write_at_cached(&self, offset: u64, buf: &[u8]) -> anyhow::Result<usize> {
-        self.write_at_inner(offset, buf, true).await
+    pub(crate) async fn write_at_cached(
+        &self,
+        offset: u64,
+        buf: &[u8],
+        creation_unique: u64,
+    ) -> anyhow::Result<usize> {
+        self.write_at_inner(offset, buf, true, creation_unique).await
     }
 
     async fn write_at_inner(
@@ -1003,6 +1029,7 @@ where
         offset: u64,
         buf: &[u8],
         bypass_flush_gate: bool,
+        creation_unique: u64,
     ) -> anyhow::Result<usize> {
         self.shared.writeback_result()?;
         self.back_pressure().await?;
@@ -1032,7 +1059,7 @@ where
             let cid = chunk_id_for(self.shared.inode.ino(), chunk_index)?;
             let ckey = guard.get_or_create_chunk(cid);
             let mut handle = guard.chunk_handle(&self.shared, ckey);
-            let action = handle.write_at(within_offset, buf)?;
+            let action = handle.write_at(within_offset, buf, creation_unique)?;
             drop(guard);
 
             for slice in action.flush {
@@ -1051,8 +1078,7 @@ where
                 let ckey = guard.get_or_create_chunk(cid);
                 let mut handle = guard.chunk_handle(&self.shared, ckey);
                 let span_len = span.len.as_usize();
-                let action =
-                    handle.write_at(span.offset, &buf[position..position + span_len])?;
+                let action = handle.write_at(span.offset, &buf[position..position + span_len], creation_unique)?;
                 drop(guard);
 
                 for slice in action.flush {
@@ -1256,16 +1282,15 @@ where
                         let mut guard = self.shared.inner.lock().await;
                         for (cid, chunk) in guard.chunks.iter_mut() {
                             if !chunk.commit_started
-                                && chunk.slices.iter().any(|s| {
-                                    matches!(s.lock().state, SliceStatus::Uploaded)
-                                })
+                                && chunk
+                                    .slices
+                                    .iter()
+                                    .any(|s| matches!(s.lock().state, SliceStatus::Uploaded))
                             {
                                 chunk.commit_started = true;
                                 let shared = self.shared.clone();
                                 let cid = *cid;
-                                tokio::spawn(
-                                    async move { Self::commit_chunk(shared, cid).await },
-                                );
+                                tokio::spawn(async move { Self::commit_chunk(shared, cid).await });
                             }
                         }
                     }
@@ -1865,8 +1890,7 @@ where
                 .desc_for_commit();
                 if let Some(desc) = desc {
                     let (ino_val, chunk_index) = extract_ino_and_chunk_index(desc.chunk_id);
-                    let file_offset =
-                        chunk_index * shared.config.layout.chunk_size + desc.offset;
+                    let file_offset = chunk_index * shared.config.layout.chunk_size + desc.offset;
                     let _ = shared
                         .reader
                         .invalidate(ino_val as u64, file_offset, desc.length.as_usize())
@@ -2369,7 +2393,7 @@ mod tests {
             chunk_size: 16 * 1024,
             block_size: 4 * 1024,
         };
-        let mut slice = SliceState::new(1, 0, test_config(layout), Arc::new(AtomicU64::new(0)));
+        let mut slice = SliceState::new(1, 0, test_config(layout), Arc::new(AtomicU64::new(0)), 0);
         let len = layout.block_size as usize + (layout.block_size as usize / 2);
         slice.data.append(&vec![1u8; len]).unwrap();
 
@@ -2383,7 +2407,7 @@ mod tests {
             chunk_size: 16 * 1024,
             block_size: 4 * 1024,
         };
-        let mut slice = SliceState::new(1, 0, test_config(layout), Arc::new(AtomicU64::new(0)));
+        let mut slice = SliceState::new(1, 0, test_config(layout), Arc::new(AtomicU64::new(0)), 0);
         let len = layout.block_size as usize + (layout.block_size as usize / 2);
         let data = vec![2u8; len];
         slice.data.append(&data).unwrap();
@@ -2429,7 +2453,7 @@ mod tests {
             chunk_size: 16 * 1024,
             block_size: 4 * 1024,
         };
-        let mut slice = SliceState::new(1, 0, test_config(layout), Arc::new(AtomicU64::new(0)));
+        let mut slice = SliceState::new(1, 0, test_config(layout), Arc::new(AtomicU64::new(0)), 0);
         slice
             .data
             .append(&vec![0u8; layout.block_size as usize * 2])
@@ -2735,6 +2759,7 @@ mod tests {
             0,
             test_config(layout),
             Arc::new(AtomicU64::new(0)),
+            0,
         )));
         {
             let mut guard = writer.shared.inner.lock().await;
@@ -2785,6 +2810,7 @@ mod tests {
             0,
             test_config(layout),
             Arc::new(AtomicU64::new(0)),
+            0,
         )));
         {
             let mut guard = writer.shared.inner.lock().await;
@@ -2956,6 +2982,7 @@ mod tests {
             0,
             test_config(layout),
             Arc::new(AtomicU64::new(0)),
+            0,
         )));
         {
             let mut state = slice.lock();

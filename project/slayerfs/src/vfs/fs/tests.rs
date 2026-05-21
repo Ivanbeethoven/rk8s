@@ -702,7 +702,7 @@ mod io_tests {
         let attr = fs.stat("/cached.bin").await.unwrap();
         let data = b"cached-writeback-data";
 
-        fs.write_cached_ino(attr.ino, 0, data).await.unwrap();
+        fs.write_cached_ino(attr.ino, 0, data, 0).await.unwrap();
 
         let inode = fs.ensure_inode_registered(attr.ino).await.unwrap();
         let writer = fs.state.writer.ensure_file(inode);
@@ -732,7 +732,7 @@ mod io_tests {
         let attr = fs.stat("/setattr-truncate.bin").await.unwrap();
         let data = b"pending-data-before-ftruncate";
 
-        fs.write_cached_ino(attr.ino, 0, data).await.unwrap();
+        fs.write_cached_ino(attr.ino, 0, data, 0).await.unwrap();
         let inode = fs.ensure_inode_registered(attr.ino).await.unwrap();
         let writer = fs.state.writer.ensure_file(inode);
         assert!(writer.has_pending().await);
@@ -1755,7 +1755,7 @@ mod truncate_flush_tests {
             let data = vec![(i as u8).wrapping_mul(17); block * 2];
             op_timeout(
                 "write_cached",
-                fs.write_cached_ino(ino, (i * block) as u64, &data),
+                fs.write_cached_ino(ino, (i * block) as u64, &data, i as u64),
             )
             .await
             .unwrap();

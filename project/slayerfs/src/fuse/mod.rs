@@ -504,7 +504,7 @@ where
                 write_flags,
                 "fuse.write -> write_ino (cache)"
             );
-            self.write_cached_ino(ino as i64, offset, data)
+            self.write_cached_ino(ino as i64, offset, data, _req.unique)
                 .await
                 .map_err(Into::<Errno>::into)? as u32
         } else if fh != 0 {

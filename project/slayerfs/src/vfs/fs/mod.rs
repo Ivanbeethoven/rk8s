@@ -278,8 +278,8 @@ where
         let prefetch_layout = config.read.layout;
         let prefetcher: Arc<dyn crate::vfs::cache::prefetch::Prefetcher> =
             Arc::new(crate::vfs::cache::prefetch::GlobalPrefetcher::new(
-                16,  // concurrency
-                256, // queue depth
+                64,   // concurrency
+                1024, // queue depth
                 move |ino, start, len| {
                     let backend = prefetch_backend.clone();
                     let layout = prefetch_layout;
@@ -2029,6 +2029,7 @@ where
         ino: i64,
         offset: u64,
         data: &[u8],
+        creation_unique: u64,
     ) -> Result<usize, VfsError> {
         if data.is_empty() {
             return Ok(0);
@@ -2037,7 +2038,7 @@ where
         let inode = self.ensure_inode_registered(ino).await?;
         let writer = self.state.writer.ensure_file(inode.clone());
         let written = writer
-            .write_at_cached(offset, data)
+            .write_at_cached(offset, data, creation_unique)
             .await
             .map_err(VfsError::from)?;
 
