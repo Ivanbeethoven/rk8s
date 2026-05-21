@@ -123,6 +123,20 @@ pub struct ChunksCacheConfig {
     ///         calculated dynamically based on window sizes.
     pub max_access_entries: usize,
 
+    /// Maximum bytes for the hot (in-memory) cache tier.
+    ///
+    /// **Default**: 1 GiB (maps to CacheConfig.read_memory_bytes)
+    /// **Impact**: Controls how much RAM is used for frequently-accessed blocks.
+    /// Uses moka's byte-weighted eviction (weigher returns entry byte size).
+    pub max_hot_bytes: u64,
+
+    /// Maximum bytes for on-disk cache storage.
+    ///
+    /// **Default**: 20 GiB (maps to CacheConfig.read_ssd_bytes)
+    /// **Impact**: Controls SSD usage for the persistent read cache.
+    /// When exceeded, oldest files (by access time) are evicted on insert.
+    pub max_disk_bytes: u64,
+
     /// Custom disk storage directory (optional)
     ///
     /// If None, uses system cache directory via `dirs::cache_dir()`
@@ -171,6 +185,8 @@ impl Default for ChunksCacheConfig {
         Self {
             hot_cache_size: 1024,
             cold_cache_size: 1024,
+            max_hot_bytes: 1024 * 1024 * 1024, // 1 GiB
+            max_disk_bytes: 20 * 1024 * 1024 * 1024, // 20 GiB
             base_promotion_threshold: 10.0,
             short_window_size: Duration::from_secs(10),
             medium_window_size: Duration::from_secs(60),
@@ -185,15 +201,31 @@ impl Default for ChunksCacheConfig {
     }
 }
 
+impl ChunksCacheConfig {
+    /// Create a config with explicit byte budgets and cache directory.
+    pub fn with_budgets(read_memory_bytes: u64, read_ssd_bytes: u64, cache_dir: PathBuf) -> Self {
+        Self {
+            max_hot_bytes: read_memory_bytes,
+            max_disk_bytes: read_ssd_bytes,
+            disk_storage_dir: Some(cache_dir),
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DiskStorage {
     base_dir: PathBuf,
+    /// Current total bytes used on disk
+    bytes_used: Arc<AtomicU64>,
+    /// Maximum bytes allowed on disk (0 = unlimited)
+    max_bytes: u64,
 }
 
 impl DiskStorage {
-    pub async fn new<P: AsRef<Path>>(base_dir: P) -> anyhow::Result<Self> {
+    pub async fn new<P: AsRef<Path>>(base_dir: P, max_bytes: u64) -> anyhow::Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
-        debug!("Initializing disk storage at: {:?}", base_dir);
+        debug!("Initializing disk storage at: {:?}, max_bytes: {}", base_dir, max_bytes);
 
         if !base_dir.exists() {
             info!("Creating cache directory: {:?}", base_dir);
@@ -202,7 +234,32 @@ impl DiskStorage {
             debug!("Cache directory already exists: {:?}", base_dir);
         }
 
-        Ok(Self { base_dir })
+        // Scan existing files to calculate initial bytes_used
+        let initial_bytes = Self::scan_dir_size(&base_dir).await;
+        debug!("Initial disk cache usage: {} bytes ({:.1} MiB)", initial_bytes, initial_bytes as f64 / 1048576.0);
+
+        Ok(Self {
+            base_dir,
+            bytes_used: Arc::new(AtomicU64::new(initial_bytes)),
+            max_bytes,
+        })
+    }
+
+    /// Scan directory to calculate total size of cached files
+    async fn scan_dir_size(dir: &Path) -> u64 {
+        let mut total = 0u64;
+        let mut entries = match tokio::fs::read_dir(dir).await {
+            Ok(e) => e,
+            Err(_) => return 0,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(meta) = entry.metadata().await {
+                if meta.is_file() {
+                    total += meta.len();
+                }
+            }
+        }
+        total
     }
 
     pub fn key_to_filename(key: &str) -> String {
@@ -213,10 +270,29 @@ impl DiskStorage {
         hex::encode(hash_result)
     }
 
+    /// Get current bytes used on disk
+    pub fn bytes_used(&self) -> u64 {
+        self.bytes_used.load(Ordering::Relaxed)
+    }
+
     pub async fn store(&self, key: &str, data: impl AsRef<[u8]>) -> anyhow::Result<()> {
         let filename = Self::key_to_filename(key);
-        let filepath = self.base_dir.join(filename);
+        let filepath = self.base_dir.join(&filename);
         let data_bytes = data.as_ref();
+        let data_len = data_bytes.len() as u64;
+
+        // Check if we need to evict before storing
+        if self.max_bytes > 0 {
+            let current = self.bytes_used.load(Ordering::Relaxed);
+            if current + data_len > self.max_bytes {
+                self.evict_lru(data_len).await;
+            }
+        }
+
+        // If the file already exists, subtract its old size
+        if let Ok(meta) = tokio::fs::metadata(&filepath).await {
+            self.bytes_used.fetch_sub(meta.len(), Ordering::Relaxed);
+        }
 
         trace!(
             "Storing {} bytes for key '{}' to file: {:?}",
@@ -225,13 +301,62 @@ impl DiskStorage {
             filepath
         );
 
-        tokio::fs::write(filepath, data_bytes).await?;
+        tokio::fs::write(&filepath, data_bytes).await?;
+        self.bytes_used.fetch_add(data_len, Ordering::Relaxed);
+
         debug!(
-            "Successfully stored data for key '{}', size: {} bytes",
+            "Successfully stored data for key '{}', size: {} bytes, disk usage: {:.1} MiB",
             key,
-            data_bytes.len()
+            data_bytes.len(),
+            self.bytes_used.load(Ordering::Relaxed) as f64 / 1048576.0
         );
         Ok(())
+    }
+
+    /// Evict oldest files (by access time) to free at least `needed_bytes`
+    async fn evict_lru(&self, needed_bytes: u64) {
+        let target = self.max_bytes.saturating_sub(needed_bytes);
+        let current = self.bytes_used.load(Ordering::Relaxed);
+        if current <= target {
+            return;
+        }
+        let to_free = current - target;
+        debug!("Disk cache eviction: need to free {} bytes ({:.1} MiB)", to_free, to_free as f64 / 1048576.0);
+
+        // Collect files with their access times
+        let mut files: Vec<(PathBuf, u64, u64)> = Vec::new(); // (path, size, atime_secs)
+        let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(meta) = entry.metadata().await {
+                if meta.is_file() {
+                    let atime = meta.accessed()
+                        .unwrap_or(SystemTime::UNIX_EPOCH)
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    files.push((entry.path(), meta.len(), atime));
+                }
+            }
+        }
+
+        // Sort by access time (oldest first)
+        files.sort_by_key(|f| f.2);
+
+        let mut freed = 0u64;
+        for (path, size, _) in &files {
+            if freed >= to_free {
+                break;
+            }
+            if tokio::fs::remove_file(path).await.is_ok() {
+                freed += size;
+                self.bytes_used.fetch_sub(*size, Ordering::Relaxed);
+                trace!("Evicted cache file: {:?} ({} bytes)", path, size);
+            }
+        }
+        debug!("Disk cache eviction complete: freed {} bytes ({:.1} MiB)", freed, freed as f64 / 1048576.0);
     }
 
     pub async fn load(&self, key: &str) -> anyhow::Result<Vec<u8>> {
@@ -275,8 +400,12 @@ impl DiskStorage {
             return Err(anyhow!("file {} does not exist", filepath.display()));
         }
 
-        match tokio::fs::remove_file(filepath).await {
+        // Get size before removing
+        let file_size = tokio::fs::metadata(&filepath).await.map(|m| m.len()).unwrap_or(0);
+
+        match tokio::fs::remove_file(&filepath).await {
             Ok(_) => {
+                self.bytes_used.fetch_sub(file_size, Ordering::Relaxed);
                 debug!("Successfully removed file for key '{}'", key);
                 Ok(())
             }
@@ -1181,6 +1310,16 @@ impl Policy {
 /// - Access statistics use lock-free atomic operations
 /// - Cache operations use Moka's concurrent-safe implementation
 ///
+/// Cache statistics for monitoring and diagnostics
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    pub hot_bytes: u64,
+    pub hot_entries: u64,
+    pub max_hot_bytes: u64,
+    pub disk_bytes: u64,
+    pub max_disk_bytes: u64,
+}
+
 /// # Memory Management
 ///
 /// - **Hot Cache**: Stores actual data, limited by `hot_cache_size`
@@ -1218,8 +1357,8 @@ impl ChunksCache {
     /// Creates a new ChunksCache with custom configuration
     pub async fn new_with_config(mut config: ChunksCacheConfig) -> anyhow::Result<Self> {
         debug!(
-            "Creating new ChunksCache with configuration: hot_cache_size={}, cold_cache_size={}, base_promotion_threshold={}",
-            config.hot_cache_size, config.cold_cache_size, config.base_promotion_threshold
+            "Creating new ChunksCache with configuration: hot_cache_size={}, cold_cache_size={}, max_hot_bytes={}, max_disk_bytes={}, base_promotion_threshold={}",
+            config.hot_cache_size, config.cold_cache_size, config.max_hot_bytes, config.max_disk_bytes, config.base_promotion_threshold
         );
 
         let cache_dir = config
@@ -1227,12 +1366,18 @@ impl ChunksCache {
             .take()
             .unwrap_or_else(|| cache_dir().unwrap());
         debug!("Using cache directory: {:?}", cache_dir);
-        let disk_storage = DiskStorage::new(cache_dir).await?;
+        let disk_storage = DiskStorage::new(cache_dir, config.max_disk_bytes).await?;
 
         let hot_bytes = Arc::new(AtomicU64::new(0));
         let hot_bytes_evict = hot_bytes.clone();
+        // Use byte-weighted capacity: moka evicts entries when total weight exceeds max_capacity.
+        // The weigher returns the byte size of each entry (clamped to u32::MAX).
         let hot_cache_builder = moka::future::Cache::builder()
-            .max_capacity(config.hot_cache_size as u64)
+            .max_capacity(config.max_hot_bytes)
+            .weigher(|_key: &String, value: &Vec<u8>| -> u32 {
+                // Each entry's weight is its byte size (with overhead estimate for key + metadata)
+                (value.len() as u64 + 64).min(u32::MAX as u64) as u32
+            })
             .time_to_idle(Duration::from_secs(300))
             .time_to_live(Duration::from_secs(3600))
             .eviction_listener(move |_key, value: Vec<u8>, _cause| {
@@ -1337,18 +1482,35 @@ impl ChunksCache {
         }
     }
 
-    /// Update cache utilization metrics
+    /// Update cache utilization metrics (using byte-based utilization)
     fn update_utilization_metrics(&self) {
-        let current_size = self.hot_cache.entry_count();
-        let max_size = self.config.hot_cache_size as u64;
-        let bytes = self.hot_bytes.load(Ordering::Relaxed);
+        let hot_bytes = self.hot_bytes.load(Ordering::Relaxed);
+        let max_bytes = self.config.max_hot_bytes;
+        // Convert byte utilization to entry-like scale for the policy
+        let utilization_scaled = if max_bytes > 0 {
+            (hot_bytes * 10000 / max_bytes).min(10000)
+        } else {
+            0
+        };
         trace!(
-            "Updating cache utilization: {}/{} entries, {} MB hot bytes",
-            current_size,
-            max_size,
-            bytes / 1024 / 1024
+            "Updating cache utilization: {:.1} MiB / {:.1} MiB hot, disk: {:.1} MiB / {:.1} MiB",
+            hot_bytes as f64 / 1048576.0,
+            max_bytes as f64 / 1048576.0,
+            self.disk_storage.bytes_used() as f64 / 1048576.0,
+            self.config.max_disk_bytes as f64 / 1048576.0,
         );
-        self.policy.update_cache_utilization(current_size, max_size);
+        self.policy.update_cache_utilization(utilization_scaled, 10000);
+    }
+
+    /// Get cache statistics
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hot_bytes: self.hot_bytes.load(Ordering::Relaxed),
+            hot_entries: self.hot_cache.entry_count(),
+            max_hot_bytes: self.config.max_hot_bytes,
+            disk_bytes: self.disk_storage.bytes_used(),
+            max_disk_bytes: self.config.max_disk_bytes,
+        }
     }
 
     pub async fn insert(&self, key: &str, data: &Vec<u8>) -> anyhow::Result<()> {
@@ -1396,7 +1558,7 @@ mod tests {
     // Test helper: create a temporary storage directory
     async fn setup_test_storage() -> (DiskStorage, tempfile::TempDir) {
         let temp_dir = tempdir().unwrap();
-        let storage = DiskStorage::new(temp_dir.path()).await.unwrap();
+        let storage = DiskStorage::new(temp_dir.path(), 0).await.unwrap();
         (storage, temp_dir)
     }
 
@@ -1413,7 +1575,7 @@ mod tests {
         // Ensure the directory does not exist
         assert!(!dir_path.exists());
 
-        let _storage = DiskStorage::new(&dir_path).await.unwrap();
+        let _storage = DiskStorage::new(&dir_path, 0).await.unwrap();
         assert!(dir_path.exists());
         assert!(dir_path.is_dir());
     }
@@ -1425,7 +1587,7 @@ mod tests {
         // Directory already exists
         assert!(temp_dir.path().exists());
 
-        let _storage = DiskStorage::new(temp_dir.path()).await.unwrap();
+        let _storage = DiskStorage::new(temp_dir.path(), 0).await.unwrap();
         assert!(temp_dir.path().exists());
     }
 
@@ -1573,6 +1735,8 @@ mod tests {
         for i in 0..10 {
             let storage_clone = DiskStorage {
                 base_dir: storage.base_dir.clone(),
+                bytes_used: storage.bytes_used.clone(),
+                max_bytes: storage.max_bytes,
             };
             let etag = format!("concurrent_etag_{}", i);
             let data = format!("Data for {}", i).into_bytes();

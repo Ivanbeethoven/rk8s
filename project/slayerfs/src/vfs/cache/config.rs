@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+use crate::chunk::bandwidth::BandwidthConfig;
+use crate::chunk::compress::Compression;
+
 /// Write-back mode controls when data becomes globally visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteBackMode {
@@ -54,6 +57,15 @@ pub struct CacheConfig {
 
     // Disk safety
     pub min_free_disk_bytes: u64,
+
+    // Compression
+    pub compression: Compression,
+
+    // Bandwidth limiting
+    pub bandwidth: BandwidthConfig,
+
+    // Global memory budget (reader + writer combined)
+    pub memory_budget_bytes: u64,
 }
 
 impl Default for CacheConfig {
@@ -76,6 +88,10 @@ impl Default for CacheConfig {
             strict_posix: true,
             writeback_mode: WriteBackMode::UploadBeforeCommit,
             min_free_disk_bytes: 1024 * 1024 * 1024,
+            compression: Compression::None,
+            bandwidth: BandwidthConfig::default(),
+            // Default: read_memory + write_memory = 1.5 GiB, add 512 MiB headroom = 2 GiB
+            memory_budget_bytes: 2 * 1024 * 1024 * 1024,
         }
     }
 }

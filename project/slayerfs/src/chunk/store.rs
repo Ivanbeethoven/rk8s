@@ -1,5 +1,7 @@
 //! Storage backends: asynchronous block-level IO traits and in-memory implementations.
 
+use crate::chunk::bandwidth::BandwidthLimiter;
+use crate::chunk::compress::{Compression, compress, decompress};
 use crate::chunk::page_cache::{PageKey, ReadPageCache};
 use crate::chunk::singleflight::SingleFlight;
 use crate::utils::NumCastExt;
@@ -145,6 +147,8 @@ pub struct ObjectBlockStore<B: ObjectBackend> {
     read_flight: SingleFlight<BlockKey, Bytes>,
     /// Configuration for read strategy
     config: BlockStoreConfig,
+    /// Network bandwidth rate limiter for uploads/downloads
+    bandwidth: BandwidthLimiter,
 }
 
 /// Configuration for ObjectBlockStore read strategy
@@ -160,6 +164,9 @@ pub struct BlockStoreConfig {
     pub page_size: usize,
     /// Maximum number of pages in the read cache (default: 4096 → 256MB with 64KB pages).
     pub page_cache_capacity: usize,
+    /// Block compression algorithm for storage and transfer.
+    /// Blocks are compressed before S3 upload and decompressed on read.
+    pub compression: Compression,
 }
 
 impl Default for BlockStoreConfig {
@@ -169,6 +176,7 @@ impl Default for BlockStoreConfig {
             range_read_threshold: 0.25,  // 25% = 1MB for 4MB blocks
             page_size: 64 * 1024,        // 64KB
             page_cache_capacity: 4096,   // 4096 pages × 64KB = 256MB
+            compression: Compression::None,
         }
     }
 }
@@ -213,6 +221,7 @@ impl<B: ObjectBackend> ObjectBlockStore<B> {
             page_cache,
             read_flight: SingleFlight::new(),
             config,
+            bandwidth: BandwidthLimiter::unlimited(),
         }
     }
     /// Creates a new ObjectBlockStore with custom cache configuration
@@ -245,7 +254,15 @@ impl<B: ObjectBackend> ObjectBlockStore<B> {
             page_cache,
             read_flight: SingleFlight::new(),
             config: store_config,
+            bandwidth: BandwidthLimiter::unlimited(),
         })
+    }
+
+    /// Set the bandwidth limiter for this store
+    #[allow(unused)]
+    pub fn with_bandwidth(mut self, limiter: BandwidthLimiter) -> Self {
+        self.bandwidth = limiter;
+        self
     }
 
     fn key_for(key: BlockKey) -> String {
@@ -276,15 +293,19 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
         }
         parts.extend(chunks);
 
-        // Assemble full block for write-through cache population.
+        // Assemble full block (uncompressed) for cache population.
         let full_block: Vec<u8> = parts.iter().flat_map(|b| b.iter().copied()).collect();
 
+        // Compress for S3 upload if configured
+        let upload_data = compress(&full_block, self.config.compression);
+        // Rate limit upload bandwidth
+        self.bandwidth.acquire_upload(upload_data.len()).await;
         self.client
-            .put_object_vectored(&key_str, parts)
+            .put_object_vectored(&key_str, vec![Bytes::from(upload_data)])
             .await
             .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
 
-        // Write-through: populate read cache so subsequent reads avoid S3 round-trip.
+        // Write-through: populate read cache with uncompressed data.
         let _ = self.block_cache.insert(&key_str, &full_block).await;
 
         Ok(total_len as u64)
@@ -308,15 +329,19 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
         }
         parts.push(Bytes::copy_from_slice(data));
 
-        // Assemble full block for write-through cache.
+        // Assemble full block (uncompressed) for cache.
         let full_block: Vec<u8> = parts.iter().flat_map(|b| b.iter().copied()).collect();
 
+        // Compress for S3 upload
+        let upload_data = compress(&full_block, self.config.compression);
+        // Rate limit upload bandwidth
+        self.bandwidth.acquire_upload(upload_data.len()).await;
         self.client
-            .put_object_vectored(&key_str, parts)
+            .put_object_vectored(&key_str, vec![Bytes::from(upload_data)])
             .await
             .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
 
-        // Write-through: populate read cache.
+        // Write-through: populate read cache with uncompressed data.
         let _ = self.block_cache.insert(&key_str, &full_block).await;
 
         Ok(data.len() as u64)
@@ -416,20 +441,32 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
         // Large read — fetch full block via SingleFlight, then cache it.
         tracing::Span::current().record("strategy", "coalesced_full");
         let client = &self.client;
+        let compression = self.config.compression;
 
         let block_data =
             self.read_flight
                 .execute(key, || async move {
                     let key_str = Self::key_for(key);
-                    let data = client.get_object(&key_str).await.map_err(|e| {
+                    let raw = client.get_object(&key_str).await.map_err(|e| {
                         anyhow::anyhow!("object store get failed: {key_str}, {e:?}")
                     })?;
-                    Ok::<_, anyhow::Error>(Bytes::from(data.unwrap_or_default()))
+                    let raw_bytes = raw.unwrap_or_default();
+                    // Decompress if compression is enabled (auto-detects from header)
+                    let decompressed = if !matches!(compression, Compression::None) {
+                        decompress(&raw_bytes)
+                            .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))?
+                    } else {
+                        raw_bytes
+                    };
+                    Ok::<_, anyhow::Error>(Bytes::from(decompressed))
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("SingleFlight read failed: {e}"))?;
 
-        // Populate cache with the full block for future reads.
+        // Rate limit download bandwidth (applied after receiving data)
+        self.bandwidth.acquire_download(block_data.len()).await;
+
+        // Populate cache with the decompressed full block for future reads.
         let _ = self
             .block_cache
             .insert(&key_str, &block_data.to_vec())
