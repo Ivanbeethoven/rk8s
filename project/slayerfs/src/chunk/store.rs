@@ -1,6 +1,6 @@
 //! Storage backends: asynchronous block-level IO traits and in-memory implementations.
 
-use crate::chunk::page_cache::{ReadPageCache, PageKey};
+use crate::chunk::page_cache::{PageKey, ReadPageCache};
 use crate::chunk::singleflight::SingleFlight;
 use crate::utils::NumCastExt;
 use crate::utils::zero::make_zero_bytes;
@@ -237,7 +237,8 @@ impl<B: ObjectBackend> ObjectBlockStore<B> {
 
         let block_cache = block_on(ChunksCache::new_with_config(cache_config))
             .map_err(|e| anyhow::anyhow!("Failed to create cache: {}", e))?;
-        let page_cache = ReadPageCache::new(store_config.page_cache_capacity, store_config.page_size);
+        let page_cache =
+            ReadPageCache::new(store_config.page_cache_capacity, store_config.page_size);
         Ok(Self {
             client,
             block_cache,
@@ -402,8 +403,7 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
                 let copy_end = copy_end.min(page_data.len());
                 if copy_end > copy_start {
                     let copy_len = copy_end - copy_start;
-                    buf[pos..pos + copy_len]
-                        .copy_from_slice(&page_data[copy_start..copy_end]);
+                    buf[pos..pos + copy_len].copy_from_slice(&page_data[copy_start..copy_end]);
                     pos += copy_len;
                     total_read += copy_len;
                 }

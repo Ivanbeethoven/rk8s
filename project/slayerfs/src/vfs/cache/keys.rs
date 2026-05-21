@@ -11,7 +11,10 @@ pub struct CleanBlockKey {
 
 impl CleanBlockKey {
     pub fn new(slice_id: u64, block_index: u32) -> Self {
-        Self { slice_id, block_index }
+        Self {
+            slice_id,
+            block_index,
+        }
     }
 
     pub fn to_cache_path(&self) -> String {
@@ -36,7 +39,8 @@ impl DirtySliceKey {
     }
 
     pub fn slice_path(&self, root: &std::path::Path) -> std::path::PathBuf {
-        self.dir_path(root).join(format!("{}.slice", self.local_seq))
+        self.dir_path(root)
+            .join(format!("{}.slice", self.local_seq))
     }
 
     pub fn meta_path(&self, root: &std::path::Path) -> std::path::PathBuf {
@@ -45,9 +49,7 @@ impl DirtySliceKey {
 }
 
 /// State machine for a dirty slice in the write-back cache.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DirtySliceState {
     /// Slice is still being written to in memory.
     Open,

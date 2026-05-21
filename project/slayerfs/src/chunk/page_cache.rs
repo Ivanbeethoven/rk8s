@@ -25,7 +25,11 @@ pub const DEFAULT_PAGE_CAPACITY: usize = 4096;
 ///
 /// `(slice_id, block_index, page_index)` where `page_index` is the page number
 /// within the block (block_offset / page_size).
-pub type PageKey = (u64 /*slice_id*/, u32 /*block_index*/, u32 /*page_index*/);
+pub type PageKey = (
+    u64, /*slice_id*/
+    u32, /*block_index*/
+    u32, /*page_index*/
+);
 
 /// A lightweight, process-wide cache for block pages.
 ///

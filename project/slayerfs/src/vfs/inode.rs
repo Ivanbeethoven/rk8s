@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// Cached tracking of per-inode size and allocation state.
 ///
