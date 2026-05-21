@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinSet;
 use tokio::time::{interval, timeout};
 use tracing::{Instrument, warn};
 
@@ -151,8 +152,20 @@ pub(crate) struct SliceState {
     slice_id: Option<u64>,
     /// Offset relative to the chunk start.
     offset: u64,
+    /// Contiguous byte boundary of confirmed uploads (all blocks below this
+    /// offset have completed their S3 PUT).
     uploaded: u64,
-    uploading: Option<(usize, usize)>,
+    /// Highest block index that has been dispatched for upload.  Blocks in
+    /// `[uploaded/block_size .. dispatched_end)` are in-flight.
+    dispatched_end: usize,
+    /// Bitmask of completed block indices.  Bit N is set when block N's upload
+    /// has been confirmed.  Max 64 blocks per slice (256MB/4MB = 64).
+    block_done: u64,
+    /// Number of upload batches currently in-flight.
+    in_flight: u32,
+    /// Set to `true` when a pipeline upload task has been spawned for this
+    /// slice to prevent duplicate top-level upload tasks.
+    upload_task_active: bool,
     data: CacheSlice,
     usage: UsageGuard,
     /// Error occurred at background thread.
@@ -190,7 +203,10 @@ impl SliceState {
             chunk_id,
             offset,
             uploaded: 0,
-            uploading: None,
+            dispatched_end: 0,
+            block_done: 0,
+            in_flight: 0,
+            upload_task_active: false,
             data: CacheSlice::new(config),
             usage: UsageGuard::new(usage),
             err: None,
@@ -210,15 +226,11 @@ impl SliceState {
         }
 
         let size = self.data.block_size();
-        let pending_start = if let Some((_, end)) = self.uploading {
-            end as u64 * size as u64
-        } else {
-            self.uploaded
-        };
+        let pending_start = self.dispatched_end as u64 * size as u64;
 
         let off_to_slice = offset - self.offset;
 
-        // Uploaded blocks cannot be overlapped.
+        // Uploaded/dispatched blocks cannot be overlapped.
         if off_to_slice < pending_start.max(self.uploaded) {
             return None;
         }
@@ -253,11 +265,9 @@ impl SliceState {
 
     pub fn has_idle_block(&self) -> bool {
         let size = self.data.block_size();
-        let pending_end = self
-            .uploading
-            .map(|(_, end)| end as u64 * size as u64)
-            .unwrap_or(self.uploaded)
-            .max(self.uploaded);
+        // Use dispatched_end as the frontier — blocks below this are either
+        // uploaded or in-flight.
+        let pending_end = (self.dispatched_end as u64 * size as u64).max(self.uploaded);
 
         let remaining = self.data.len().saturating_sub(pending_end);
 
@@ -270,7 +280,9 @@ impl SliceState {
 
     pub fn idx_need_upload(&self) -> (usize, usize) {
         let size = self.data.block_size() as u64;
-        let start = (self.uploaded / size) as usize;
+        // Start from dispatched_end (not uploaded) — pipeline allows dispatching
+        // new blocks while earlier ones are still in-flight.
+        let start = self.dispatched_end;
         let end = if matches!(self.state, SliceStatus::Readonly | SliceStatus::Failed) {
             if self.data.len() == 0 {
                 0
@@ -366,7 +378,7 @@ where
             s.frozen_epoch = self.shared.inode.data_epoch();
             s.data.freeze();
 
-            if s.uploading.is_none() && !s.has_idle_block() {
+            if s.in_flight == 0 && !s.has_idle_block() {
                 s.state = SliceStatus::Uploaded;
                 s.err = None;
                 s.notify.notify_waiters();
@@ -381,17 +393,60 @@ where
         froze
     }
 
-    fn advance_upload(&self, len: u64, _uploaded_blocks: Vec<usize>) {
+    /// Called when a block range `[start_idx, end_idx)` finishes uploading.
+    /// Marks the blocks done in the bitmask and advances `uploaded` through
+    /// the highest contiguous completed boundary.
+    fn advance_upload_range(&self, start_idx: usize, end_idx: usize, _len: u64) {
         self.with_mut(|s| {
-            s.uploading = None;
-            s.uploaded += len;
+            // Mark completed blocks in bitmask.
+            for idx in start_idx..end_idx {
+                s.block_done |= 1u64 << idx;
+            }
+            s.in_flight = s.in_flight.saturating_sub(1);
+
+            // Advance `uploaded` through contiguous completed blocks.
+            let block_size = s.data.block_size() as u64;
+            let mut current_block = (s.uploaded / block_size) as usize;
+            while (s.block_done >> current_block) & 1 == 1 {
+                current_block += 1;
+            }
+            let new_uploaded = current_block as u64 * block_size;
+            if new_uploaded > s.uploaded {
+                s.uploaded = new_uploaded;
+            }
 
             // Keep uploaded pages resident until metadata commit removes the slice.
-            // Reads that arrive after upload but before commit still rely on
-            // overlay_dirty() to see the latest mmap/writeback data.
             s.usage.update_bytes(s.data.alloc_bytes());
 
-            if matches!(s.state, SliceStatus::Readonly | SliceStatus::Failed) && !s.has_idle_block()
+            if matches!(s.state, SliceStatus::Readonly | SliceStatus::Failed)
+                && s.in_flight == 0
+                && !s.has_idle_block()
+            {
+                s.state = SliceStatus::Uploaded;
+                s.err = None;
+            }
+            s.notify.notify_waiters();
+        })
+    }
+
+    /// Legacy advance_upload for backward compatibility with single-batch callers.
+    fn advance_upload(&self, len: u64, _uploaded_blocks: Vec<usize>) {
+        self.with_mut(|s| {
+            s.in_flight = s.in_flight.saturating_sub(1);
+            s.uploaded += len;
+
+            // Mark all blocks up to uploaded as done.
+            let block_size = s.data.block_size() as u64;
+            let done_end = (s.uploaded / block_size) as usize;
+            for idx in 0..done_end {
+                s.block_done |= 1u64 << idx;
+            }
+
+            s.usage.update_bytes(s.data.alloc_bytes());
+
+            if matches!(s.state, SliceStatus::Readonly | SliceStatus::Failed)
+                && s.in_flight == 0
+                && !s.has_idle_block()
             {
                 s.state = SliceStatus::Uploaded;
                 s.err = None;
@@ -419,7 +474,7 @@ where
     }
 
     fn can_continue_upload(&self) -> bool {
-        self.with_ref(|s| s.has_idle_block() && s.uploading.is_none())
+        self.with_ref(|s| s.has_idle_block() && !s.upload_task_active)
     }
 
     // Mark data upload failure and wake commit waiters.
@@ -427,7 +482,8 @@ where
         let message = err.to_string();
         self.with_mut(|s| {
             s.state = SliceStatus::Failed;
-            s.uploading = None;
+            s.in_flight = 0;
+            s.upload_task_active = false;
             s.err = Some(message.clone());
 
             s.notify.notify_waiters();
@@ -441,7 +497,7 @@ where
             if matches!(s.state, SliceStatus::Failed | SliceStatus::Committed) {
                 return Ok(None);
             }
-            if s.uploading.is_some() || !s.has_idle_block() {
+            if !s.has_idle_block() {
                 return Ok(None);
             }
 
@@ -454,13 +510,20 @@ where
             s.data.freeze_blocks(start, end);
 
             let data = s.data.collect_pages(start, end)?;
-            s.uploading = Some((start, end));
+            // Pipeline: track dispatched frontier and in-flight count instead
+            // of a single exclusive `uploading` range.
+            s.dispatched_end = end;
+            s.in_flight += 1;
+
+            // Compute the byte offset for this batch based on block indices.
+            let block_size = s.data.block_size() as u64;
+            let batch_offset = start as u64 * block_size;
 
             Ok(Some(UploadPlan {
                 chunk_id: s.chunk_id,
                 data,
                 slice_id: s.slice_id,
-                uploaded: s.uploaded,
+                uploaded: batch_offset,
             }))
         })
     }
@@ -1403,57 +1466,34 @@ where
     /// Spawn a background task to upload a frozen slice's data.
     /// Metadata commit is handled separately by commit_chunk.
     fn spawn_flush_slice(shared: Arc<Shared<B, M>>, slice: Arc<ParkingMutex<SliceState>>) {
+        // Guard against spawning duplicate upload tasks for the same slice.
+        {
+            let mut s = slice.lock();
+            if s.upload_task_active {
+                return;
+            }
+            s.upload_task_active = true;
+        }
         Self::spawn_upload_task(shared, slice);
     }
 
+    /// Pipeline upload task: dispatches multiple block batches concurrently
+    /// using a JoinSet.  As each block range completes, `uploaded` advances
+    /// through contiguous confirmed blocks.  New blocks that become ready
+    /// (from ongoing writes) are dispatched immediately without waiting for
+    /// previous uploads to finish.
     fn spawn_upload_task(shared: Arc<Shared<B, M>>, slice: Arc<ParkingMutex<SliceState>>) {
         tokio::spawn(async move {
-            loop {
+            // Allocate slice_id once, up front, before dispatching any blocks.
+            let slice_id = {
                 let handle = SliceHandle {
                     slice: &slice,
                     shared: &shared,
                 };
-
-                let plan = match handle.prepare_upload() {
-                    Ok(Some(plan)) => plan,
-                    Ok(None) => {
-                        // No more blocks to upload — the slice is now in
-                        // Uploaded state.  Wake the commit_chunk poll loop
-                        // so it picks up this slice without waiting for
-                        // its next sleep cycle.
-                        shared.flush_notify.notify_waiters();
-                        return;
-                    }
-                    Err(err) => {
-                        warn!(error = ?err, "prepare_upload failed");
-                        handle.mark_failed(err);
-                        return;
-                    }
-                };
-
-                let UploadPlan {
-                    chunk_id,
-                    data,
-                    slice_id,
-                    uploaded,
-                } = plan;
-
-                let mut all_chunks = Vec::new();
-                let mut data_len = 0;
-                let mut indices = Vec::new();
-
-                for (index, chunks) in data {
-                    indices.push(index);
-
-                    for chunk in chunks {
-                        data_len += chunk.len();
-                        all_chunks.push(chunk);
-                    }
-                }
-
-                let slice_id = match slice_id {
-                    Some(slice_id) => slice_id,
-                    None => match handle.shared.backend.meta().next_id(SLICE_ID_KEY).await {
+                let existing = handle.with_ref(|s| s.slice_id);
+                match existing {
+                    Some(id) => id,
+                    None => match shared.backend.meta().next_id(SLICE_ID_KEY).await {
                         Ok(id) => {
                             let id = id as u64;
                             handle.set_slice_id(id);
@@ -1464,67 +1504,191 @@ where
                             return;
                         }
                     },
-                };
-
-                // The blocks to upload/write should be relative to the slice itself.
-                // Otherwise, a previously uploaded block may be overwritten.
-                let offset = uploaded;
-
-                // Best-effort persist to local SSD for crash recovery. Use the
-                // final remote slice_id as the local key so commit cleanup can
-                // remove the exact dirty record it just made durable.
-                if let Some(wb) = &shared.write_back {
-                    let ino = shared.inode.ino();
-                    let key = crate::vfs::cache::keys::DirtySliceKey {
-                        ino,
-                        chunk_id,
-                        local_seq: slice_id,
-                        epoch: 0,
-                    };
-                    if let Err(e) = wb.persist_slice(key, all_chunks.clone(), offset).await {
-                        tracing::debug!(ino, chunk_id, slice_id, error = ?e, "SSD persist skipped");
-                    }
                 }
+            };
 
-                let uploader = DataUploader::new(shared.config.layout, &shared.backend);
-                let result = backoff(UPLOAD_MAX_RETRIES, || async {
-                    match uploader
-                        .write_at_vectored(slice_id, offset.into(), &all_chunks)
-                        .await
-                    {
-                        Ok(_) => Ok(()),
+            // Result type for each upload sub-task: (start_idx, end_idx, bytes_len)
+            type UploadResult = Result<(usize, usize, u64), anyhow::Error>;
+            let mut join_set: JoinSet<UploadResult> = JoinSet::new();
+
+            loop {
+                // Dispatch all currently-available blocks.
+                loop {
+                    let handle = SliceHandle {
+                        slice: &slice,
+                        shared: &shared,
+                    };
+
+                    let plan = match handle.prepare_upload() {
+                        Ok(Some(plan)) => plan,
+                        Ok(None) => break,
                         Err(err) => {
-                            warn!(
-                                chunk_id,
-                                slice_id,
-                                offset,
-                                len = data_len,
-                                error = ?err,
-                                "upload failed, retrying"
-                            );
-                            Err(MetaError::ContinueRetry(RetryReason::VersionConflict))
+                            warn!(error = ?err, "prepare_upload failed");
+                            handle.mark_failed(err);
+                            join_set.abort_all();
+                            return;
+                        }
+                    };
+
+                    let UploadPlan {
+                        chunk_id,
+                        data,
+                        slice_id: _,
+                        uploaded: batch_offset,
+                    } = plan;
+
+                    let mut all_chunks = Vec::new();
+                    let mut data_len = 0u64;
+                    let mut start_idx = usize::MAX;
+                    let mut end_idx = 0usize;
+
+                    for (index, chunks) in data {
+                        if index < start_idx {
+                            start_idx = index;
+                        }
+                        if index + 1 > end_idx {
+                            end_idx = index + 1;
+                        }
+                        for chunk in chunks {
+                            data_len += chunk.len() as u64;
+                            all_chunks.push(chunk);
                         }
                     }
-                })
-                .await;
 
-                match result {
-                    Ok(()) => {
-                        handle.advance_upload(data_len as u64, indices);
+                    // Spawn a sub-task for this batch of blocks.
+                    let shared2 = shared.clone();
+                    let wb_ref = shared.write_back.clone();
+                    let ino = shared.inode.ino();
+                    let layout = shared.config.layout;
+                    join_set.spawn(async move {
+                        // Best-effort SSD persist for crash recovery.
+                        if let Some(wb) = &wb_ref {
+                            let key = crate::vfs::cache::keys::DirtySliceKey {
+                                ino,
+                                chunk_id,
+                                local_seq: slice_id,
+                                epoch: 0,
+                            };
+                            if let Err(e) =
+                                wb.persist_slice(key, all_chunks.clone(), batch_offset).await
+                            {
+                                tracing::debug!(
+                                    ino, chunk_id, slice_id, error = ?e,
+                                    "SSD persist skipped"
+                                );
+                            }
+                        }
+
+                        let uploader = DataUploader::new(layout, &shared2.backend);
+                        let result = backoff(UPLOAD_MAX_RETRIES, || async {
+                            match uploader
+                                .write_at_vectored(slice_id, batch_offset.into(), &all_chunks)
+                                .await
+                            {
+                                Ok(_) => Ok(()),
+                                Err(err) => {
+                                    warn!(
+                                        chunk_id,
+                                        slice_id,
+                                        offset = batch_offset,
+                                        len = data_len,
+                                        error = ?err,
+                                        "pipeline upload failed, retrying"
+                                    );
+                                    Err(MetaError::ContinueRetry(RetryReason::VersionConflict))
+                                }
+                            }
+                        })
+                        .await;
+
+                        match result {
+                            Ok(()) => Ok((start_idx, end_idx, data_len)),
+                            Err(err) => Err(anyhow::anyhow!(err)),
+                        }
+                    });
+                }
+
+                // Check if we're done (no in-flight, no more blocks).
+                let is_done = {
+                    let s = slice.lock();
+                    s.in_flight == 0
+                        && !s.has_idle_block()
+                        && matches!(
+                            s.state,
+                            SliceStatus::Uploaded | SliceStatus::Committed | SliceStatus::Failed
+                        )
+                };
+                if is_done && join_set.is_empty() {
+                    slice.lock().upload_task_active = false;
+                    shared.flush_notify.notify_waiters();
+                    return;
+                }
+
+                if join_set.is_empty() {
+                    // No in-flight uploads and no blocks to dispatch, but slice
+                    // isn't done yet (still Writable/Readonly with no idle blocks).
+                    // This means writes haven't filled the next block yet.
+                    // Wait for notification that new data arrived or slice was frozen.
+                    let handle = SliceHandle {
+                        slice: &slice,
+                        shared: &shared,
+                    };
+                    // Check one more time after waking.
+                    let has_work = handle.with_ref(|s| s.has_idle_block());
+                    if !has_work {
+                        // If the slice is frozen with nothing in flight, we're done.
+                        let done_check = handle.with_ref(|s| {
+                            matches!(
+                                s.state,
+                                SliceStatus::Uploaded
+                                    | SliceStatus::Committed
+                                    | SliceStatus::Failed
+                            )
+                        });
+                        if done_check {
+                            slice.lock().upload_task_active = false;
+                            shared.flush_notify.notify_waiters();
+                            return;
+                        }
+                        // Wait briefly for new data, then re-check.
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    continue;
+                }
+
+                // Wait for at least one upload to complete.
+                match join_set.join_next().await {
+                    Some(Ok(Ok((start_idx, end_idx, data_len)))) => {
+                        let handle = SliceHandle {
+                            slice: &slice,
+                            shared: &shared,
+                        };
+                        handle.advance_upload_range(start_idx, end_idx, data_len);
                         handle.try_commit().await;
                     }
-                    Err(err) => {
-                        warn!(
-                            chunk_id,
-                            slice_id,
-                            offset,
-                            len = data_len,
-                            error = ?err,
-                            "upload failed after retries"
-                        );
-                        handle.mark_failed(anyhow::anyhow!(err));
+                    Some(Ok(Err(err))) => {
+                        let handle = SliceHandle {
+                            slice: &slice,
+                            shared: &shared,
+                        };
+                        warn!(error = ?err, "pipeline upload batch failed after retries");
+                        handle.mark_failed(err);
+                        join_set.abort_all();
                         return;
                     }
+                    Some(Err(join_err)) => {
+                        let handle = SliceHandle {
+                            slice: &slice,
+                            shared: &shared,
+                        };
+                        handle.mark_failed(anyhow::anyhow!(
+                            "upload task panicked: {}",
+                            join_err
+                        ));
+                        join_set.abort_all();
+                        return;
+                    }
+                    None => unreachable!("join_set is not empty"),
                 }
             }
         });

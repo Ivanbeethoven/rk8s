@@ -135,26 +135,26 @@ install_mount_helper() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
-src="\${1:-}"
-target="\${2:-}"
+src="${1:-}"
+target="${2:-}"
 shift 2 || true
 
-config_path="\${SLAYERFS_CONFIG_PATH:-/run/slayerfs/config.yaml}"
-log_file="\${SLAYERFS_LOG_FILE:-/artifacts/slayerfs.log}"
+config_path="${SLAYERFS_CONFIG_PATH:-/run/slayerfs/config.yaml}"
+log_file="${SLAYERFS_LOG_FILE:-/artifacts/slayerfs.log}"
 
-mkdir -p "\$target" "\$(dirname "\$log_file")"
+mkdir -p "$target" "$(dirname "$log_file")"
 
 # Enable FUSE op tracing when PERF_FUSE_OPS_LOG=1 for detailed profiling
-if [[ "\${PERF_FUSE_OPS_LOG:-0}" == "1" ]]; then
-    export RUST_LOG="\${RUST_LOG:-slayerfs=info,rfuse3::raw::logfs=debug}"
+if [[ "${PERF_FUSE_OPS_LOG:-0}" == "1" ]]; then
+    export RUST_LOG="${RUST_LOG:-slayerfs=info,rfuse3::raw::logfs=debug}"
 else
-    export RUST_LOG="\${RUST_LOG:-error}"
+    export RUST_LOG="${RUST_LOG:-error}"
 fi
 
-/usr/local/bin/slayerfs mount --privileged --config "\$config_path" "\$target" >>"\$log_file" 2>&1 &
-sleep "\${SLAYERFS_MOUNT_WAIT_SECS:-1}"
+/usr/local/bin/slayerfs mount --privileged --config "$config_path" "$target" >>"$log_file" 2>&1 &
+sleep "${SLAYERFS_MOUNT_WAIT_SECS:-1}"
 exit 0
 EOF
     chmod +x "$helper"
