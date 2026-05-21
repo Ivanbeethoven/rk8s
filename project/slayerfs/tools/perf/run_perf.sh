@@ -18,6 +18,7 @@ CONFIG_PATH="$PERF_DIR/config.yaml"
 FLAME_DIR="$PERF_DIR/flame"
 MNT_DIR="$PERF_DIR/mnt"
 DATA_DIR="$PERF_DIR/data"
+RESULTS_DIR="$PERF_DIR/results"
 
 REDIS_PORT="${REDIS_PORT:-16379}"
 RUSTFS_S3_PORT="${RUSTFS_S3_PORT:-19000}"
@@ -94,7 +95,7 @@ fi
 # ---- Setup ----
 info "setting up environment..."
 rm -rf "$PERF_DIR"
-mkdir -p "$PERF_DIR" "$FLAME_DIR" "$MNT_DIR" "$DATA_DIR"
+mkdir -p "$PERF_DIR" "$FLAME_DIR" "$MNT_DIR" "$DATA_DIR" "$RESULTS_DIR"
 
 # ---- Start infrastructure ----
 info "starting redis + rustfs..."
@@ -166,8 +167,10 @@ rm -rf "$MNT_DIR"/* 2>/dev/null || true
 run_fio() {
     local label="$1"; shift
     info "  fio $label..."
+    local tmp_json="$RESULTS_DIR/fio-${label}.json.tmp"
     fio "$@" --directory="$MNT_DIR" --runtime="$RUNTIME" --time_based \
         --group_reporting --eta=never --output-format=json 2>/dev/null \
+        | tee "$tmp_json" \
         | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
@@ -179,6 +182,7 @@ for j in d.get('jobs',[]):
             lat=j[op]['lat_ns']['mean']/1e6
             print(f'    {op}: {bw/1024/1024:.0f} MiB/s, iops={iops:.1f}, lat_avg={lat:.2f}ms')
 " 2>/dev/null || true
+    mv "$tmp_json" "$RESULTS_DIR/fio-${label}.json" 2>/dev/null || true
 }
 
 # =========================================================================
@@ -187,7 +191,7 @@ for j in d.get('jobs',[]):
 if [ "$SKIP_ONCPU" -eq 0 ]; then
     info "=== ON-CPU profiling (perf record -F 99 --call-graph dwarf) ==="
 
-    perf record -F 99 --call-graph dwarf -a -o "$FLAME_DIR/oncpu-perf.data" &
+    perf record -F 99 --call-graph fp -a -o "$FLAME_DIR/oncpu-perf.data" &
     PERF_ONCPU_PID=$!
     sleep 1
 
@@ -204,7 +208,7 @@ if [ "$SKIP_ONCPU" -eq 0 ]; then
         info "generating on-CPU flame graph..."
         perf script -i "$FLAME_DIR/oncpu-perf.data" 2>/dev/null \
             | inferno-collapse-perf 2>/dev/null \
-            > "$FLAME_DIR/oncpu.folded"
+            > "$FLAME_DIR/oncpu.folded" || true
 
         grep "slayerfs" "$FLAME_DIR/oncpu.folded" > "$FLAME_DIR/oncpu-slayerfs.folded" 2>/dev/null || true
 
@@ -268,6 +272,19 @@ if [ -f "$FLAME_DIR/oncpu-slayerfs.folded" ]; then
     info "=== crypto overhead ==="
     python3 "$SCRIPT_DIR/analyze_flame.py" --crypto "$FLAME_DIR/oncpu-slayerfs.folded" 2>/dev/null || true
 fi
+
+# =========================================================================
+# LLM-readable report
+# =========================================================================
+info "=== LLM-readable report ==="
+HOTSPOTS_ARG=""
+if [ -f "$FLAME_DIR/oncpu-slayerfs.folded" ]; then
+    HOTSPOTS_ARG="--hotspots $FLAME_DIR/oncpu-slayerfs.folded"
+fi
+python3 "$SCRIPT_DIR/analyze_perf.py" --llm $HOTSPOTS_ARG "$PERF_DIR" \
+    > "$PERF_DIR/llm-report.txt" 2>/dev/null || true
+info "  LLM report: $PERF_DIR/llm-report.txt"
+cat "$PERF_DIR/llm-report.txt" 2>/dev/null || true
 
 # =========================================================================
 # Summary

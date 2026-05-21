@@ -6,7 +6,7 @@ Generates a detailed performance profile report from fio JSON results,
 slayerfs logs, and optional perf profiling data.
 
 Usage:
-    # Analyze a single run
+    # Analyze a single run (markdown)
     python3 analyze_perf.py /path/to/perf-run-XXXXX/
 
     # Compare two runs
@@ -14,15 +14,23 @@ Usage:
 
     # Analyze with bottleneck identification
     python3 analyze_perf.py --bottleneck /path/to/perf-run-XXXXX/
+
+    # LLM-readable indented text
+    python3 analyze_perf.py --llm /path/to/perf-run-XXXXX/
+    python3 analyze_perf.py --llm --compare /path/to/baseline/ /path/to/current/ \\
+        --hotspots /tmp/slayerfs-perf/flame/oncpu-slayerfs.folded
 """
 
 import argparse
 import json
 import os
 import pathlib
+import re
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 
 @dataclass
@@ -540,6 +548,354 @@ def generate_comparison_report(
     return "\n".join(lines) + "\n"
 
 
+# ---------------------------------------------------------------------------
+# LLM-readable indented text output
+# ---------------------------------------------------------------------------
+
+def _parse_hotspots(folded_path: str) -> dict:
+    """Parse a folded stack file into top functions + leaf functions."""
+    func_counts: Counter[str] = Counter()
+    leaf_counts: Counter[str] = Counter()
+    with open(folded_path) as f:
+        for line in f:
+            parts = line.strip().rsplit(" ", 1)
+            if len(parts) != 2:
+                continue
+            stack, count_str = parts
+            try:
+                count = int(count_str)
+            except ValueError:
+                continue
+            frames = stack.split(";")
+            for frame in frames:
+                short = frame.rsplit("(", 1)[0].rsplit("+", 1)[0].strip()
+                if short and not short.startswith("["):
+                    func_counts[short] += count
+            if frames:
+                leaf = frames[-1].rsplit("(", 1)[0].rsplit("+", 1)[0].strip()
+                if leaf and not leaf.startswith("["):
+                    leaf_counts[leaf] += count
+    return {
+        "top": func_counts.most_common(15),
+        "leaves": leaf_counts.most_common(10),
+    }
+
+
+def _crypto_pct(folded_path: str) -> float:
+    """Return crypto overhead percentage from folded stacks."""
+    total = 0
+    crypto = 0
+    crypto_kw = ("sha256", "md5::", "crc_fast", "hmac", "sha2::", "digest::")
+    with open(folded_path) as f:
+        for line in f:
+            parts = line.strip().rsplit(" ", 1)
+            if len(parts) != 2:
+                continue
+            stack, count_str = parts
+            try:
+                cnt = int(count_str)
+            except ValueError:
+                continue
+            total += cnt
+            if any(x in stack for x in crypto_kw):
+                crypto += cnt
+    return (crypto * 100 / total) if total > 0 else 0.0
+
+
+def _llm_throughput(results: list) -> list[str]:
+    """Throughput rows as indented text."""
+    lines = ["Throughput:"]
+    for r in results:
+        parts = [f"  {r.name:<14} {r.rw:<10} bs={r.bs} jobs={r.numjobs}"]
+        if r.read_bw_bytes > 0:
+            parts.append(f"read {fmt_bw(r.read_bw_bytes):>10s}  {fmt_iops(r.read_iops):>6s} IOPS")
+        if r.write_bw_bytes > 0:
+            parts.append(f"write {fmt_bw(r.write_bw_bytes):>10s}  {fmt_iops(r.write_iops):>6s} IOPS")
+        lines.append("  | ".join(parts))
+    return lines
+
+
+def _llm_latency(results: list) -> list[str]:
+    """Latency summary as indented text, split read/write."""
+    lines = []
+    # Read
+    read_rows = []
+    for r in results:
+        if not r.read_lat_percentiles:
+            continue
+        p = r.read_lat_percentiles
+        read_rows.append(
+            f"  {r.name:<14} mean={fmt_lat(r.read_lat_mean_ns):>8s}  "
+            f"p50={fmt_lat(p.get('50.000000', 0)):>8s}  "
+            f"p99={fmt_lat(p.get('99.000000', 0)):>8s}  "
+            f"p99.9={fmt_lat(p.get('99.900000', 0)):>8s}"
+        )
+    if read_rows:
+        lines.append("Latency (read):")
+        lines.extend(read_rows)
+    # Write
+    write_rows = []
+    for r in results:
+        if not r.write_lat_percentiles:
+            continue
+        p = r.write_lat_percentiles
+        write_rows.append(
+            f"  {r.name:<14} mean={fmt_lat(r.write_lat_mean_ns):>8s}  "
+            f"p50={fmt_lat(p.get('50.000000', 0)):>8s}  "
+            f"p99={fmt_lat(p.get('99.000000', 0)):>8s}  "
+            f"p99.9={fmt_lat(p.get('99.900000', 0)):>8s}"
+        )
+    if write_rows:
+        lines.append("Latency (write):")
+        lines.extend(write_rows)
+    return lines
+
+
+def _llm_bottlenecks(results: list) -> list[str]:
+    """Heuristic bottlenecks as indented text with severity tags."""
+    lines = ["Bottlenecks:"]
+    found = 0
+
+    for r in results:
+        if r.read_lat_percentiles:
+            p50 = r.read_lat_percentiles.get("50.000000", 0) / 1e6
+            p99 = r.read_lat_percentiles.get("99.000000", 0) / 1e6
+            p999 = r.read_lat_percentiles.get("99.900000", 0) / 1e6
+
+            if p50 > 100:
+                found += 1
+                lines.append(f"  [HIGH] {r.name}: read P50={p50:.0f}ms — each 4MB block = full S3 GET")
+                lines.append(f"    → target: src/vfs/cache/prefetch.rs, src/chunk/store.rs")
+
+            if p99 > p50 * 5:
+                found += 1
+                lines.append(f"  [MED]  {r.name}: read P99/P50={p99/p50:.1f}x tail — S3 GET retry or cold-block miss")
+                lines.append(f"    → target: src/cadapter/s3.rs, src/vfs/cache/lru_cache.rs")
+
+            if p999 > p99 * 3:
+                found += 1
+                lines.append(f"  [LOW]  {r.name}: read P99.9/P99={p999/p99:.1f}x — GC pause or TCP retransmit")
+
+            if r.numjobs > 1 and r.read_bw_bytes > 0:
+                per_job = r.read_bw_bytes / r.numjobs / (1024 * 1024)
+                if per_job < 50:
+                    found += 1
+                    lines.append(f"  [MED]  {r.name}: read {per_job:.0f} MiB/s/job (×{r.numjobs} jobs) — scaling bottleneck")
+                    lines.append(f"    → target: src/cadapter/s3.rs (connection pool), src/vfs/cache/prefetch.rs")
+
+        if r.write_lat_percentiles:
+            p50 = r.write_lat_percentiles.get("50.000000", 0) / 1e6
+            p99 = r.write_lat_percentiles.get("99.000000", 0) / 1e6
+
+            if p50 < 10 and p99 > 100:
+                found += 1
+                ratio = p99 / max(p50, 0.01)
+                lines.append(f"  [HIGH] {r.name}: write P50={p50:.1f}ms P99={p99:.0f}ms ({ratio:.0f}x gap) — write buffer stall")
+                lines.append(f"    → target: src/vfs/io/writer.rs (buffer hard limit, auto_flush)")
+
+            if p99 > 500:
+                found += 1
+                lines.append(f"  [HIGH] {r.name}: write P99={p99:.0f}ms >500ms threshold")
+                lines.append(f"    → increase write buffer capacity or S3 upload concurrency")
+                lines.append(f"    → target: src/vfs/io/writer.rs, src/vfs/cache/mod.rs")
+
+    if found == 0:
+        lines.append("  (no significant bottlenecks detected)")
+    return lines
+
+
+def _llm_roadmap(results: list) -> list[str]:
+    """Prioritized optimization items as indented text."""
+    items: list[tuple[int, str, str, str, str]] = []
+
+    for r in results:
+        if r.write_lat_percentiles:
+            p99 = r.write_lat_percentiles.get("99.000000", 0) / 1e6
+            if p99 > 300:
+                items.append((1, "Write Buffer Backpressure", "HIGH", "MED",
+                              "src/vfs/io/writer.rs"))
+        if r.read_lat_percentiles:
+            p50 = r.read_lat_percentiles.get("50.000000", 0) / 1e6
+            if p50 > 50 and "rand" in r.rw:
+                items.append((2, "Random Read Latency", "HIGH", "HIGH",
+                              "src/vfs/cache/prefetch.rs, src/chunk/store.rs"))
+            elif p50 > 10 and "seq" in r.rw:
+                items.append((3, "Sequential Read Pipeline", "MED", "MED",
+                              "src/vfs/cache/prefetch.rs"))
+        if r.numjobs > 1 and r.read_bw_bytes > 0:
+            per_job = r.read_bw_bytes / r.numjobs / (1024 * 1024)
+            if per_job < 40:
+                items.append((4, "Parallel Read Scaling", "MED", "MED",
+                              "src/cadapter/s3.rs"))
+
+    seen = set()
+    lines = ["Optimization Roadmap:"]
+    priority = 1
+    for _, title, impact, effort, files in sorted(items, key=lambda x: x[0]):
+        if title in seen:
+            continue
+        seen.add(title)
+        lines.append(f"  {priority}. {title} [impact={impact}, effort={effort}]")
+        lines.append(f"     {files}")
+        priority += 1
+
+    if not seen:
+        lines.append("  (all metrics within expected range)")
+    return lines
+
+
+def _llm_comparison(baseline: list, current: list) -> list[str]:
+    """Side-by-side comparison as indented text."""
+    base_map = {r.name: r for r in baseline}
+    lines = ["Comparison (baseline → current):"]
+    found = 0
+
+    for c in current:
+        b = base_map.get(c.name)
+        if not b:
+            continue
+        # Read BW
+        if c.read_bw_bytes > 0 and b.read_bw_bytes > 0:
+            delta = (c.read_bw_bytes - b.read_bw_bytes) / b.read_bw_bytes * 100
+            tag = "REGRESSION" if delta < -5 else ("GAIN" if delta > 5 else "")
+            tag_str = f"  *** {tag}" if tag else ""
+            lines.append(
+                f"  {c.name:<14} read_bw:  {fmt_bw(b.read_bw_bytes):>10s} → {fmt_bw(c.read_bw_bytes):>10s} "
+                f"({delta:+.1f}%){tag_str}"
+            )
+            found += 1
+        # Write BW
+        if c.write_bw_bytes > 0 and b.write_bw_bytes > 0:
+            delta = (c.write_bw_bytes - b.write_bw_bytes) / b.write_bw_bytes * 100
+            tag = "REGRESSION" if delta < -5 else ("GAIN" if delta > 5 else "")
+            tag_str = f"  *** {tag}" if tag else ""
+            lines.append(
+                f"  {c.name:<14} write_bw: {fmt_bw(b.write_bw_bytes):>10s} → {fmt_bw(c.write_bw_bytes):>10s} "
+                f"({delta:+.1f}%){tag_str}"
+            )
+            found += 1
+        # Read P99
+        if c.read_lat_percentiles and b.read_lat_percentiles:
+            c99 = c.read_lat_percentiles.get("99.000000", 0)
+            b99 = b.read_lat_percentiles.get("99.000000", 0)
+            if b99 > 0:
+                delta = (c99 - b99) / b99 * 100
+                tag = "REGRESSION" if delta > 10 else ("GAIN" if delta < -10 else "")
+                tag_str = f"  *** {tag}" if tag else ""
+                lines.append(
+                    f"  {c.name:<14} read_p99: {fmt_lat(b99):>8s} → {fmt_lat(c99):>8s} "
+                    f"({delta:+.1f}%){tag_str}"
+                )
+                found += 1
+        # Write P99
+        if c.write_lat_percentiles and b.write_lat_percentiles:
+            c99 = c.write_lat_percentiles.get("99.000000", 0)
+            b99 = b.write_lat_percentiles.get("99.000000", 0)
+            if b99 > 0:
+                delta = (c99 - b99) / b99 * 100
+                tag = "REGRESSION" if delta > 10 else ("GAIN" if delta < -10 else "")
+                tag_str = f"  *** {tag}" if tag else ""
+                lines.append(
+                    f"  {c.name:<14} write_p99:{fmt_lat(b99):>8s} → {fmt_lat(c99):>8s} "
+                    f"({delta:+.1f}%){tag_str}"
+                )
+                found += 1
+
+    if found == 0:
+        lines.append("  (no comparable workloads)")
+    return lines
+
+
+def generate_llm_text(
+    artifact_dir: pathlib.Path,
+    hotspots_path: Optional[str] = None,
+    baseline_results: Optional[list] = None,
+    current_results: Optional[list] = None,
+) -> str:
+    """Generate an LLM-readable indented text performance profile."""
+    out: list[str] = []
+
+    # Header
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    out.append(f"SlayerFS Performance Profile: {artifact_dir.name}")
+    out.append(f"Generated: {ts}")
+    out.append("")
+
+    # Use provided results or parse from artifact_dir
+    if current_results:
+        results = current_results
+    else:
+        results = []
+        results_dir = artifact_dir / "results"
+        if results_dir.exists():
+            for f in sorted(results_dir.glob("fio*.json")):
+                r = parse_fio_json(f)
+                if r:
+                    results.append(r)
+
+    if not results:
+        out.append("(no fio results found)")
+        return "\n".join(out) + "\n"
+
+    # Throughput
+    out.extend(_llm_throughput(results))
+    out.append("")
+
+    # Latency
+    out.extend(_llm_latency(results))
+    out.append("")
+
+    # Bottlenecks
+    out.extend(_llm_bottlenecks(results))
+    out.append("")
+
+    # Hotspots (from flame graph folded data)
+    if hotspots_path and pathlib.Path(hotspots_path).exists():
+        try:
+            hs = _parse_hotspots(hotspots_path)
+            out.append(f"Hotspots (on-CPU top {len(hs['top'])}):")
+            total_top = sum(c for _, c in hs["top"])
+            for func, cnt in hs["top"]:
+                pct = (cnt * 100 / total_top) if total_top > 0 else 0
+                out.append(f"  {cnt:>10d}  {pct:5.1f}%  {func[:100]}")
+            out.append("")
+            if hs["leaves"]:
+                out.append(f"Hotspots (leaf functions, top {len(hs['leaves'])}):")
+                for func, cnt in hs["leaves"]:
+                    out.append(f"  {cnt:>10d}  {func[:100]}")
+                out.append("")
+
+            crypto = _crypto_pct(hotspots_path)
+            flag = " *** OVER 10% — disable SigV4 payload signing!" if crypto > 10 else ""
+            out.append(f"Crypto overhead: {crypto:.1f}% of on-CPU samples{flag}")
+            out.append("")
+        except Exception:
+            pass
+
+    # Optimization roadmap
+    out.extend(_llm_roadmap(results))
+    out.append("")
+
+    # Comparison
+    if baseline_results:
+        out.extend(_llm_comparison(baseline_results, results))
+        out.append("")
+
+    return "\n".join(out) + "\n"
+
+
+def _load_results_from_dir(d: pathlib.Path) -> list:
+    """Parse all fio JSON results from a directory."""
+    results = []
+    results_dir = d / "results"
+    if results_dir.exists():
+        for f in sorted(results_dir.glob("fio*.json")):
+            r = parse_fio_json(f)
+            if r:
+                results.append(r)
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="SlayerFS performance analysis tool"
@@ -561,12 +917,41 @@ def main():
         help="Include bottleneck identification and optimization roadmap",
     )
     parser.add_argument(
+        "--llm",
+        action="store_true",
+        help="Output indented text format for LLM consumption",
+    )
+    parser.add_argument(
+        "--hotspots",
+        metavar="FOLDED",
+        help="Path to on-CPU folded stack file (for --llm mode)",
+    )
+    parser.add_argument(
         "--output", "-o",
         help="Output file (default: stdout)",
     )
     args = parser.parse_args()
 
-    if args.compare:
+    if args.llm:
+        # LLM-readable indented text mode
+        if args.compare:
+            baseline_results = _load_results_from_dir(pathlib.Path(args.compare[0]))
+            current_results = _load_results_from_dir(pathlib.Path(args.compare[1]))
+            report = generate_llm_text(
+                pathlib.Path(args.compare[1]),
+                hotspots_path=args.hotspots,
+                baseline_results=baseline_results,
+                current_results=current_results,
+            )
+        elif args.artifact_dir:
+            report = generate_llm_text(
+                pathlib.Path(args.artifact_dir),
+                hotspots_path=args.hotspots,
+            )
+        else:
+            parser.print_help()
+            sys.exit(1)
+    elif args.compare:
         report = generate_comparison_report(
             pathlib.Path(args.compare[0]),
             pathlib.Path(args.compare[1]),
