@@ -41,6 +41,12 @@ use rfuse3::{FileType as FuseFileType, SetAttr, Timestamp};
 use tracing::{debug, error, info, trace, warn};
 
 const FUSE_CACHE_TTL: Duration = Duration::ZERO;
+
+/// Virtual inode for the `.stats` file exposed at the mount root.
+/// Uses a high inode number unlikely to collide with real inodes.
+const STATS_INODE: u64 = 0x7FFF_FFFF_0000_0003;
+/// Name of the virtual stats file.
+const STATS_FILENAME: &str = ".stats";
 #[cfg(all(test, target_os = "linux"))]
 mod mount_tests {
     use super::*;
@@ -329,6 +335,41 @@ where
             name = %name_str,
             "fuse.lookup"
         );
+
+        // Virtual `.stats` file at mount root
+        if parent as i64 == self.root_ino() && name_str == STATS_FILENAME {
+            let now: Timestamp = std::time::SystemTime::now().into();
+            let attr = rfuse3::raw::reply::FileAttr {
+                ino: STATS_INODE,
+                size: 0,
+                blocks: 0,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                kind: FuseFileType::RegularFile,
+                perm: 0o444,
+                nlink: 1,
+                uid: req.uid,
+                gid: req.gid,
+                rdev: 0,
+                blksize: 4096,
+                #[cfg(target_os = "macos")]
+                crtime: now,
+                #[cfg(target_os = "macos")]
+                flags: 0,
+            };
+            return Ok(ReplyEntry {
+                ttl: Duration::from_secs(1),
+                attr,
+                generation: 0,
+            });
+        }
+
+        let _timer = crate::vfs::stats::OpTimer::new(
+            &self.stats().fuse_lookup_ops,
+            &self.stats().fuse_lookup_lat_us,
+        );
+
         let name_str = name.to_string_lossy();
         let child = self.child_of(parent as i64, name_str.as_ref()).await;
         let Some(child_ino) = child else {
@@ -349,6 +390,15 @@ where
 
     // Open file: allocate a handle for read/write operations.
     async fn open(&self, _req: Request, ino: u64, flags: u32) -> FuseResult<ReplyOpen> {
+        // Virtual .stats file: allow read-only open, no real file handle needed.
+        if ino == STATS_INODE {
+            let accmode = flags & (libc::O_ACCMODE as u32);
+            if accmode != (libc::O_RDONLY as u32) {
+                return Err(libc::EACCES.into());
+            }
+            return Ok(ReplyOpen { fh: 0, flags: 0 });
+        }
+
         debug!(ino, flags, "fuse.open");
         // Verify the inode exists and is a file
         let Some(attr) = self.stat_ino(ino as i64).await else {
@@ -416,6 +466,21 @@ where
         offset: u64,
         size: u32,
     ) -> FuseResult<ReplyData> {
+        // Virtual .stats file
+        if ino == STATS_INODE {
+            let content = self.stats().render();
+            let bytes = content.as_bytes();
+            let start = (offset as usize).min(bytes.len());
+            let end = (start + size as usize).min(bytes.len());
+            return Ok(ReplyData {
+                data: Bytes::copy_from_slice(&bytes[start..end]),
+            });
+        }
+
+        let _timer = crate::vfs::stats::OpTimer::new(
+            &self.stats().fuse_read_ops,
+            &self.stats().fuse_read_lat_us,
+        );
         debug!(ino, fh, offset, size, "fuse.read");
 
         let data = if fh != 0 {
@@ -458,6 +523,9 @@ where
             out
         };
 
+        self.stats()
+            .fuse_read_bytes
+            .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(ReplyData {
             data: Bytes::from(data),
         })
@@ -485,6 +553,10 @@ where
         write_flags: u32,
         _flags: u32,
     ) -> FuseResult<ReplyWrite> {
+        let _timer = crate::vfs::stats::OpTimer::new(
+            &self.stats().fuse_write_ops,
+            &self.stats().fuse_write_lat_us,
+        );
         debug!(
             ino,
             fh,
@@ -532,6 +604,9 @@ where
                 .await
                 .map_err(Into::<Errno>::into)? as u32
         };
+        self.stats()
+            .fuse_write_bytes
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(ReplyWrite { written: n })
     }
 
@@ -543,6 +618,34 @@ where
         fh: Option<u64>,
         _flags: u32,
     ) -> FuseResult<ReplyAttr> {
+        // Virtual .stats file
+        if ino == STATS_INODE {
+            let now: Timestamp = std::time::SystemTime::now().into();
+            let attr = rfuse3::raw::reply::FileAttr {
+                ino: STATS_INODE,
+                size: 0,
+                blocks: 0,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                kind: FuseFileType::RegularFile,
+                perm: 0o444,
+                nlink: 1,
+                uid: req.uid,
+                gid: req.gid,
+                rdev: 0,
+                blksize: 4096,
+                #[cfg(target_os = "macos")]
+                crtime: now,
+                #[cfg(target_os = "macos")]
+                flags: 0,
+            };
+            return Ok(ReplyAttr {
+                ttl: Duration::from_secs(1),
+                attr,
+            });
+        }
+
         debug!(unique = req.unique, ino, fh = ?fh, "fuse.getattr");
         let vattr_opt = self.stat_ino(ino as i64).await;
         let vattr = if let Some(vattr) = vattr_opt {

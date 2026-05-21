@@ -25,6 +25,7 @@ pub(crate) mod inode;
 pub(crate) mod io;
 pub(crate) mod meta_ops;
 pub mod sdk;
+pub mod stats;
 // Module implementation TODOs remain.
 
 pub(crate) use inode::Inode;

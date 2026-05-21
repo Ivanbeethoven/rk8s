@@ -266,6 +266,7 @@ where
     modified: ModifiedTracker,
     append_locks: DashMap<i64, Arc<Mutex<()>>>,
     read_cache: Arc<crate::vfs::cache::lru_cache::LruReadCache>,
+    pub(crate) stats: Arc<crate::vfs::stats::FsStats>,
 }
 
 impl<S, M> VfsState<S, M>
@@ -350,6 +351,7 @@ where
             read_cache: Arc::new(crate::vfs::cache::lru_cache::LruReadCache::new(
                 256 * 1024 * 1024,
             )),
+            stats: Arc::new(crate::vfs::stats::FsStats::new()),
         }
     }
 
@@ -703,6 +705,11 @@ where
 
     pub(crate) fn root_ino(&self) -> i64 {
         self.core.root
+    }
+
+    /// Access the shared statistics counters.
+    pub fn stats(&self) -> &Arc<crate::vfs::stats::FsStats> {
+        &self.state.stats
     }
 
     pub(crate) fn meta_layer(&self) -> &M {

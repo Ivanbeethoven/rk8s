@@ -13,6 +13,7 @@ members = [
     "libscheduler",
     "common",
     "slayerfs",
+    "slayerfs/tools/stats",
     "libvault",
     "dagrs-derive",
     "dagrs",
