@@ -72,6 +72,51 @@ services:
     networks:
       - slayerfs-xfstests
 
+  minio:
+    image: minio/minio:latest
+    container_name: minio-slayerfs-perf-redis
+    expose:
+      - "9000"
+      - "9001"
+    ports:
+      - "${MINIO_HOST_BIND:-127.0.0.1}:${MINIO_S3_HOST_PORT:-19000}:9000"
+      - "${MINIO_HOST_BIND:-127.0.0.1}:${MINIO_CONSOLE_HOST_PORT:-19001}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    command:
+      - server
+      - /data
+      - --console-address
+      - :9001
+    volumes:
+      - minio-data-perf-redis:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks:
+      - slayerfs-xfstests
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        timeout 180 sh -ec '
+          while true; do
+            mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} >/dev/null 2>&1 || { sleep 2; continue; }
+            mc mb --ignore-existing local/${SLAYERFS_S3_BUCKET:-slayerfs-data} >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+        '
+    networks:
+      - slayerfs-xfstests
+
   perf:
     image: slayerfs-xfstests-perf:local
     build:
@@ -80,8 +125,6 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      rustfs-init:
-        condition: service_completed_successfully
     environment:
       SLAYERFS_META_BACKEND: redis
       SLAYERFS_META_URL: redis://redis:6379/0
@@ -125,3 +168,4 @@ networks:
 volumes:
   slayerfs-state-perf-redis:
   rustfs-data-perf-redis:
+  minio-data-perf-redis:

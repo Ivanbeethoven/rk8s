@@ -26,15 +26,16 @@ usage() {
 
 选项:
   --s3                       使用 rustfs 作为对象存储（默认）
+  --minio                    使用 MinIO 作为对象存储
   --local-fs                 改为使用本地目录作为对象存储
-  --tools "<tool...>"        指定压力工具列表，默认: "dirstress dirperf metaperf looptest fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw"
+  --tools "<tool...>"        指定压力工具列表，默认: "fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
   --slayerfs-bench           额外运行一次宿主机 cargo bench --bench slayerfs_bench
   --bench-args "<args...>"   透传给 cargo bench 之后的 Criterion 参数
   --keep                     结束后不执行 compose down（便于调试）
   -h, --help                 显示帮助
 
 支持的 PERF_TOOLS:
-  dirstress dirperf metaperf looptest fio fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw
+  fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw fio dirstress dirperf metaperf looptest
 
 可通过环境变量覆盖各工具参数:
   PERF_DIRSTRESS_ARGS PERF_DIRPERF_ARGS PERF_METAPERF_ARGS PERF_LOOPTEST_ARGS
@@ -55,19 +56,23 @@ require_value() {
 }
 
 KEEP=false
-USE_S3=true
+STORAGE_BACKEND="rustfs"  # rustfs | minio | local-fs
 RUN_SLAYERFS_BENCH=false
-PERF_TOOLS_VALUE="dirstress dirperf metaperf looptest fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw"
+PERF_TOOLS_VALUE="fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
 BENCH_ARGS_VALUE=""
 
 while [[ $# -gt 0 ]]; do
     case "${1:-}" in
         --s3)
-            USE_S3=true
+            STORAGE_BACKEND="rustfs"
+            shift
+            ;;
+        --minio)
+            STORAGE_BACKEND="minio"
             shift
             ;;
         --local-fs)
-            USE_S3=false
+            STORAGE_BACKEND="local-fs"
             shift
             ;;
         --tools)
@@ -100,12 +105,40 @@ done
 
 mkdir -p "$ARTIFACTS_DIR"
 
+# 预清理：杀掉占用目标端口的残留容器，确保 compose up 不会端口冲突
+preclean_ports() {
+    local -a ports=(16379 19000 19001)
+    for port in "${ports[@]}"; do
+        local pid
+        pid=$(ss -tlnp 2>/dev/null | awk -v p=":${port}\$" '$0 ~ p {sub(/.*pid=/, ""); sub(/,.*/, ""); print $0}') || true
+        if [[ -n "$pid" ]]; then
+            local pname
+            pname=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+            # 只杀 docker-proxy / containers 相关进程，避免误杀用户自己的服务
+            if [[ "$pname" == "docker-proxy" ]]; then
+                info "端口 $port 被 docker-proxy (pid=$pid) 占用，尝试停止关联容器"
+                local cid
+                cid=$(docker ps -q --filter "publish=$port" 2>/dev/null) || true
+                if [[ -n "$cid" ]]; then
+                    docker stop "$cid" 2>/dev/null || true
+                    docker rm -f "$cid" 2>/dev/null || true
+                fi
+            else
+                err "端口 $port 被进程 $pname (pid=$pid) 占用，请手动释放"
+            fi
+        fi
+    done
+    # 确保之前的 compose 资源已释放
+    docker compose -f "$COMPOSE_FILE" down -v --remove-orphans >/dev/null 2>&1 || true
+}
+preclean_ports
+
 cleanup() {
     if [[ "$KEEP" == true ]]; then
         info "跳过 compose down (--keep)"
         return 0
     fi
-    docker compose -f "$COMPOSE_FILE" down -v >/dev/null 2>&1 || true
+    docker compose -f "$COMPOSE_FILE" down -v --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -127,13 +160,13 @@ run_slayerfs_bench() {
             RUST_LOG="${RUST_LOG:-warn}" \
             SLAYERFS_BENCH_META_BACKEND=redis \
             SLAYERFS_BENCH_META_URL="$benchmark_meta_url" \
-            SLAYERFS_BENCH_BACKEND="$([[ "$USE_S3" == true ]] && echo s3 || echo local)" \
+            SLAYERFS_BENCH_BACKEND="$([[ "$STORAGE_BACKEND" == "local-fs" ]] && echo local || echo s3)" \
             SLAYERFS_BENCH_S3_BUCKET="${SLAYERFS_S3_BUCKET:-slayerfs-data}" \
             SLAYERFS_BENCH_S3_REGION="${SLAYERFS_S3_REGION:-us-east-1}" \
-            SLAYERFS_BENCH_S3_ENDPOINT="http://127.0.0.1:${RUSTFS_S3_HOST_PORT:-19000}" \
+            SLAYERFS_BENCH_S3_ENDPOINT="http://127.0.0.1:${S3_HOST_PORT:-19000}" \
             SLAYERFS_BENCH_S3_FORCE_PATH_STYLE=true \
-            AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-rustfsadmin}" \
-            AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-rustfsadmin}" \
+            AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-${S3_ACCESS_KEY}}" \
+            AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-${S3_SECRET_KEY}}" \
             AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}" \
             cargo bench -p slayerfs --bench slayerfs_bench -- "${bench_args[@]}"
     ) 2>&1 | tee "$bench_artifact_dir/console.log"
@@ -156,22 +189,56 @@ mkdir -p "$host_artifact_dir"
 
 export SLAYERFS_ARTIFACT_DIR="/artifacts/perf-run-${ts}"
 export SLAYERFS_S3_BUCKET="${SLAYERFS_S3_BUCKET:-slayerfs-data}"
-if [[ "$USE_S3" == true ]]; then
-    export SLAYERFS_DATA_BACKEND="s3"
-else
-    export SLAYERFS_DATA_BACKEND="local-fs"
-fi
 
-services=(redis rustfs)
+# 根据存储后端设置 S3 相关变量
+case "$STORAGE_BACKEND" in
+    rustfs)
+        export SLAYERFS_DATA_BACKEND="s3"
+        export SLAYERFS_S3_ENDPOINT="${SLAYERFS_S3_ENDPOINT:-http://rustfs:9000}"
+        export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-rustfsadmin}"
+        export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-rustfsadmin}"
+        S3_ACCESS_KEY="${AWS_ACCESS_KEY_ID}"
+        S3_SECRET_KEY="${AWS_SECRET_ACCESS_KEY}"
+        S3_HOST_PORT="${RUSTFS_S3_HOST_PORT:-19000}"
+        storage_service="rustfs"
+        init_service="rustfs-init"
+        ;;
+    minio)
+        export SLAYERFS_DATA_BACKEND="s3"
+        export SLAYERFS_S3_ENDPOINT="${SLAYERFS_S3_ENDPOINT:-http://minio:9000}"
+        export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minioadmin}"
+        export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minioadmin}"
+        S3_ACCESS_KEY="${AWS_ACCESS_KEY_ID}"
+        S3_SECRET_KEY="${AWS_SECRET_ACCESS_KEY}"
+        S3_HOST_PORT="${MINIO_S3_HOST_PORT:-19000}"
+        storage_service="minio"
+        init_service="minio-init"
+        ;;
+    local-fs)
+        export SLAYERFS_DATA_BACKEND="local-fs"
+        S3_ACCESS_KEY=""
+        S3_SECRET_KEY=""
+        S3_HOST_PORT=""
+        storage_service=""
+        init_service=""
+        ;;
+esac
+
+services=(redis)
+if [[ -n "$storage_service" ]]; then
+    services+=("$storage_service")
+fi
 info "启动依赖服务: ${services[*]}"
 docker compose -f "$COMPOSE_FILE" up -d "${services[@]}"
 
-info "初始化 rustfs bucket（一次性容器）"
-docker compose -f "$COMPOSE_FILE" run --rm rustfs-init
+if [[ -n "$init_service" ]]; then
+    info "初始化 ${storage_service} bucket（一次性容器）"
+    docker compose -f "$COMPOSE_FILE" run --rm "$init_service"
+fi
 
 info "运行容器内性能测试（退出码由 perf 容器决定）"
 set +e
-docker compose -f "$COMPOSE_FILE" run --rm \
+docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e PERF_TOOLS="$PERF_TOOLS_VALUE" \
     -e PERF_DIRSTRESS_ARGS \
     -e PERF_DIRPERF_ARGS \

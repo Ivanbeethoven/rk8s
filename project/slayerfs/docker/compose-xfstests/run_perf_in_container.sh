@@ -19,7 +19,7 @@ log_file="${SLAYERFS_LOG_FILE:-/artifacts/slayerfs.log}"
 xfstests_dir="${XFSTESTS_DIR:-/opt/xfstests-dev}"
 artifact_root="${SLAYERFS_ARTIFACT_ROOT:-/artifacts}"
 artifact_dir="${SLAYERFS_ARTIFACT_DIR:-}"
-perf_tools="${PERF_TOOLS:-dirstress dirperf metaperf looptest fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw}"
+perf_tools="${PERF_TOOLS:-fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest}"
 
 env_or_default() {
     local specific_var="$1"
@@ -435,7 +435,7 @@ prepare_fio_dataset() {
         --bs="${PERF_FIO_PREP_BS:-4m}"
         --size="$dataset_size"
         --numjobs=1
-        --ioengine="${PERF_FIO_PREP_IOENGINE:-sync}"
+        --ioengine="${PERF_FIO_PREP_IOENGINE:-io_uring}"
         --iodepth="${PERF_FIO_PREP_IODEPTH:-1}"
         --direct="$direct_mode"
         --end_fsync=1
@@ -475,7 +475,7 @@ run_fio_custom() {
             --bs="${PERF_FIO_BS:-4m}"
             --size="${PERF_FIO_SIZE:-256m}"
             --numjobs="${PERF_FIO_NUMJOBS:-4}"
-            --ioengine="${PERF_FIO_IOENGINE:-sync}"
+            --ioengine="${PERF_FIO_IOENGINE:-io_uring}"
             --iodepth="${PERF_FIO_IODEPTH:-1}"
             --direct="${PERF_FIO_DIRECT:-0}"
             --runtime="${PERF_FIO_RUNTIME:-60}"
@@ -538,10 +538,13 @@ run_fio_profile() {
                 bs="$(env_or_default "$bs_var" PERF_FIO_BS 4m)"
                 size="$(env_or_default "$size_var" PERF_FIO_SIZE 1g)"
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 1)"
-                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE sync)"
+                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE io_uring)"
                 iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
                 direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
                 runtime="$(env_or_default "$runtime_var" PERF_FIO_RUNTIME 60)"
+                use_time_based=true
+                use_end_fsync=false
+                use_refill_buffers=false
                 needs_prefill=true
                 ;;
             seqwrite)
@@ -550,10 +553,13 @@ run_fio_profile() {
                 bs="$(env_or_default "$bs_var" PERF_FIO_BS 4m)"
                 size="$(env_or_default "$size_var" PERF_FIO_SIZE 1g)"
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 1)"
-                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE sync)"
+                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE io_uring)"
                 iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
                 direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
                 runtime="$(env_or_default "$runtime_var" PERF_FIO_RUNTIME 60)"
+                use_time_based=true
+                use_end_fsync=false
+                use_refill_buffers=false
                 ;;
             randread)
                 name="$(env_or_default "$name_var" PERF_FIO_NAME slayerfs-randread)"
@@ -561,10 +567,13 @@ run_fio_profile() {
                 bs="$(env_or_default "$bs_var" PERF_FIO_BS 4m)"
                 size="$(env_or_default "$size_var" PERF_FIO_SIZE 512m)"
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 4)"
-                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE sync)"
+                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE io_uring)"
                 iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
                 direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
                 runtime="$(env_or_default "$runtime_var" PERF_FIO_RUNTIME 60)"
+                use_time_based=true
+                use_end_fsync=false
+                use_refill_buffers=false
                 needs_prefill=true
                 ;;
             randwrite)
@@ -573,10 +582,13 @@ run_fio_profile() {
                 bs="$(env_or_default "$bs_var" PERF_FIO_BS 4m)"
                 size="$(env_or_default "$size_var" PERF_FIO_SIZE 512m)"
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 4)"
-                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE sync)"
+                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE io_uring)"
                 iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
                 direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
                 runtime="$(env_or_default "$runtime_var" PERF_FIO_RUNTIME 60)"
+                use_time_based=true
+                use_end_fsync=false
+                use_refill_buffers=false
                 ;;
             randrw)
                 name="$(env_or_default "$name_var" PERF_FIO_NAME slayerfs-randrw)"
@@ -585,10 +597,42 @@ run_fio_profile() {
                 bs="$(env_or_default "$bs_var" PERF_FIO_BS 4m)"
                 size="$(env_or_default "$size_var" PERF_FIO_SIZE 512m)"
                 numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 4)"
-                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE sync)"
+                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE io_uring)"
                 iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
                 direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
                 runtime="$(env_or_default "$runtime_var" PERF_FIO_RUNTIME 60)"
+                use_time_based=true
+                use_end_fsync=false
+                use_refill_buffers=false
+                needs_prefill=true
+                ;;
+            bigwrite)
+                name="$(env_or_default "$name_var" PERF_FIO_NAME slayerfs-bigwrite)"
+                rw="$(env_or_default "$rw_var" PERF_FIO_RW write)"
+                bs="$(env_or_default "$bs_var" PERF_FIO_BS 4m)"
+                size="$(env_or_default "$size_var" PERF_FIO_SIZE 128m)"
+                numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 8)"
+                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE io_uring)"
+                iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
+                direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
+                runtime="0"
+                use_time_based=false
+                use_end_fsync=true
+                use_refill_buffers=true
+                needs_prefill=false
+                ;;
+            bigread)
+                name="$(env_or_default "$name_var" PERF_FIO_NAME slayerfs-bigread)"
+                rw="$(env_or_default "$rw_var" PERF_FIO_RW read)"
+                bs="$(env_or_default "$bs_var" PERF_FIO_BS 4m)"
+                size="$(env_or_default "$size_var" PERF_FIO_SIZE 128m)"
+                numjobs="$(env_or_default "$numjobs_var" PERF_FIO_NUMJOBS 8)"
+                ioengine="$(env_or_default "$ioengine_var" PERF_FIO_IOENGINE io_uring)"
+                iodepth="$(env_or_default "$iodepth_var" PERF_FIO_IODEPTH 1)"
+                direct="$(env_or_default "$direct_var" PERF_FIO_DIRECT 0)"
+                runtime="0"
+                use_time_based=false
+                use_refill_buffers=true
                 needs_prefill=true
                 ;;
             *)
@@ -607,11 +651,19 @@ run_fio_profile() {
             --ioengine="$ioengine"
             --iodepth="$iodepth"
             --direct="$direct"
-            --runtime="$runtime"
-            --time_based
-            --group_reporting
-            --eta=never
         )
+
+        if [[ "${use_time_based:-true}" == true ]]; then
+            args+=(--runtime="$runtime" --time_based)
+        fi
+        if [[ "${use_end_fsync:-false}" == true ]]; then
+            args+=(--end_fsync=1)
+        fi
+        if [[ "${use_refill_buffers:-false}" == true ]]; then
+            args+=(--refill_buffers)
+        fi
+
+        args+=(--group_reporting --eta=never)
 
         if [[ -n "${rwmixread:-}" ]]; then
             args+=(--rwmixread="$rwmixread")
@@ -920,6 +972,12 @@ run_perf_suite() {
                 ;;
             fio-randrw)
                 run_fio_profile "$tool" randrw || status=1
+                ;;
+            fio-bigwrite)
+                run_fio_profile "$tool" bigwrite || status=1
+                ;;
+            fio-bigread)
+                run_fio_profile "$tool" bigread || status=1
                 ;;
             *)
                 err "不支持的 PERF_TOOLS 项: $tool"
