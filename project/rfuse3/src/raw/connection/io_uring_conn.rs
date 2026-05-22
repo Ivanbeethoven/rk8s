@@ -133,7 +133,11 @@ impl FuseConnection {
 
         Ok(Self {
             unmount_notify: self.unmount_notify.clone(),
-            inner: IoUringConnection { tx, fd: new_fd, file },
+            inner: IoUringConnection {
+                tx,
+                fd: new_fd,
+                file,
+            },
         })
     }
 
@@ -144,10 +148,12 @@ impl FuseConnection {
         mount_path: impl AsRef<std::path::Path>,
         unmount_notify: Arc<Notify>,
     ) -> io::Result<Self> {
+        use nix::sys::socket::{
+            self, AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType,
+        };
         use std::ffi::OsString;
-        use std::os::fd::FromRawFd as _;
         use std::os::fd::AsRawFd as _;
-        use nix::sys::socket::{self, AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType};
+        use std::os::fd::FromRawFd as _;
         use tokio::process::Command;
 
         let (sock0, sock1) = socket::socketpair(
@@ -155,7 +161,8 @@ impl FuseConnection {
             SockType::SeqPacket,
             None,
             SockFlag::empty(),
-        ).map_err(io::Error::from)?;
+        )
+        .map_err(io::Error::from)?;
 
         let binary_path = crate::find_fusermount3()?;
         let options = mount_options.build_with_unprivileged();
@@ -177,10 +184,12 @@ impl FuseConnection {
             let mut buf = vec![];
             let mut cmsg_buf = nix::cmsg_space!([std::os::unix::io::RawFd; 1]);
             let mut bufs = [std::io::IoSliceMut::new(&mut buf)];
-            let msg = socket::recvmsg::<()>(
-                fd1, &mut bufs[..], Some(&mut cmsg_buf), MsgFlags::empty(),
-            ).map_err(io::Error::from)?;
-            if let Some(ControlMessageOwned::ScmRights(fds)) = msg.cmsgs().ok().and_then(|mut c| c.next()) {
+            let msg =
+                socket::recvmsg::<()>(fd1, &mut bufs[..], Some(&mut cmsg_buf), MsgFlags::empty())
+                    .map_err(io::Error::from)?;
+            if let Some(ControlMessageOwned::ScmRights(fds)) =
+                msg.cmsgs().ok().and_then(|mut c| c.next())
+            {
                 if fds.is_empty() {
                     return Err(io::Error::other("no fuse fd"));
                 }
@@ -188,14 +197,20 @@ impl FuseConnection {
             } else {
                 Err(io::Error::other("get fuse fd failed"))
             }
-        }).await.unwrap()?;
+        })
+        .await
+        .unwrap()?;
 
         let file = Arc::new(unsafe { File::from_raw_fd(fuse_fd) });
         let tx = IoUringConnection::start_ring_thread(fuse_fd)?;
 
         Ok(Self {
             unmount_notify,
-            inner: IoUringConnection { tx, fd: fuse_fd, file },
+            inner: IoUringConnection {
+                tx,
+                fd: fuse_fd,
+                file,
+            },
         })
     }
 
@@ -224,15 +239,27 @@ impl FuseConnection {
         if self.inner.tx.send(req).await.is_err() {
             return Some((
                 (vec![], data_buf),
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "ring thread gone")),
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "ring thread gone",
+                )),
             ));
         }
 
         let mut unmount_fut = pin!(self.unmount_notify.notified().fuse());
         let mut read_fut = pin!(async {
-            rx.await
-                .unwrap_or(((vec![], AlignedDataBuf { ptr: std::ptr::null_mut(), len: 0 }), Err(io::Error::new(io::ErrorKind::BrokenPipe, "ring cancelled"))))
-        }.fuse());
+            rx.await.unwrap_or((
+                (
+                    vec![],
+                    AlignedDataBuf {
+                        ptr: std::ptr::null_mut(),
+                        len: 0,
+                    },
+                ),
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "ring cancelled")),
+            ))
+        }
+        .fuse());
 
         select! {
             _ = unmount_fut => {
@@ -270,7 +297,10 @@ impl FuseConnection {
         if self.inner.tx.send(req).await.is_err() {
             return (
                 (data, body_extend_data),
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "ring thread gone")),
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "ring thread gone",
+                )),
             );
         }
 
@@ -322,12 +352,8 @@ struct InflightWrite {
 /// Processes read and write requests from a single channel, submitting them to
 /// the ring and waiting for completions. All iovec arrays are heap-allocated
 /// (Box) to ensure they remain at a stable address until the CQE arrives.
-fn ring_thread_main(
-    fd: i32,
-    mut rx: mpsc::Receiver<RingRequest>,
-) -> io::Result<()> {
-    let mut ring: IoUring = IoUring::builder()
-        .build(RING_SIZE)?;
+fn ring_thread_main(fd: i32, mut rx: mpsc::Receiver<RingRequest>) -> io::Result<()> {
+    let mut ring: IoUring = IoUring::builder().build(RING_SIZE)?;
 
     let mut pending_read: Option<InflightRead> = None;
     let mut pending_writes: Vec<Option<InflightWrite>> = Vec::new();
@@ -344,9 +370,13 @@ fn ring_thread_main(
             match rx.blocking_recv() {
                 None => return Ok(()), // channel closed, clean shutdown
                 Some(req) => submit_request(
-                    &mut ring, fd, req,
-                    &mut pending_read, &mut pending_writes,
-                    &mut read_inflight, &mut writes_inflight,
+                    &mut ring,
+                    fd,
+                    req,
+                    &mut pending_read,
+                    &mut pending_writes,
+                    &mut read_inflight,
+                    &mut writes_inflight,
                 )?,
             }
         }
@@ -355,9 +385,13 @@ fn ring_thread_main(
         loop {
             match rx.try_recv() {
                 Ok(req) => submit_request(
-                    &mut ring, fd, req,
-                    &mut pending_read, &mut pending_writes,
-                    &mut read_inflight, &mut writes_inflight,
+                    &mut ring,
+                    fd,
+                    req,
+                    &mut pending_read,
+                    &mut pending_writes,
+                    &mut read_inflight,
+                    &mut writes_inflight,
                 )?,
                 Err(_) => break,
             }
@@ -383,9 +417,10 @@ fn ring_thread_main(
                     } else {
                         Ok(result as usize)
                     };
-                    let _ = inflight.req.reply.send(
-                        ((inflight.req.header_buf, inflight.req.data_buf), io_result)
-                    );
+                    let _ = inflight
+                        .req
+                        .reply
+                        .send(((inflight.req.header_buf, inflight.req.data_buf), io_result));
                 }
             } else if user_data >= TAG_WRITE_BASE {
                 writes_inflight -= 1;
@@ -396,9 +431,10 @@ fn ring_thread_main(
                     } else {
                         Ok(result as usize)
                     };
-                    let _ = inflight.req.reply.send(
-                        ((inflight.req.data, inflight.req.body_extend), io_result)
-                    );
+                    let _ = inflight
+                        .req
+                        .reply
+                        .send(((inflight.req.data, inflight.req.body_extend), io_result));
                 }
             }
         }
@@ -424,10 +460,13 @@ fn submit_request(
         RingRequest::Read(req) => {
             if *read_inflight {
                 // Only one read at a time; reply with error
-                let _ = req.reply.send(
-                    ((req.header_buf, req.data_buf),
-                     Err(io::Error::new(io::ErrorKind::WouldBlock, "read already inflight")))
-                );
+                let _ = req.reply.send((
+                    (req.header_buf, req.data_buf),
+                    Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "read already inflight",
+                    )),
+                ));
                 return Ok(());
             }
             let iovecs = Box::new([
@@ -448,7 +487,10 @@ fn submit_request(
                     .push(&entry)
                     .map_err(|_| io::Error::new(io::ErrorKind::Other, "SQ full"))?;
             }
-            *pending_read = Some(InflightRead { req, _iovecs: iovecs });
+            *pending_read = Some(InflightRead {
+                req,
+                _iovecs: iovecs,
+            });
             *read_inflight = true;
         }
         RingRequest::Write(req) => {
@@ -461,7 +503,10 @@ fn submit_request(
                             iov_base: req.data.as_ptr() as *mut libc::c_void,
                             iov_len: req.data.len(),
                         },
-                        libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 },
+                        libc::iovec {
+                            iov_base: std::ptr::null_mut(),
+                            iov_len: 0,
+                        },
                     ]
                 }
                 Some(body) => {
@@ -488,7 +533,10 @@ fn submit_request(
                     .push(&entry)
                     .map_err(|_| io::Error::new(io::ErrorKind::Other, "SQ full"))?;
             }
-            pending_writes.push(Some(InflightWrite { req, _iovecs: iovecs }));
+            pending_writes.push(Some(InflightWrite {
+                req,
+                _iovecs: iovecs,
+            }));
             *writes_inflight += 1;
         }
     }

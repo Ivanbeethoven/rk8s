@@ -8,7 +8,11 @@ use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_util::stream::StreamExt;
 use tracing::debug;
 
-#[cfg(all(not(feature = "tokio-runtime"), not(feature = "io-uring-runtime"), feature = "async-io-runtime"))]
+#[cfg(all(
+    not(feature = "tokio-runtime"),
+    not(feature = "io-uring-runtime"),
+    feature = "async-io-runtime"
+))]
 use async_global_executor::{self as task, Task as JoinHandle};
 #[cfg(any(
     all(not(feature = "async-io-runtime"), feature = "tokio-runtime"),
@@ -69,6 +73,7 @@ pub(crate) struct DispatchCtx<FS: Filesystem + Send + Sync + 'static> {
     pub(crate) fs: Arc<FS>,
     pub(crate) resp: Vec<UnboundedSender<FuseData>>,
     pub(crate) direct_io: bool,
+    pub(crate) force_readdir_plus: bool,
     pub(crate) _inflight: Arc<AtomicUsize>,
     pub(crate) _inflight_notify: Arc<async_notify::Notify>,
 }
@@ -101,16 +106,17 @@ impl<FS: Filesystem + Send + Sync + 'static> Workers<FS> {
         let mut senders = Vec::with_capacity(worker_count);
         let mut handles = Vec::with_capacity(worker_count);
         for idx in 0..worker_count {
-            let (tx, mut rx): (UnboundedSender<WorkItem>, UnboundedReceiver<WorkItem>) = unbounded();
+            let (tx, mut rx): (UnboundedSender<WorkItem>, UnboundedReceiver<WorkItem>) =
+                unbounded();
             let ctx_clone = _ctx.clone();
-            #[cfg(all(not(feature = "tokio-runtime"), not(feature = "io-uring-runtime"), feature = "async-io-runtime"))]
+            #[cfg(all(
+                not(feature = "tokio-runtime"),
+                not(feature = "io-uring-runtime"),
+                feature = "async-io-runtime"
+            ))]
             let handle = task::spawn(async move {
                 while let Some(item) = rx.next().await {
-                    let ctx = ctx_clone.clone();
-                    task::spawn(async move {
-                        process_work_item(&ctx, idx, item).await;
-                    })
-                    .detach();
+                    process_work_item(&ctx_clone, idx, item).await;
                 }
                 debug!(worker=%idx, "worker exit");
             });
@@ -120,10 +126,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Workers<FS> {
             ))]
             let handle = task::spawn(async move {
                 while let Some(item) = rx.next().await {
-                    let ctx = ctx_clone.clone();
-                    task::spawn(async move {
-                        process_work_item(&ctx, idx, item).await;
-                    });
+                    process_work_item(&ctx_clone, idx, item).await;
                 }
                 debug!(worker=%idx, "worker exit");
             });
@@ -160,6 +163,7 @@ async fn process_work_item<FS: Filesystem + Send + Sync + 'static>(
             ctx => ctx,
             worker_idx => worker_idx,
             item => item,
+            FUSE_FORGET   => handle_forget_inline,
             FUSE_LOOKUP   => handle_lookup_inline,
             FUSE_GETATTR  => handle_getattr_inline,
             FUSE_OPEN     => handle_open_inline,
@@ -196,6 +200,9 @@ async fn process_work_item<FS: Filesystem + Send + Sync + 'static>(
             FUSE_LSEEK => handle_lseek_inline,
             FUSE_COPY_FILE_RANGE => handle_copy_file_range_inline,
             FUSE_POLL => handle_poll_inline,
+            FUSE_DESTROY => handle_destroy_inline,
+            FUSE_INTERRUPT => handle_interrupt_inline,
+            FUSE_NOTIFY_REPLY => handle_notify_reply_inline,
             FUSE_BATCH_FORGET => handle_batch_forget_inline,
             _ => {
                 match opcode_result {

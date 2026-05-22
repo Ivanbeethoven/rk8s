@@ -61,6 +61,37 @@ pub(super) async fn handle_lookup_inline<FS: Filesystem + Send + Sync + 'static>
     let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
 }
 
+pub(super) async fn handle_forget_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
+    item: WorkItem,
+) {
+    let forget_in = match get_bincode_config().deserialize::<fuse_forget_in>(&item.data) {
+        Err(err) => {
+            error!(
+                "deserialize fuse_forget_in failed {}, request unique {}",
+                err, item.unique
+            );
+            return;
+        }
+        Ok(v) => v,
+    };
+
+    debug!(
+        unique = item.unique,
+        inode = item.in_header.nodeid,
+        nlookup = forget_in.nlookup,
+        "forget (worker)"
+    );
+
+    ctx.fs
+        .forget(
+            Request::from(&item),
+            item.in_header.nodeid,
+            forget_in.nlookup,
+        )
+        .await;
+}
+
 pub(super) async fn handle_getattr_inline<FS: Filesystem + Send + Sync + 'static>(
     ctx: &DispatchCtx<FS>,
     item: WorkItem,
@@ -315,8 +346,13 @@ pub(super) async fn handle_readdir_inline<FS: Filesystem + Send + Sync + 'static
     ctx: &DispatchCtx<FS>,
     item: WorkItem,
 ) {
-    // need mount options to check force_readdir_plus; currently not in ctx, so just execute kernel-side ENOSYS logic inline here is impossible.
-    // For now we optimistically proceed; if force_readdir_plus was set, kernel shouldn't send READDIR anyway (original code returned ENOSYS).
+    if ctx.force_readdir_plus {
+        let data =
+            reply_error_in_worker(libc::ENOSYS.into(), item.unique).expect("serialize out_header");
+        let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+        return;
+    }
+
     let read_in = match get_bincode_config().deserialize::<fuse_read_in>(&item.data) {
         Err(err) => {
             debug!(
@@ -2290,7 +2326,10 @@ pub(super) async fn handle_batch_forget_inline<FS: Filesystem + Send + Sync + 's
             .deserialize::<fuse_forget_one>(&data[..FUSE_FORGET_ONE_SIZE])
         {
             Err(err) => {
-                error!("deserialize fuse_batch_forget_in body fuse_forget_one failed {}, request unique {}", err, item.unique);
+                error!(
+                    "deserialize fuse_batch_forget_in body fuse_forget_one failed {}, request unique {}",
+                    err, item.unique
+                );
                 // no need to reply
                 return;
             }
@@ -2330,6 +2369,94 @@ pub(super) async fn handle_batch_forget_inline<FS: Filesystem + Send + Sync + 's
     // batch_forget has no reply
 }
 
+pub(super) async fn handle_destroy_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
+    item: WorkItem,
+) {
+    debug!(unique = item.unique, "destroy (worker)");
+    ctx.fs.destroy(Request::from(&item)).await;
+}
+
+pub(super) async fn handle_interrupt_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
+    item: WorkItem,
+) {
+    let interrupt_in = match get_bincode_config().deserialize::<fuse_interrupt_in>(&item.data) {
+        Err(err) => {
+            debug!(
+                unique = item.unique,
+                "deserialize fuse_interrupt_in failed {}", err
+            );
+            let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
+                .expect("serialize out_header");
+            let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+            return;
+        }
+        Ok(v) => v,
+    };
+
+    debug!(
+        unique = item.unique,
+        interrupted_unique = interrupt_in.unique,
+        "interrupt (worker)"
+    );
+
+    let resp = match ctx
+        .fs
+        .interrupt(Request::from(&item), interrupt_in.unique)
+        .await
+    {
+        Err(err) => err,
+        Ok(()) => 0.into(),
+    };
+    let data = reply_error_in_worker(resp, item.unique).expect("serialize out_header");
+    let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+}
+
+pub(super) async fn handle_notify_reply_inline<FS: Filesystem + Send + Sync + 'static>(
+    ctx: &DispatchCtx<FS>,
+    item: WorkItem,
+) {
+    let notify_retrieve_in =
+        match get_bincode_config().deserialize::<fuse_notify_retrieve_in>(&item.data) {
+            Err(err) => {
+                error!(
+                    "deserialize fuse_notify_retrieve_in failed {}, request unique {}",
+                    err, item.unique
+                );
+                return;
+            }
+            Ok(v) => v,
+        };
+
+    let payload_start = FUSE_NOTIFY_RETRIEVE_IN_SIZE;
+    let payload_end = payload_start.saturating_add(notify_retrieve_in.size as usize);
+    if item.data.len() < payload_end {
+        error!(
+            unique = item.unique,
+            size = notify_retrieve_in.size,
+            available = item.data.len().saturating_sub(payload_start),
+            "fuse_notify_retrieve data size is invalid"
+        );
+        return;
+    }
+
+    let payload = item.data.slice(payload_start..payload_end);
+    if let Err(err) = ctx
+        .fs
+        .notify_reply(
+            Request::from(&item),
+            item.in_header.nodeid,
+            notify_retrieve_in.offset,
+            payload,
+        )
+        .await
+    {
+        let data = reply_error_in_worker(err, item.unique).expect("serialize out_header");
+        let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[cfg(target_os = "macos")]
 pub(super) async fn handle_setvolname_inline<FS: Filesystem + Send + Sync + 'static>(
@@ -2345,7 +2472,10 @@ pub(super) async fn handle_ioctl_inline<FS: Filesystem + Send + Sync + 'static>(
 ) {
     let ioctl_in = match get_bincode_config().deserialize::<fuse_ioctl_in>(&item.data) {
         Err(err) => {
-            debug!(unique = item.unique, "deserialize fuse_ioctl_in failed {}", err);
+            debug!(
+                unique = item.unique,
+                "deserialize fuse_ioctl_in failed {}", err
+            );
             let data = reply_error_in_worker(libc::EINVAL.into(), item.unique)
                 .expect("serialize out_header");
             let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
@@ -2361,7 +2491,7 @@ pub(super) async fn handle_ioctl_inline<FS: Filesystem + Send + Sync + 'static>(
         let _ = ctx.resp_for(item.unique).unbounded_send(Either::Left(data));
         return;
     }
-    let ioctl_data = item.data[FUSE_IOCTL_IN_SIZE..payload_end].to_vec();
+    let ioctl_data = &item.data[FUSE_IOCTL_IN_SIZE..payload_end];
 
     let request = Request::from(&item);
     let in_header = item.in_header;
@@ -2375,7 +2505,7 @@ pub(super) async fn handle_ioctl_inline<FS: Filesystem + Send + Sync + 'static>(
             ioctl_in.flags,
             ioctl_in.cmd,
             ioctl_in.arg,
-            &ioctl_data,
+            ioctl_data,
             ioctl_in.out_size,
         )
         .await
