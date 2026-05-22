@@ -70,7 +70,7 @@ const WRITE_MAX_WAIT: Duration = Duration::from_secs(30);
 /// maximizing pipeline parallelism while keeping flush latency reasonable.
 /// fsync/close bypass this threshold and force-seal regardless of size.
 /// NOTE: This is the fallback; prefer config.freeze_min_bytes when available.
-const SHOULD_FREEZE_MIN_BYTES: u64 = 32 * 1024 * 1024;
+const SHOULD_FREEZE_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
 fn truncate_flush_deadline() -> Duration {
     std::env::var("SLAYERFS_TRUNCATE_FLUSH_TIMEOUT_SECS")
