@@ -4,6 +4,7 @@
 //! Compressed data uses a 4-byte header: `[magic_hi, magic_lo, algorithm, reserved]`
 //! so that decompression can automatically detect the algorithm without external metadata.
 
+use std::borrow::Cow;
 use tracing::{debug, trace};
 
 /// Magic bytes identifying compressed data (0xSF = SlayerFs)
@@ -48,11 +49,12 @@ impl Compression {
 }
 
 /// Compress data using the specified algorithm.
-/// Returns compressed data with a 4-byte header prepended.
-/// If compression would increase size (incompressible data), returns the original with None header.
-pub fn compress(data: &[u8], algo: Compression) -> Vec<u8> {
+/// Returns `Cow::Borrowed` when data should be stored as-is (no compression or incompressible),
+/// and `Cow::Owned` with compressed+header bytes when compression is beneficial.
+/// This avoids unnecessary copies for the common case of incompressible data.
+pub fn compress<'a>(data: &'a [u8], algo: Compression) -> Cow<'a, [u8]> {
     if matches!(algo, Compression::None) || data.is_empty() {
-        return data.to_vec();
+        return Cow::Borrowed(data);
     }
 
     let compressed_body = match algo {
@@ -62,7 +64,7 @@ pub fn compress(data: &[u8], algo: Compression) -> Vec<u8> {
                 Ok(c) => c,
                 Err(e) => {
                     debug!("Zstd compression failed, storing uncompressed: {}", e);
-                    return data.to_vec();
+                    return Cow::Borrowed(data);
                 }
             }
         }
@@ -76,7 +78,7 @@ pub fn compress(data: &[u8], algo: Compression) -> Vec<u8> {
             data.len(),
             compressed_body.len() + 4
         );
-        return data.to_vec();
+        return Cow::Borrowed(data);
     }
 
     let ratio = data.len() as f64 / (compressed_body.len() + 4) as f64;
@@ -94,7 +96,7 @@ pub fn compress(data: &[u8], algo: Compression) -> Vec<u8> {
     result.push(algo.algo_byte());
     result.push(0); // reserved
     result.extend_from_slice(&compressed_body);
-    result
+    Cow::Owned(result)
 }
 
 /// Decompress data, auto-detecting compression from the header.
@@ -131,7 +133,7 @@ mod tests {
     fn test_roundtrip_none() {
         let data = b"hello world";
         let compressed = compress(data, Compression::None);
-        assert_eq!(compressed, data);
+        assert_eq!(&*compressed, &data[..]);
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
     }

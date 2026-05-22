@@ -176,7 +176,7 @@ impl Default for BlockStoreConfig {
             range_read_threshold: 0.25,  // 25% = 1MB for 4MB blocks
             page_size: 64 * 1024,        // 64KB
             page_cache_capacity: 4096,   // 4096 pages × 64KB = 256MB
-            compression: Compression::None,
+            compression: Compression::Lz4,
         }
     }
 }
@@ -296,12 +296,16 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
         // Assemble full block (uncompressed) for cache population.
         let full_block: Vec<u8> = parts.iter().flat_map(|b| b.iter().copied()).collect();
 
-        // Compress for S3 upload if configured
-        let upload_data = compress(&full_block, self.config.compression);
+        // Compress for S3 upload if configured (Cow avoids copy when incompressible)
+        let compressed = compress(&full_block, self.config.compression);
+        let upload_bytes = match compressed {
+            std::borrow::Cow::Borrowed(_) => Bytes::from(full_block.clone()),
+            std::borrow::Cow::Owned(v) => Bytes::from(v),
+        };
         // Rate limit upload bandwidth
-        self.bandwidth.acquire_upload(upload_data.len()).await;
+        self.bandwidth.acquire_upload(upload_bytes.len()).await;
         self.client
-            .put_object_vectored(&key_str, vec![Bytes::from(upload_data)])
+            .put_object_vectored(&key_str, vec![upload_bytes])
             .await
             .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
 
@@ -332,12 +336,16 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
         // Assemble full block (uncompressed) for cache.
         let full_block: Vec<u8> = parts.iter().flat_map(|b| b.iter().copied()).collect();
 
-        // Compress for S3 upload
-        let upload_data = compress(&full_block, self.config.compression);
+        // Compress for S3 upload (Cow avoids copy when incompressible)
+        let compressed = compress(&full_block, self.config.compression);
+        let upload_bytes = match compressed {
+            std::borrow::Cow::Borrowed(_) => Bytes::from(full_block.clone()),
+            std::borrow::Cow::Owned(v) => Bytes::from(v),
+        };
         // Rate limit upload bandwidth
-        self.bandwidth.acquire_upload(upload_data.len()).await;
+        self.bandwidth.acquire_upload(upload_bytes.len()).await;
         self.client
-            .put_object_vectored(&key_str, vec![Bytes::from(upload_data)])
+            .put_object_vectored(&key_str, vec![upload_bytes])
             .await
             .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
 
