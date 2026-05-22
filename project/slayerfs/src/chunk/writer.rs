@@ -11,17 +11,24 @@ use bytes::Bytes;
 use std::sync::LazyLock;
 use tokio::sync::Semaphore;
 
-/// Maximum concurrent block uploads across the entire process.  Each upload
-/// opens an HTTP connection (S3 backend); without a bound the S3 server runs
-/// out of file descriptors under heavy writeback/fysnc workloads.
-const MAX_CONCURRENT_UPLOADS: usize = 256;
+/// Foreground upload permits (flush/fsync) — higher priority, larger pool.
+const FG_UPLOAD_PERMITS: usize = 192;
+/// Background upload permits (compaction/warmup) — lower priority, smaller pool.
+const BG_UPLOAD_PERMITS: usize = 64;
 
-static UPLOAD_SEM: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_UPLOADS));
+static FG_UPLOAD_SEM: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(FG_UPLOAD_PERMITS));
+static BG_UPLOAD_SEM: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(BG_UPLOAD_PERMITS));
 
-/// Acquire a permit from the global upload semaphore.  Used by both foreground
-/// flush uploads and background compaction to share S3 bandwidth fairly.
+/// Acquire a foreground upload permit (flush/fsync path).
+pub(crate) async fn fg_upload_permit() -> tokio::sync::SemaphorePermit<'static> {
+    FG_UPLOAD_SEM.acquire().await.expect("fg upload semaphore closed")
+}
+
+/// Acquire a background upload permit (compaction/GC).
 pub(crate) async fn upload_permit() -> tokio::sync::SemaphorePermit<'static> {
-    UPLOAD_SEM.acquire().await.expect("upload semaphore closed")
+    BG_UPLOAD_SEM.acquire().await.expect("bg upload semaphore closed")
 }
 
 struct ChunkCursor<'a> {
@@ -105,12 +112,12 @@ where
             futures.push(future);
         }
 
-        // Bound total concurrent block uploads so that neither the S3
-        // server nor the local machine exhausts file descriptors.
+        // Bound total concurrent block uploads with foreground priority permits
+        // so that flush/fsync gets priority over background compaction.
         let futures: Vec<_> = futures
             .into_iter()
             .map(|f| async move {
-                let _p = UPLOAD_SEM.acquire().await;
+                let _p = FG_UPLOAD_SEM.acquire().await;
                 f.await
             })
             .collect();

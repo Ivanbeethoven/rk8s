@@ -66,11 +66,11 @@ const MAX_UNFLUSHED_SLICES: usize = 3;
 const MAX_SLICES_THRESHOLD: usize = 800;
 const WRITE_MAX_WAIT: Duration = Duration::from_secs(30);
 /// Minimum number of bytes a Writable slice must hold before `should_freeze`
-/// returns true on a size basis.  8 MiB aggregation reduces small-object
-/// PUT amplification on S3 backends.  fsync/close bypass this threshold
-/// and force-seal regardless of size.
+/// returns true on a size basis.  32 MiB gives 8 blocks per upload batch,
+/// maximizing pipeline parallelism while keeping flush latency reasonable.
+/// fsync/close bypass this threshold and force-seal regardless of size.
 /// NOTE: This is the fallback; prefer config.freeze_min_bytes when available.
-const SHOULD_FREEZE_MIN_BYTES: u64 = 8 * 1024 * 1024;
+const SHOULD_FREEZE_MIN_BYTES: u64 = 32 * 1024 * 1024;
 
 fn truncate_flush_deadline() -> Duration {
     std::env::var("SLAYERFS_TRUNCATE_FLUSH_TIMEOUT_SECS")
