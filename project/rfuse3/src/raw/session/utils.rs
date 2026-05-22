@@ -93,7 +93,11 @@ where
     ))]
     task::spawn(fut.instrument(span));
 
-    #[cfg(all(not(feature = "tokio-runtime"), not(feature = "io-uring-runtime"), feature = "async-io-runtime"))]
+    #[cfg(all(
+        not(feature = "tokio-runtime"),
+        not(feature = "io-uring-runtime"),
+        feature = "async-io-runtime"
+    ))]
     task::spawn(fut.instrument(span)).detach()
 }
 

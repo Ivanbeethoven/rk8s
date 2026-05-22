@@ -57,7 +57,11 @@ use futures_channel::{
     oneshot,
 };
 use futures_util::future::Either;
-#[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+#[cfg(all(
+    target_os = "macos",
+    not(feature = "tokio-runtime"),
+    feature = "async-io-runtime"
+))]
 use futures_util::select;
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
@@ -90,7 +94,11 @@ use crate::helper::*;
 use crate::notify::Notify;
 use crate::raw::abi::*;
 use crate::raw::buffer_pool::AlignedBuffer;
-#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime", feature = "io-uring-runtime"))]
+#[cfg(any(
+    feature = "async-io-runtime",
+    feature = "tokio-runtime",
+    feature = "io-uring-runtime"
+))]
 use crate::raw::connection::FuseConnection;
 use crate::raw::filesystem::Filesystem;
 use crate::raw::reply::ReplyXAttr;
@@ -173,7 +181,11 @@ impl Drop for MountHandle {
                 return;
             }
 
-            #[cfg(all(not(feature = "tokio-runtime"), not(feature = "io-uring-runtime"), feature = "async-io-runtime"))]
+            #[cfg(all(
+                not(feature = "tokio-runtime"),
+                not(feature = "io-uring-runtime"),
+                feature = "async-io-runtime"
+            ))]
             {
                 task::spawn(inner.inner_unmount()).detach();
             }
@@ -306,7 +318,11 @@ impl MountHandleInner {
 impl Future for MountHandle {
     type Output = IoResult<()>;
 
-    #[cfg(all(not(feature = "tokio-runtime"), not(feature = "io-uring-runtime"), feature = "async-io-runtime"))]
+    #[cfg(all(
+        not(feature = "tokio-runtime"),
+        not(feature = "io-uring-runtime"),
+        feature = "async-io-runtime"
+    ))]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.inner.as_mut().expect("inner should be Some()").task).poll(cx)
     }
@@ -321,7 +337,11 @@ impl Future for MountHandle {
             .map(Result::unwrap)
     }
 }
-#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime", feature = "io-uring-runtime"))]
+#[cfg(any(
+    feature = "async-io-runtime",
+    feature = "tokio-runtime",
+    feature = "io-uring-runtime"
+))]
 /// FUSE filesystem session with inode-based operations.
 ///
 /// # Concurrency Model
@@ -371,7 +391,11 @@ pub struct Session<FS: Filesystem + Send + Sync + 'static> {
     inflight_notify: Arc<async_notify::Notify>,
 }
 
-#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime", feature = "io-uring-runtime"))]
+#[cfg(any(
+    feature = "async-io-runtime",
+    feature = "tokio-runtime",
+    feature = "io-uring-runtime"
+))]
 impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     /// new a fuse filesystem session.
     pub fn new(mount_options: MountOptions) -> Self {
@@ -432,6 +456,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 fs,
                 resp: self.response_senders.clone(),
                 direct_io: self.mount_options.direct_io,
+                force_readdir_plus: self.mount_options.force_readdir_plus,
                 _inflight: self.inflight.clone(),
                 _inflight_notify: self.inflight_notify.clone(),
             });
@@ -453,7 +478,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     }
 }
 
-#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime", feature = "io-uring-runtime"))]
+#[cfg(any(
+    feature = "async-io-runtime",
+    feature = "tokio-runtime",
+    feature = "io-uring-runtime"
+))]
 impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     async fn mount_empty_check(&self, mount_path: &Path) -> IoResult<()> {
         use std::io::ErrorKind;
@@ -706,6 +735,22 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             // write requests queue up unsent.
             let conn = Arc::new(fuse_write_connection.try_clone()?);
 
+            #[cfg(all(
+                not(feature = "tokio-runtime"),
+                not(feature = "io-uring-runtime"),
+                feature = "async-io-runtime"
+            ))]
+            task::spawn(async move {
+                if let Err(e) = Self::reply_fuse(conn, rx).await {
+                    tracing::error!("reply fuse task {i} exited: {e}");
+                }
+            })
+            .detach();
+
+            #[cfg(any(
+                all(not(feature = "async-io-runtime"), feature = "tokio-runtime"),
+                feature = "io-uring-runtime"
+            ))]
             task::spawn(async move {
                 if let Err(e) = Self::reply_fuse(conn, rx).await {
                     tracing::error!("reply fuse task {i} exited: {e}");
@@ -782,7 +827,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
                         tokio::time::sleep(std::time::Duration::from_micros(retry_delay_us)).await;
                         #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-                        async_io::Timer::after(std::time::Duration::from_micros(retry_delay_us)).await;
+                        async_io::Timer::after(std::time::Duration::from_micros(retry_delay_us))
+                            .await;
                         // Exponential backoff capped at 10ms
                         retry_delay_us = (retry_delay_us * 2).min(10_000);
                     }
@@ -1032,7 +1078,42 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             let data_size = in_header.len as usize - FUSE_IN_HEADER_SIZE;
             let data_ref = &data_buffer[..data_size];
 
-            if let Some(workers) = &self.workers {
+            if self.workers.is_some() {
+                match opcode {
+                    fuse_opcode::FUSE_INIT => {
+                        warn!("duplicated fuse init request");
+                        self.handle_init(request, data_ref, &fuse_connection, &fs)
+                            .await?;
+                        continue;
+                    }
+                    fuse_opcode::FUSE_DESTROY => {
+                        debug!("receive fuse destroy");
+                        fs.destroy(request).await;
+                        debug!("fuse destroyed");
+                        return Ok(());
+                    }
+                    fuse_opcode::FUSE_FORGET => {
+                        self.handle_forget(request, in_header, data_ref, &fs).await;
+                        continue;
+                    }
+                    fuse_opcode::FUSE_INTERRUPT => {
+                        self.handle_interrupt(request, data_ref, &fs).await;
+                        continue;
+                    }
+                    fuse_opcode::FUSE_NOTIFY_REPLY => {
+                        self.handle_notify_reply(request, in_header, data_ref, &fs)
+                            .await;
+                        continue;
+                    }
+                    fuse_opcode::FUSE_BATCH_FORGET => {
+                        self.handle_batch_forget(request, in_header, data_ref, &fs)
+                            .await;
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                let workers = self.workers.as_ref().expect("workers checked above");
                 let unique = request.unique;
                 let opcode_raw = in_header.opcode;
                 // Copy request payload into Bytes for worker.
@@ -1055,14 +1136,13 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         self.inflight_notify.clone(),
                     ))
                 };
-                workers
-                    .submit(WorkItem {
-                        unique,
-                        opcode: opcode_raw,
-                        in_header: lite,
-                        data: body_bytes,
-                        _inflight_guard: inflight_guard,
-                    });
+                workers.submit(WorkItem {
+                    unique,
+                    opcode: opcode_raw,
+                    in_header: lite,
+                    data: body_bytes,
+                    _inflight_guard: inflight_guard,
+                });
             } else {
                 // Will concurrency in a single-threaded context cause disorder in the sequence of operations on a single file?
                 match opcode {
@@ -1558,7 +1638,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             init_reply.max_write
         };
 
-        let max_background = u16::try_from(self.max_background).unwrap_or(u16::MAX).max(1);
+        let max_background = u16::try_from(self.max_background)
+            .unwrap_or(u16::MAX)
+            .max(1);
         // Use max_background as the congestion threshold so the kernel never
         // throttles writeback.  With the default 3/4 ratio the kernel stops
         // sending FUSE_WRITE requests when 75% of background slots are in use,
@@ -2927,7 +3009,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         // setxattr "size" field specifies size of only "Value" part of data
         if setxattr_in.size as usize != data.len() {
             error!(
-                "fuse_setxattr_in value field data length is not right, request unique {} setxattr_in.size={} data.len={}", request.unique, setxattr_in.size, data.len());
+                "fuse_setxattr_in value field data length is not right, request unique {} setxattr_in.size={} data.len={}",
+                request.unique,
+                setxattr_in.size,
+                data.len()
+            );
 
             reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
 
@@ -4255,7 +4341,10 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         while data.len() >= FUSE_FORGET_ONE_SIZE {
             match get_bincode_config().deserialize::<fuse_forget_one>(data) {
                 Err(err) => {
-                    error!("deserialize fuse_batch_forget_in body fuse_forget_one failed {}, request unique {}", err, request.unique);
+                    error!(
+                        "deserialize fuse_batch_forget_in body fuse_forget_one failed {}, request unique {}",
+                        err, request.unique
+                    );
 
                     // no need to reply
                     return;
