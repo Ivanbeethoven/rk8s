@@ -890,7 +890,6 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn cached_stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
         let inode = self.check_root(ino);
-        debug!("MetaClient: stat request for inode {}", inode);
 
         if let Some(attr) = self.inode_cache.get_attr(inode).await {
             trace!("MetaClient: Inode cache HIT for inode {}", inode);
@@ -902,7 +901,6 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         let attr = self.store.stat(inode).await?;
 
         if let Some(ref a) = attr {
-            debug!("MetaClient: Caching attr for inode {}", inode);
             self.inode_cache.insert_node(inode, a.clone(), None).await;
         }
 
@@ -926,25 +924,20 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
     #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn cached_lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
         let parent = self.check_root(parent);
-        debug!("MetaClient: lookup request for ({}, '{}')", parent, name);
 
         if let Some(ino) = self.inode_cache.lookup(parent, name).await {
-            debug!(
-                "MetaClient: Inode cache HIT for ({}, '{}') -> inode {}",
+            trace!(
+                "MetaClient: lookup HIT ({}, '{}') -> inode {}",
                 parent, name, ino
             );
             return Ok(Some(ino));
         }
 
-        debug!("MetaClient: Inode cache MISS for ({}, '{}')", parent, name);
+        trace!("MetaClient: lookup MISS ({}, '{}')", parent, name);
 
         let result = self.store.lookup(parent, name).await?;
 
         if let Some(ino) = result {
-            debug!(
-                "MetaClient: Caching lookup result ({}, '{}') -> inode {}",
-                parent, name, ino
-            );
             if let Ok(Some(attr)) = self.store.stat(ino).await {
                 let cache_parent = matches!(attr.kind, FileType::Dir).then_some(parent);
 

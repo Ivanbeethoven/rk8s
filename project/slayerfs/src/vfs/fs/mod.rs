@@ -296,16 +296,26 @@ where
                         use crate::vfs::io::split_chunk_spans;
 
                         let spans = split_chunk_spans(layout, start, len as usize);
+                        // Issue all spans concurrently — each span fetches
+                        // its blocks via SingleFlight so parallelism is bounded
+                        // by the prefetch semaphore, not serialized here.
+                        let mut tasks = Vec::with_capacity(spans.len());
                         for span in spans {
                             let cid = match chunk_id_for(ino, span.index) {
                                 Ok(c) => c,
                                 Err(_) => continue,
                             };
-                            let mut fetcher = DataFetcher::new(layout, cid, &*backend);
-                            if fetcher.prepare_slices().await.is_err() {
-                                continue;
-                            }
-                            let _ = fetcher.read_at(span.offset.into(), span.len as usize).await;
+                            let backend = backend.clone();
+                            tasks.push(tokio::spawn(async move {
+                                let mut fetcher = DataFetcher::new(layout, cid, &*backend);
+                                if fetcher.prepare_slices().await.is_err() {
+                                    return;
+                                }
+                                let _ = fetcher.read_at(span.offset.into(), span.len as usize).await;
+                            }));
+                        }
+                        for t in tasks {
+                            let _ = t.await;
                         }
                     }
                 },

@@ -254,7 +254,7 @@ impl DiskStorage {
             bytes_used: Arc::new(AtomicU64::new(initial_bytes)),
             max_bytes,
             read_sem: Arc::new(Semaphore::new(16)),
-            write_sem: Arc::new(Semaphore::new(8)),
+            write_sem: Arc::new(Semaphore::new(32)),
         })
     }
 
@@ -1517,28 +1517,19 @@ impl ChunksCache {
     }
 
     pub async fn get(&self, key: &String) -> Option<Vec<u8>> {
-        trace!("Cache GET request for key: {}", key);
-        self.policy.record_access(key.clone()).await;
-
-        // Check hot cache first
+        // Check hot cache first — fastest path, no promotion tracking needed.
         if let Some(value) = self.hot_cache.get(key).await {
-            debug!(
-                "Hot cache HIT for key: {}, size: {} bytes",
-                key,
-                value.len()
-            );
+            trace!("Hot cache HIT: {} ({} bytes)", key, value.len());
             self.policy.record_cache_request(true);
-            self.update_utilization_metrics();
             return Some(value);
         }
 
-        debug!("Hot cache MISS for key: {}", key);
+        trace!("Hot cache MISS: {}", key);
         self.policy.record_cache_request(false);
 
         // Try loading from disk directly — the cold_cache index may have
         // evicted the key marker but the file can still exist on disk
         // (populated by write-through or prior reads).
-        trace!("Loading data from disk for key: {}", key);
         let value = match self.disk_storage.load(key).await {
             Ok(value) if !value.is_empty() => value,
             Ok(_) => {
@@ -1550,6 +1541,9 @@ impl ChunksCache {
         };
 
         debug!("Loaded {} bytes from disk for key: {}", value.len(), key);
+
+        // Record access only for disk hits — drives promotion decisions.
+        self.policy.record_access(key.clone()).await;
 
         // Re-populate cold cache index so future lookups are faster
         self.cold_cache.insert(key.clone(), ()).await;
@@ -1655,19 +1649,9 @@ impl ChunksCache {
     }
 
     pub async fn insert(&self, key: &str, data: &Vec<u8>) -> anyhow::Result<()> {
-        debug!(
-            "Cache INSERT request for key: {}, size: {} bytes",
-            key,
-            data.len()
-        );
         self.insert_hot(key, data.clone()).await;
-        trace!("Storing on disk: {}", key);
         self.disk_storage.store(key, data).await?;
-
-        trace!("Adding to cold cache: {}", key);
         self.cold_cache.insert(key.to_owned(), ()).await;
-
-        debug!("Successfully inserted key: {}", key);
         Ok(())
     }
 
@@ -1687,6 +1671,14 @@ impl ChunksCache {
     /// Returns None if disk I/O is saturated (all write_sem permits taken).
     pub fn try_disk_store_permit(&self, key: &str) -> Option<OwnedSemaphorePermit> {
         self.disk_storage.try_io_permit(key)
+    }
+
+    /// Store data to disk cache, awaiting a write permit if necessary.
+    /// Used by background write-cache population tasks.
+    pub async fn store_to_disk(&self, key: &str, data: Vec<u8>) -> anyhow::Result<()> {
+        self.disk_storage.store(key, &data).await?;
+        self.cold_cache.insert(key.to_owned(), ()).await;
+        Ok(())
     }
 
     /// Store data to disk cache using a pre-acquired permit.

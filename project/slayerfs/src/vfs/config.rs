@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub const DEFAULT_PAGE_SIZE: u32 = 64 * 1024; // 64KB
-pub const DEFAULT_MAX_AHEAD: u64 = 32 * 1024 * 1024; // 32MB
+pub const DEFAULT_MAX_AHEAD: u64 = 64 * 1024 * 1024; // 64MB — 16 blocks pipeline depth
 pub const DEFAULT_BUFFER_SIZE: u64 = 1024 * 1024 * 300; // 300MB
 pub const DEFAULT_WRITE_BUFFER_SIZE: u64 = 1024 * 1024 * 300; // 300MB
 pub const DEFAULT_FLUSH_ALL_INTERVAL: Duration = Duration::from_secs(5);

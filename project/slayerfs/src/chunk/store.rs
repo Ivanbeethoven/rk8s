@@ -316,10 +316,10 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
     }
 
     fn populate_write_cache_background(&self, key: String, data: Vec<u8>) {
-        // Populate memory cache always (fast, no I/O). Disk cache only if a
-        // write permit is immediately available — this prevents write-heavy
-        // workloads from saturating disk I/O while still warming the SSD cache
-        // when I/O capacity is idle.
+        // Populate memory hot cache immediately. Persist to disk if a write
+        // permit is available — with 32 permits this covers most workloads.
+        // Skipping under extreme I/O pressure avoids queuing hundreds of
+        // background tasks that compete with foreground uploads.
         let cache = self.block_cache.clone();
         tokio::spawn(async move {
             cache.insert_hot(&key, data.clone()).await;

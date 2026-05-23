@@ -35,10 +35,11 @@ fn default_mount_options() -> MountOptions {
     mo.allow_other(true);
     // Default to 4 MiB for higher throughput while keeping memory usage reasonable.
     mo.max_write(NonZeroU32::new(4 * 1024 * 1024).unwrap());
-    // Set kernel readahead to 4 MiB to match block size. Default 128KB is too small for a
-    // network FS with 4MB blocks — larger readahead lets the kernel coalesce reads and
-    // feeds our userspace prefetcher more efficiently.
-    mo.max_readahead(Some(4 * 1024 * 1024));
+    // Set kernel readahead to 16 MiB (4 blocks). Larger values cause excessive
+    // concurrent FUSE reads that create scheduling contention. 16 MiB lets the
+    // kernel pipeline 4 read requests while our userspace prefetcher handles
+    // deeper look-ahead independently.
+    mo.max_readahead(Some(16 * 1024 * 1024));
     mo
 }
 

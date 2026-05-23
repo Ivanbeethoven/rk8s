@@ -83,7 +83,7 @@ impl Default for CacheConfig {
             upload_concurrency: 32,
             prefetch_enabled: true,
             prefetch_initial_bytes: 4 * 1024 * 1024,
-            prefetch_max_bytes: 32 * 1024 * 1024,
+            prefetch_max_bytes: 64 * 1024 * 1024,
             prefetch_concurrency: 64,
             strict_posix: true,
             writeback_mode: WriteBackMode::UploadBeforeCommit,
@@ -115,6 +115,6 @@ mod tests {
         assert_eq!(config.read_memory_bytes, 300 * 1024 * 1024);
         assert_eq!(config.write_memory_bytes, 300 * 1024 * 1024);
         assert_eq!(config.dirty_slice_target_size, 8 * 1024 * 1024);
-        assert_eq!(config.prefetch_max_bytes, 32 * 1024 * 1024);
+        assert_eq!(config.prefetch_max_bytes, 64 * 1024 * 1024);
     }
 }

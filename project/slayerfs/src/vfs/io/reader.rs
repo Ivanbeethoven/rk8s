@@ -271,12 +271,13 @@ impl Session {
         let mut ahead = self.ahead;
 
         if ahead == 0 && block_size <= max_ahead && (offset == 0 || self.total > len) {
-            ahead = block_size;
+            // Start with 2 blocks to immediately fill the pipeline.
+            ahead = block_size.saturating_mul(2).min(max_ahead);
         } else if ahead < max_ahead
             && self.total >= ahead
             && total_ahead_limit > usage.saturating_add(ahead.saturating_mul(4))
         {
-            ahead = ahead.saturating_mul(2);
+            ahead = ahead.saturating_mul(2).min(max_ahead);
         } else if ahead >= block_size
             && (total_ahead_limit < usage.saturating_add(ahead / 2) || self.total < ahead / 4)
         {
