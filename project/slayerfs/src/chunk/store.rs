@@ -228,7 +228,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             page_cache,
             page_flight: SingleFlight::new(),
             read_flight: Arc::new(SingleFlight::new()),
-            range_prefetch_limit: Arc::new(Semaphore::new(1)),
+            range_prefetch_limit: Arc::new(Semaphore::new(8)),
             config,
             bandwidth: BandwidthLimiter::unlimited(),
         }
@@ -273,7 +273,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             page_cache,
             page_flight: SingleFlight::new(),
             read_flight: Arc::new(SingleFlight::new()),
-            range_prefetch_limit: Arc::new(Semaphore::new(1)),
+            range_prefetch_limit: Arc::new(Semaphore::new(8)),
             config: store_config,
             bandwidth: BandwidthLimiter::unlimited(),
         })
@@ -297,7 +297,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             page_cache,
             page_flight: SingleFlight::new(),
             read_flight: Arc::new(SingleFlight::new()),
-            range_prefetch_limit: Arc::new(Semaphore::new(1)),
+            range_prefetch_limit: Arc::new(Semaphore::new(8)),
             config: store_config,
             bandwidth: BandwidthLimiter::unlimited(),
         })
@@ -356,7 +356,10 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
                     let raw = client.get_object(&key_str).await.map_err(|e| {
                         anyhow::anyhow!("object store get failed: {key_str}, {e:?}")
                     })?;
-                    let raw_bytes = raw.unwrap_or_default();
+                    let raw_bytes = match raw {
+                        Some(data) => data,
+                        None => return Ok(Bytes::new()), // Block doesn't exist (sparse)
+                    };
                     let decompressed = if !matches!(compression, Compression::None) {
                         decompress(&raw_bytes)
                             .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))?
@@ -615,7 +618,10 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                     let raw = client.get_object(&key_str).await.map_err(|e| {
                         anyhow::anyhow!("object store get failed: {key_str}, {e:?}")
                     })?;
-                    let raw_bytes = raw.unwrap_or_default();
+                    let raw_bytes = match raw {
+                        Some(data) => data,
+                        None => return Ok(Bytes::new()), // Block doesn't exist (sparse)
+                    };
                     // Decompress if compression is enabled (auto-detects from header)
                     let decompressed = if !matches!(compression, Compression::None) {
                         decompress(&raw_bytes)
@@ -628,13 +634,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                 .await
                 .map_err(|e| anyhow::anyhow!("SingleFlight read failed: {e}"))?;
 
-        // Populate memory cache immediately and disk cache opportunistically.
-        // Reads should not wait for local cache persistence after the object
-        // data has already been fetched.
-        self.block_cache
-            .insert_opportunistic(key_str.clone(), block_data.to_vec())
-            .await;
-
+        // Copy data to caller's buffer first — minimize read latency.
         let offset_usize = offset as usize;
         let end = offset_usize + len;
         let mut copy_len = 0;
@@ -644,6 +644,13 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             buf[..copy_len].copy_from_slice(&block_data.as_ref()[offset_usize..copy_end]);
         }
         tracing::Span::current().record("read_len", copy_len);
+
+        // Populate caches after serving the read — the hot cache insert is
+        // fast (in-memory) so we await it to ensure subsequent reads hit.
+        // Disk persistence is spawned in the background by insert_opportunistic.
+        self.block_cache
+            .insert_opportunistic(key_str.clone(), block_data.to_vec())
+            .await;
 
         Ok(())
     }
@@ -1168,10 +1175,9 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(
-            *backend.get_object_calls.lock().unwrap(),
-            1,
-            "concurrent small range misses should trigger one background full-block prefetch"
+        assert!(
+            *backend.get_object_calls.lock().unwrap() <= 8,
+            "concurrent small range misses should be bounded by prefetch concurrency limit"
         );
 
         Ok(())
@@ -1616,10 +1622,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        assert_eq!(
-            backend.max_full_gets.load(Ordering::SeqCst),
-            1,
-            "background range prefetch should run one full-block GET at a time"
+        assert!(
+            backend.max_full_gets.load(Ordering::SeqCst) <= 8,
+            "background range prefetch should respect concurrency limit (max 8)"
         );
         assert_eq!(backend.get_object_calls.load(Ordering::SeqCst), 2);
         assert_eq!(backend.current_full_gets.load(Ordering::SeqCst), 0);

@@ -1777,8 +1777,13 @@ where
                             shared.flush_notify.notify_waiters();
                             return;
                         }
-                        // Wait briefly for new data, then re-check.
-                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        // Wait for slice notification (new data or state change).
+                        let notify = slice.lock().notify.clone();
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(50),
+                            notify.notified(),
+                        )
+                        .await;
                     }
                     continue;
                 }

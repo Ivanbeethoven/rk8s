@@ -1604,12 +1604,10 @@ impl ChunksCache {
     }
 
     pub async fn insert_opportunistic(&self, key: String, data: Vec<u8>) {
-        debug!(
-            "Cache INSERT request for key: {}, size: {} bytes",
-            key,
-            data.len()
-        );
-        self.insert_hot(&key, data.clone()).await;
+        // Insert into hot memory cache (fast path for subsequent reads).
+        let len = data.len() as u64;
+        self.hot_cache.insert(key.clone(), data.clone()).await;
+        self.hot_bytes.fetch_add(len, Ordering::Relaxed);
 
         // Always attempt to persist to disk so future reads avoid S3.
         // If immediate permit is available, write now; otherwise spawn a
