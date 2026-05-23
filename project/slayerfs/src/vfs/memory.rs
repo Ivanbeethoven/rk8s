@@ -134,20 +134,35 @@ impl MemoryBudget {
     /// Try to allocate bytes for the reader (prefetch).
     /// Returns true if allocation succeeded (pressure < critical), false otherwise.
     pub fn try_alloc_reader(&self, bytes: u64) -> bool {
-        let current = self.inner.used_bytes.load(Ordering::Relaxed);
-        if current.saturating_add(bytes)
-            > (self.inner.total_bytes as f64 * WATERMARK_CRITICAL) as u64
-        {
-            trace!(
-                "Reader alloc rejected: used={:.1} MiB + request={:.1} MiB > critical={:.1} MiB",
-                current as f64 / 1048576.0,
-                bytes as f64 / 1048576.0,
-                (self.inner.total_bytes as f64 * WATERMARK_CRITICAL) / 1048576.0
-            );
-            return false;
+        let critical_limit = (self.inner.total_bytes as f64 * WATERMARK_CRITICAL) as u64;
+        loop {
+            let current = self.inner.used_bytes.load(Ordering::Relaxed);
+            if current.saturating_add(bytes) > critical_limit {
+                trace!(
+                    "Reader alloc rejected: used={:.1} MiB + request={:.1} MiB > critical={:.1} MiB",
+                    current as f64 / 1048576.0,
+                    bytes as f64 / 1048576.0,
+                    critical_limit as f64 / 1048576.0
+                );
+                return false;
+            }
+            // CAS: atomically reserve the bytes to avoid TOCTOU races
+            if self
+                .inner
+                .used_bytes
+                .compare_exchange_weak(
+                    current,
+                    current + bytes,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                self.inner.reader_bytes.fetch_add(bytes, Ordering::Relaxed);
+                return true;
+            }
+            // CAS failed (contention) — retry
         }
-        self.alloc_reader(bytes);
-        true
     }
 
     /// Allocate bytes for the writer (dirty buffers).

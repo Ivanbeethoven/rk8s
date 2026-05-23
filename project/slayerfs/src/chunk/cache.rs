@@ -307,15 +307,18 @@ impl DiskStorage {
         let (header, checksums) = super::cache_integrity::compute_framing(data_bytes);
         let total_len = (header.len() + data_bytes.len() + checksums.len()) as u64;
 
-        // Check if we need to evict before storing
+        // Atomically reserve space and trigger eviction if over budget.
+        // fetch_add is atomic — no race between multiple concurrent store() calls.
         if self.max_bytes > 0 {
-            let current = self.bytes_used.load(Ordering::Relaxed);
-            if current + total_len > self.max_bytes {
+            let prev = self.bytes_used.fetch_add(total_len, Ordering::Relaxed);
+            if prev + total_len > self.max_bytes {
                 self.evict_lru(total_len).await;
             }
+        } else {
+            self.bytes_used.fetch_add(total_len, Ordering::Relaxed);
         }
 
-        // If the file already exists, subtract its old size
+        // If the file already exists, subtract its old size (we already added total_len)
         if let Ok(meta) = tokio::fs::metadata(&filepath).await {
             self.bytes_used.fetch_sub(meta.len(), Ordering::Relaxed);
         }
@@ -324,12 +327,20 @@ impl DiskStorage {
         // For 4MB blocks, the header is 8 bytes and checksums are 512 bytes —
         // the copy cost is negligible vs the disk I/O latency.
         use tokio::io::AsyncWriteExt;
-        let mut file = tokio::fs::File::create(&filepath).await?;
-        file.write_all(&header).await?;
-        file.write_all(data_bytes).await?;
-        file.write_all(&checksums).await?;
+        let write_result = async {
+            let mut file = tokio::fs::File::create(&filepath).await?;
+            file.write_all(&header).await?;
+            file.write_all(data_bytes).await?;
+            file.write_all(&checksums).await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
 
-        self.bytes_used.fetch_add(total_len, Ordering::Relaxed);
+        if let Err(e) = write_result {
+            // Roll back the pre-reserved bytes on write failure
+            self.bytes_used.fetch_sub(total_len, Ordering::Relaxed);
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -422,7 +433,37 @@ impl DiskStorage {
 
         // Decode with CRC32C verification (handles legacy unencoded files too)
         match super::cache_integrity::decode(&raw) {
-            Some(data) => Ok(data),
+            Some(data) => {
+                // Touch atime so LRU eviction keeps hot data longer.
+                // Uses futimens with UTIME_NOW on atime only (mtime unchanged).
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let _ = std::fs::metadata(&filepath).map(|m| {
+                        let mtime = libc::timespec {
+                            tv_sec: m.mtime(),
+                            tv_nsec: m.mtime_nsec(),
+                        };
+                        let times = [
+                            libc::timespec {
+                                tv_sec: 0,
+                                tv_nsec: libc::UTIME_NOW,
+                            },
+                            mtime,
+                        ];
+                        let c_path =
+                            std::ffi::CString::new(filepath.as_os_str().as_encoded_bytes())
+                                .ok();
+                        if let Some(p) = c_path {
+                            unsafe {
+                                // SAFETY: valid null-terminated path and timespec array
+                                libc::utimensat(libc::AT_FDCWD, p.as_ptr(), times.as_ptr(), 0);
+                            }
+                        }
+                    });
+                }
+                Ok(data)
+            }
             None => {
                 // Corrupted — delete the file and return error
                 let _ = tokio::fs::remove_file(&filepath).await;
@@ -1438,7 +1479,10 @@ impl ChunksCache {
             .time_to_idle(Duration::from_secs(300))
             .time_to_live(Duration::from_secs(3600))
             .eviction_listener(move |_key, value: Vec<u8>, _cause| {
-                hot_bytes_evict.fetch_sub(value.len() as u64, Ordering::Relaxed);
+                // Saturating sub to prevent underflow from racing insert_hot/eviction
+                let _ = hot_bytes_evict.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(value.len() as u64))
+                });
             });
         let cold_cache_builder = moka::future::Cache::builder()
             .max_capacity(config.cold_cache_size as u64)
@@ -1554,8 +1598,9 @@ impl ChunksCache {
     }
 
     pub async fn insert_hot(&self, key: &str, data: Vec<u8>) {
-        trace!("Inserting into hot cache: {}", key);
+        let len = data.len() as u64;
         self.hot_cache.insert(key.to_owned(), data).await;
+        self.hot_bytes.fetch_add(len, Ordering::Relaxed);
     }
 
     pub async fn insert_opportunistic(&self, key: String, data: Vec<u8>) {

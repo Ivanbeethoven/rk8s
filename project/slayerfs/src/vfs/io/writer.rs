@@ -410,16 +410,18 @@ where
     /// the highest contiguous completed boundary.
     fn advance_upload_range(&self, start_idx: usize, end_idx: usize, _len: u64) {
         self.with_mut(|s| {
-            // Mark completed blocks in bitmask.
+            // Mark completed blocks in bitmask (guard against overflow).
             for idx in start_idx..end_idx {
-                s.block_done |= 1u64 << idx;
+                if idx < 64 {
+                    s.block_done |= 1u64 << idx;
+                }
             }
             s.in_flight = s.in_flight.saturating_sub(1);
 
             // Advance `uploaded` through contiguous completed blocks.
             let block_size = s.data.block_size() as u64;
             let mut current_block = (s.uploaded / block_size) as usize;
-            while (s.block_done >> current_block) & 1 == 1 {
+            while current_block < 64 && (s.block_done >> current_block) & 1 == 1 {
                 current_block += 1;
             }
             let new_uploaded = current_block as u64 * block_size;
@@ -450,7 +452,7 @@ where
             // Mark all blocks up to uploaded as done.
             let block_size = s.data.block_size() as u64;
             let done_end = (s.uploaded / block_size) as usize;
-            for idx in 0..done_end {
+            for idx in 0..done_end.min(64) {
                 s.block_done |= 1u64 << idx;
             }
 
