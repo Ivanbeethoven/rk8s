@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::net::lookup_host;
 use tokio::select;
@@ -397,6 +398,8 @@ const SET_PLOCK_LUA: &str = r#"
 "#;
 
 const CHUNK_ID_BASE: u64 = 1_000_000_000u64;
+pub(super) const REDIS_TXN_LOCK_STRIPES: usize = 1024;
+static REDIS_TXN_LOCKS: OnceLock<Vec<tokio::sync::Mutex<()>>> = OnceLock::new();
 
 const DELAYED_COUNTER_KEY: &str = "ds_counter";
 const DELAYED_KEY_PREFIX: &str = "ds";
@@ -1249,8 +1252,8 @@ impl RedisMetaStore {
             conn,
             _config: config,
             node_cache: moka::future::Cache::builder()
-                .max_capacity(10_000)
-                .time_to_live(Duration::from_secs(2))
+                .max_capacity(100_000)
+                .time_to_live(Duration::from_secs(30))
                 .build(),
             sid: std::sync::Mutex::new(None),
             epoch: std::sync::Mutex::new(None),
@@ -1333,6 +1336,41 @@ impl RedisMetaStore {
                     ino, chunk_index
                 )
             })
+    }
+
+    fn local_locks() -> &'static [tokio::sync::Mutex<()>] {
+        REDIS_TXN_LOCKS
+            .get_or_init(|| {
+                (0..REDIS_TXN_LOCK_STRIPES)
+                    .map(|_| tokio::sync::Mutex::new(()))
+                    .collect()
+            })
+            .as_slice()
+    }
+
+    pub(crate) fn local_lock_slot_for_key(key: &str) -> usize {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+
+        let mut hash = FNV_OFFSET;
+        for byte in key.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        (hash as usize) % REDIS_TXN_LOCK_STRIPES
+    }
+
+    fn local_lock_for_key(key: &str) -> &'static tokio::sync::Mutex<()> {
+        &Self::local_locks()[Self::local_lock_slot_for_key(key)]
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn with_local_lock_for_key<Fut>(key: &str, fut: Fut) -> Fut::Output
+    where
+        Fut: std::future::Future,
+    {
+        let _guard = Self::local_lock_for_key(key).lock().await;
+        fut.await
     }
 
     fn parse_chunk_id_from_chunk_key(key: &str) -> Option<u64> {
@@ -2905,10 +2943,11 @@ impl MetaStore for RedisMetaStore {
         fields(chunk_id, slice_id = slice.slice_id, offset = slice.offset, len = slice.length)
     )]
     async fn append_slice(&self, chunk_id: u64, slice: SliceDesc) -> Result<(), MetaError> {
-        let mut conn = self.conn.clone();
         let chunk_key = self.chunk_key(chunk_id);
         let version_key = self.chunk_version_key(chunk_id);
         let data = crate::meta::serialization::serialize_meta(&slice)?;
+        let _txn_guard = Self::local_lock_for_key(&chunk_key).lock().await;
+        let mut conn = self.conn.clone();
         redis::pipe()
             .atomic()
             .cmd("RPUSH")
@@ -2943,20 +2982,23 @@ impl MetaStore for RedisMetaStore {
         let data = crate::meta::serialization::serialize_meta(&slice)?;
         let now = current_time();
 
-        let script = redis::Script::new(WRITE_SLICE_LUA);
-        let result: String = script
-            .key(&chunk_key)
-            .key(&version_key)
-            .key(&node_key)
-            .arg(data)
-            .arg(new_size)
-            .arg(now)
-            .invoke_async(&mut self.conn.clone())
-            .await
-            .map_err(redis_err)?;
+        let response: LuaResponse = {
+            let _txn_guard = Self::local_lock_for_key(&chunk_key).lock().await;
+            let script = redis::Script::new(WRITE_SLICE_LUA);
+            let result: String = script
+                .key(&chunk_key)
+                .key(&version_key)
+                .key(&node_key)
+                .arg(data)
+                .arg(new_size)
+                .arg(now)
+                .invoke_async(&mut self.conn.clone())
+                .await
+                .map_err(redis_err)?;
 
-        let response: LuaResponse = serde_json::from_str(&result)
-            .map_err(|e| MetaError::Internal(format!("Lua response parse error: {e}")))?;
+            serde_json::from_str(&result)
+                .map_err(|e| MetaError::Internal(format!("Lua response parse error: {e}")))?
+        };
 
         match response.error.as_deref() {
             Some("node_not_found") => Err(MetaError::NotFound(ino)),
@@ -3092,6 +3134,7 @@ impl MetaStore for RedisMetaStore {
         let chunk_key = self.chunk_key(chunk_id);
         let version_key = self.chunk_version_key(chunk_id);
         let script = redis::Script::new(CHUNK_CAS_LUA);
+        let _txn_guard = Self::local_lock_for_key(&chunk_key).lock().await;
 
         for _ in 0..COMPACT_RETRY_LIMIT {
             let mut conn = self.conn.clone();
@@ -3209,6 +3252,7 @@ impl MetaStore for RedisMetaStore {
         let chunk_key = self.chunk_key(chunk_id);
         let version_key = self.chunk_version_key(chunk_id);
         let script = redis::Script::new(CHUNK_CAS_LUA);
+        let _txn_guard = Self::local_lock_for_key(&chunk_key).lock().await;
 
         for _ in 0..COMPACT_RETRY_LIMIT {
             let mut conn = self.conn.clone();

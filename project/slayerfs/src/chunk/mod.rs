@@ -16,6 +16,7 @@
 
 pub mod bandwidth;
 pub mod cache;
+pub mod cache_integrity;
 pub mod compact;
 pub mod compress;
 pub mod layout;
@@ -28,12 +29,12 @@ pub mod store;
 pub mod util;
 pub mod writer;
 
+pub use bandwidth::{BandwidthConfig, BandwidthLimiter};
 pub use compact::{BlockGcConfig, BlockStoreGC};
 pub use compact::{
     CompactResult, CompactionWorker, CompactionWorkerConfig, Compactor, CompactorError,
 };
 pub use compress::Compression;
-pub use bandwidth::{BandwidthConfig, BandwidthLimiter};
 pub use layout::{
     ChunkLayout, DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, chunk_index_of, within_chunk_offset,
 };

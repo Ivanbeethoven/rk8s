@@ -1,3 +1,4 @@
+#[allow(dead_code)] // Kept for future cache integration; currently bypassed by ObjectBlockStore
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 

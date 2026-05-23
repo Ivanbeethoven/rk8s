@@ -1,5 +1,7 @@
+#[allow(dead_code)] // Kept for future cache integration; currently bypassed by ObjectBlockStore
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[allow(dead_code)]
 use super::keys::CleanBlockKey;
 
 /// Statistics for the read cache.

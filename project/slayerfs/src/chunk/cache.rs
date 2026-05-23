@@ -14,7 +14,7 @@ use dirs::cache_dir;
 use sea_orm::sea_query::WindowSelectType;
 use sha2::{Digest, Sha256, digest::KeyInit};
 use tokio::fs;
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{debug, error, info, trace, warn};
 
 /// Configuration for the intelligent dual-layer cache system.
@@ -185,7 +185,7 @@ impl Default for ChunksCacheConfig {
         Self {
             hot_cache_size: 1024,
             cold_cache_size: 1024,
-            max_hot_bytes: 1024 * 1024 * 1024, // 1 GiB
+            max_hot_bytes: 1024 * 1024 * 1024,       // 1 GiB
             max_disk_bytes: 20 * 1024 * 1024 * 1024, // 20 GiB
             base_promotion_threshold: 10.0,
             short_window_size: Duration::from_secs(10),
@@ -220,12 +220,19 @@ struct DiskStorage {
     bytes_used: Arc<AtomicU64>,
     /// Maximum bytes allowed on disk (0 = unlimited)
     max_bytes: u64,
+    /// Semaphore for read operations (higher priority, separate pool)
+    read_sem: Arc<Semaphore>,
+    /// Semaphore for write/store operations
+    write_sem: Arc<Semaphore>,
 }
 
 impl DiskStorage {
     pub async fn new<P: AsRef<Path>>(base_dir: P, max_bytes: u64) -> anyhow::Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
-        debug!("Initializing disk storage at: {:?}, max_bytes: {}", base_dir, max_bytes);
+        debug!(
+            "Initializing disk storage at: {:?}, max_bytes: {}",
+            base_dir, max_bytes
+        );
 
         if !base_dir.exists() {
             info!("Creating cache directory: {:?}", base_dir);
@@ -236,12 +243,18 @@ impl DiskStorage {
 
         // Scan existing files to calculate initial bytes_used
         let initial_bytes = Self::scan_dir_size(&base_dir).await;
-        debug!("Initial disk cache usage: {} bytes ({:.1} MiB)", initial_bytes, initial_bytes as f64 / 1048576.0);
+        debug!(
+            "Initial disk cache usage: {} bytes ({:.1} MiB)",
+            initial_bytes,
+            initial_bytes as f64 / 1048576.0
+        );
 
         Ok(Self {
             base_dir,
             bytes_used: Arc::new(AtomicU64::new(initial_bytes)),
             max_bytes,
+            read_sem: Arc::new(Semaphore::new(16)),
+            write_sem: Arc::new(Semaphore::new(8)),
         })
     }
 
@@ -276,16 +289,29 @@ impl DiskStorage {
     }
 
     pub async fn store(&self, key: &str, data: impl AsRef<[u8]>) -> anyhow::Result<()> {
+        let permit = self.write_sem.clone().acquire_owned().await?;
+        self.store_with_permit(key, data, permit).await
+    }
+
+    async fn store_with_permit(
+        &self,
+        key: &str,
+        data: impl AsRef<[u8]>,
+        _permit: OwnedSemaphorePermit,
+    ) -> anyhow::Result<()> {
         let filename = Self::key_to_filename(key);
         let filepath = self.base_dir.join(&filename);
         let data_bytes = data.as_ref();
-        let data_len = data_bytes.len() as u64;
+
+        // Compute CRC32C framing without copying the data block
+        let (header, checksums) = super::cache_integrity::compute_framing(data_bytes);
+        let total_len = (header.len() + data_bytes.len() + checksums.len()) as u64;
 
         // Check if we need to evict before storing
         if self.max_bytes > 0 {
             let current = self.bytes_used.load(Ordering::Relaxed);
-            if current + data_len > self.max_bytes {
-                self.evict_lru(data_len).await;
+            if current + total_len > self.max_bytes {
+                self.evict_lru(total_len).await;
             }
         }
 
@@ -294,23 +320,34 @@ impl DiskStorage {
             self.bytes_used.fetch_sub(meta.len(), Ordering::Relaxed);
         }
 
-        trace!(
-            "Storing {} bytes for key '{}' to file: {:?}",
-            data_bytes.len(),
-            key,
-            filepath
-        );
+        // Write [header][data][checksums] using a single assembled buffer.
+        // For 4MB blocks, the header is 8 bytes and checksums are 512 bytes —
+        // the copy cost is negligible vs the disk I/O latency.
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::File::create(&filepath).await?;
+        file.write_all(&header).await?;
+        file.write_all(data_bytes).await?;
+        file.write_all(&checksums).await?;
 
-        tokio::fs::write(&filepath, data_bytes).await?;
-        self.bytes_used.fetch_add(data_len, Ordering::Relaxed);
+        self.bytes_used.fetch_add(total_len, Ordering::Relaxed);
 
-        debug!(
-            "Successfully stored data for key '{}', size: {} bytes, disk usage: {:.1} MiB",
-            key,
-            data_bytes.len(),
-            self.bytes_used.load(Ordering::Relaxed) as f64 / 1048576.0
-        );
         Ok(())
+    }
+
+    fn try_io_permit(&self, key: &str) -> Option<OwnedSemaphorePermit> {
+        let Ok(permit) = self.write_sem.clone().try_acquire_owned() else {
+            trace!(
+                "Skipping disk cache store for key '{}' because IO is busy",
+                key
+            );
+            return None;
+        };
+        Some(permit)
+    }
+
+    /// Clone the write IO semaphore Arc for deferred disk cache writes.
+    fn io_sem_clone(&self) -> Arc<Semaphore> {
+        self.write_sem.clone()
     }
 
     /// Evict oldest files (by access time) to free at least `needed_bytes`
@@ -321,7 +358,11 @@ impl DiskStorage {
             return;
         }
         let to_free = current - target;
-        debug!("Disk cache eviction: need to free {} bytes ({:.1} MiB)", to_free, to_free as f64 / 1048576.0);
+        debug!(
+            "Disk cache eviction: need to free {} bytes ({:.1} MiB)",
+            to_free,
+            to_free as f64 / 1048576.0
+        );
 
         // Collect files with their access times
         let mut files: Vec<(PathBuf, u64, u64)> = Vec::new(); // (path, size, atime_secs)
@@ -332,7 +373,8 @@ impl DiskStorage {
         while let Ok(Some(entry)) = entries.next_entry().await {
             if let Ok(meta) = entry.metadata().await {
                 if meta.is_file() {
-                    let atime = meta.accessed()
+                    let atime = meta
+                        .accessed()
                         .unwrap_or(SystemTime::UNIX_EPOCH)
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
@@ -356,32 +398,38 @@ impl DiskStorage {
                 trace!("Evicted cache file: {:?} ({} bytes)", path, size);
             }
         }
-        debug!("Disk cache eviction complete: freed {} bytes ({:.1} MiB)", freed, freed as f64 / 1048576.0);
+        debug!(
+            "Disk cache eviction complete: freed {} bytes ({:.1} MiB)",
+            freed,
+            freed as f64 / 1048576.0
+        );
     }
 
     pub async fn load(&self, key: &str) -> anyhow::Result<Vec<u8>> {
         let filename = Self::key_to_filename(key);
         let filepath = self.base_dir.join(filename);
 
-        trace!("Loading data for key '{}' from file: {:?}", key, filepath);
-
-        if !filepath.exists() {
-            trace!("File does not exist for key '{}': {:?}", key, filepath);
-            return Err(anyhow!("file {} does not exist", filepath.display()));
-        }
-
-        match tokio::fs::read(filepath).await {
-            Ok(data) => {
-                debug!(
-                    "Successfully loaded data for key '{}', size: {} bytes",
-                    key,
-                    data.len()
-                );
-                Ok(data)
+        let _permit = self.read_sem.clone().acquire_owned().await?;
+        let raw = match tokio::fs::read(&filepath).await {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(anyhow!("file {} does not exist", filepath.display()));
             }
             Err(e) => {
-                error!("Failed to load data for key '{}': {}", key, e);
-                Err(e.into())
+                return Err(e.into());
+            }
+        };
+
+        // Decode with CRC32C verification (handles legacy unencoded files too)
+        match super::cache_integrity::decode(&raw) {
+            Some(data) => Ok(data),
+            None => {
+                // Corrupted — delete the file and return error
+                let _ = tokio::fs::remove_file(&filepath).await;
+                Err(anyhow!(
+                    "CRC32C verification failed for cache key '{}', file deleted",
+                    key
+                ))
             }
         }
     }
@@ -401,8 +449,12 @@ impl DiskStorage {
         }
 
         // Get size before removing
-        let file_size = tokio::fs::metadata(&filepath).await.map(|m| m.len()).unwrap_or(0);
+        let file_size = tokio::fs::metadata(&filepath)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
 
+        let _permit = self.write_sem.clone().acquire_owned().await?;
         match tokio::fs::remove_file(&filepath).await {
             Ok(_) => {
                 self.bytes_used.fetch_sub(file_size, Ordering::Relaxed);
@@ -1326,6 +1378,7 @@ pub struct CacheStats {
 /// - **Cold Cache**: Stores only `()` markers, minimal memory overhead
 /// - **Access Stats**: Per-key statistics, automatically cleaned up when idle
 /// - **Disk Storage**: Uses system temp directory, respects available space
+#[derive(Clone)]
 pub struct ChunksCache {
     /// Persistent disk storage backend with SHA256-based file naming
     disk_storage: DiskStorage,
@@ -1358,7 +1411,11 @@ impl ChunksCache {
     pub async fn new_with_config(mut config: ChunksCacheConfig) -> anyhow::Result<Self> {
         debug!(
             "Creating new ChunksCache with configuration: hot_cache_size={}, cold_cache_size={}, max_hot_bytes={}, max_disk_bytes={}, base_promotion_threshold={}",
-            config.hot_cache_size, config.cold_cache_size, config.max_hot_bytes, config.max_disk_bytes, config.base_promotion_threshold
+            config.hot_cache_size,
+            config.cold_cache_size,
+            config.max_hot_bytes,
+            config.max_disk_bytes,
+            config.base_promotion_threshold
         );
 
         let cache_dir = config
@@ -1434,57 +1491,39 @@ impl ChunksCache {
         debug!("Hot cache MISS for key: {}", key);
         self.policy.record_cache_request(false);
 
-        let diskstorage = self.disk_storage.clone();
-        let policy = self.policy.clone();
-        let hot_cache = self.hot_cache.clone();
-        let hot_bytes = self.hot_bytes.clone();
-        let key_owned = key.to_string();
-
-        // ensure key exists in cold cache
-        self.cold_cache.get(key).await?;
-
-        let load_future = async move {
-            trace!("Loading data from disk for key: {}", key_owned);
-            let value = diskstorage.load(&key_owned).await.ok().unwrap_or_default();
-
-            if value.is_empty() {
-                warn!("No data found on disk for key: {}", key_owned);
-                return value;
+        // Try loading from disk directly — the cold_cache index may have
+        // evicted the key marker but the file can still exist on disk
+        // (populated by write-through or prior reads).
+        trace!("Loading data from disk for key: {}", key);
+        let value = match self.disk_storage.load(key).await {
+            Ok(value) if !value.is_empty() => value,
+            Ok(_) => {
+                return None;
             }
-
-            debug!(
-                "Loaded {} bytes from disk for key: {}",
-                value.len(),
-                key_owned
-            );
-
-            if policy.should_promote(key_owned.clone()).await {
-                debug!("Promoting key to hot cache: {}", key_owned);
-                hot_cache.insert(key_owned.clone(), value.clone()).await;
-                hot_bytes.fetch_add(value.len() as u64, Ordering::Relaxed);
-            } else {
-                trace!("Key not eligible for promotion: {}", key_owned);
+            Err(_) => {
+                return None;
             }
-
-            value
         };
 
-        let value = self.hot_cache.get_with_by_ref(key, load_future).await;
+        debug!("Loaded {} bytes from disk for key: {}", value.len(), key);
+
+        // Re-populate cold cache index so future lookups are faster
+        self.cold_cache.insert(key.clone(), ()).await;
+
+        if self.policy.should_promote(key.clone()).await {
+            debug!("Promoting key to hot cache: {}", key);
+            self.hot_cache.insert(key.clone(), value.clone()).await;
+            self.hot_bytes
+                .fetch_add(value.len() as u64, Ordering::Relaxed);
+        }
 
         self.update_utilization_metrics();
-
-        if value.is_empty() {
-            debug!("No data found for key: {}", key);
-            None
-        } else {
-            debug!("Returning {} bytes for key: {}", value.len(), key);
-            value.into()
-        }
+        Some(value)
     }
 
     /// Update cache utilization metrics (using byte-based utilization)
     fn update_utilization_metrics(&self) {
-        let hot_bytes = self.hot_bytes.load(Ordering::Relaxed);
+        let hot_bytes = self.hot_cache.weighted_size();
         let max_bytes = self.config.max_hot_bytes;
         // Convert byte utilization to entry-like scale for the policy
         let utilization_scaled = if max_bytes > 0 {
@@ -1499,13 +1538,14 @@ impl ChunksCache {
             self.disk_storage.bytes_used() as f64 / 1048576.0,
             self.config.max_disk_bytes as f64 / 1048576.0,
         );
-        self.policy.update_cache_utilization(utilization_scaled, 10000);
+        self.policy
+            .update_cache_utilization(utilization_scaled, 10000);
     }
 
     /// Get cache statistics
     pub fn stats(&self) -> CacheStats {
         CacheStats {
-            hot_bytes: self.hot_bytes.load(Ordering::Relaxed),
+            hot_bytes: self.hot_cache.weighted_size(),
             hot_entries: self.hot_cache.entry_count(),
             max_hot_bytes: self.config.max_hot_bytes,
             disk_bytes: self.disk_storage.bytes_used(),
@@ -1513,17 +1553,71 @@ impl ChunksCache {
         }
     }
 
-    pub async fn insert(&self, key: &str, data: &Vec<u8>) -> anyhow::Result<()> {
-        info!(
+    pub async fn insert_hot(&self, key: &str, data: Vec<u8>) {
+        trace!("Inserting into hot cache: {}", key);
+        self.hot_cache.insert(key.to_owned(), data).await;
+    }
+
+    pub async fn insert_opportunistic(&self, key: String, data: Vec<u8>) {
+        debug!(
             "Cache INSERT request for key: {}, size: {} bytes",
             key,
             data.len()
         );
-        trace!("Inserting into hot cache: {}", key);
-        self.hot_cache.insert(key.to_owned(), data.clone()).await;
-        self.hot_bytes
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.insert_hot(&key, data.clone()).await;
 
+        // Always attempt to persist to disk so future reads avoid S3.
+        // If immediate permit is available, write now; otherwise spawn a
+        // task that waits for a permit with a short timeout.  This ensures
+        // read-miss blocks reliably populate the disk cache even under
+        // concurrent I/O pressure.
+        let disk_storage = self.disk_storage.clone();
+        let cold_cache = self.cold_cache.clone();
+        if let Some(permit) = self.disk_storage.try_io_permit(&key) {
+            tokio::spawn(async move {
+                match disk_storage.store_with_permit(&key, data, permit).await {
+                    Ok(()) => {
+                        cold_cache.insert(key, ()).await;
+                    }
+                    Err(err) => {
+                        warn!(error = ?err, key, "Failed to store disk cache entry");
+                    }
+                }
+            });
+        } else {
+            let io_sem = self.disk_storage.io_sem_clone();
+            tokio::spawn(async move {
+                // Wait up to 2s for a permit — under normal load this is
+                // nearly instant; under extreme pressure we drop silently
+                // rather than queue unboundedly.
+                let permit = match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    io_sem.acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(p)) => p,
+                    _ => return,
+                };
+                match disk_storage.store_with_permit(&key, data, permit).await {
+                    Ok(()) => {
+                        cold_cache.insert(key, ()).await;
+                    }
+                    Err(err) => {
+                        warn!(error = ?err, key, "Failed to store disk cache entry (deferred)");
+                    }
+                }
+            });
+        }
+    }
+
+    pub async fn insert(&self, key: &str, data: &Vec<u8>) -> anyhow::Result<()> {
+        debug!(
+            "Cache INSERT request for key: {}, size: {} bytes",
+            key,
+            data.len()
+        );
+        self.insert_hot(key, data.clone()).await;
         trace!("Storing on disk: {}", key);
         self.disk_storage.store(key, data).await?;
 
@@ -1535,7 +1629,7 @@ impl ChunksCache {
     }
 
     pub async fn remove(&self, key: &String) -> anyhow::Result<()> {
-        info!("Cache REMOVE request for key: {}", key);
+        debug!("Cache REMOVE request for key: {}", key);
         trace!("Invalidating from hot cache: {}", key);
         self.hot_cache.invalidate(key).await;
         // self.disk_storage.remove(key).await?;
@@ -1545,8 +1639,28 @@ impl ChunksCache {
         debug!("Successfully removed key: {}", key);
         Ok(())
     }
-}
 
+    /// Try to acquire a disk write permit without blocking.
+    /// Returns None if disk I/O is saturated (all write_sem permits taken).
+    pub fn try_disk_store_permit(&self, key: &str) -> Option<OwnedSemaphorePermit> {
+        self.disk_storage.try_io_permit(key)
+    }
+
+    /// Store data to disk cache using a pre-acquired permit.
+    /// Used by write-path cache population to avoid blocking on permit acquisition.
+    pub async fn store_to_disk_with_permit(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        permit: OwnedSemaphorePermit,
+    ) -> anyhow::Result<()> {
+        self.disk_storage
+            .store_with_permit(key, data, permit)
+            .await?;
+        self.cold_cache.insert(key.to_owned(), ()).await;
+        Ok(())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1733,11 +1847,7 @@ mod tests {
 
         // Launch multiple concurrent tasks
         for i in 0..10 {
-            let storage_clone = DiskStorage {
-                base_dir: storage.base_dir.clone(),
-                bytes_used: storage.bytes_used.clone(),
-                max_bytes: storage.max_bytes,
-            };
+            let storage_clone = storage.clone();
             let etag = format!("concurrent_etag_{}", i);
             let data = format!("Data for {}", i).into_bytes();
 

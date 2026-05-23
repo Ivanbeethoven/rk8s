@@ -17,10 +17,10 @@ use futures::executor::block_on;
 use hex::encode;
 use moka::{Entry, ops::compute::Op};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fs, io::SeekFrom, path::PathBuf, sync::LazyLock};
+use std::{collections::HashMap, fs, io::SeekFrom, path::PathBuf, sync::Arc, sync::LazyLock};
 use tokio::{
     io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::RwLock,
+    sync::{RwLock, Semaphore},
 };
 
 /// Abstract block store interface (cadapter/S3/etc. can implement this).
@@ -136,15 +136,21 @@ impl BlockStore for InMemoryBlockStore {
 
 /// BlockStore backed by cadapter::client (key space `chunks/{chunk_id}/{block_index}`).
 pub struct ObjectBlockStore<B: ObjectBackend> {
-    client: ObjectClient<B>,
+    client: Arc<ObjectClient<B>>,
     block_cache: ChunksCache,
     /// Page-granularity (64KB) read cache for small range reads that would
     /// otherwise be discarded.  Intercepts repeated small random reads so they
     /// hit memory instead of making a network round-trip every time.
     page_cache: ReadPageCache,
+    /// SingleFlight controller for coalescing concurrent page-cache misses.
+    page_flight: SingleFlight<PageKey, Bytes>,
     /// SingleFlight controller for coalescing concurrent reads to the same block
     /// Thread-safe and shared across the store lifetime so concurrent requests can coalesce.
-    read_flight: SingleFlight<BlockKey, Bytes>,
+    read_flight: Arc<SingleFlight<BlockKey, Bytes>>,
+    /// Limits range-triggered background full-block prefetches. JuiceFS defaults
+    /// to a single prefetch worker; foreground reads are still allowed to use
+    /// read_flight directly and are not throttled by this semaphore.
+    range_prefetch_limit: Arc<Semaphore>,
     /// Configuration for read strategy
     config: BlockStoreConfig,
     /// Network bandwidth rate limiter for uploads/downloads
@@ -203,7 +209,8 @@ impl BlockStoreConfig {
     }
 }
 
-impl<B: ObjectBackend> ObjectBlockStore<B> {
+impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
+    #[allow(dead_code)]
     pub fn new(client: ObjectClient<B>) -> Self {
         let cache_dir = dirs::cache_dir().unwrap().join("slayerfs");
 
@@ -216,14 +223,26 @@ impl<B: ObjectBackend> ObjectBlockStore<B> {
         config.validate().expect("default config must be valid");
         let page_cache = ReadPageCache::new(config.page_cache_capacity, config.page_size);
         Self {
-            client,
+            client: Arc::new(client),
             block_cache,
             page_cache,
-            read_flight: SingleFlight::new(),
+            page_flight: SingleFlight::new(),
+            read_flight: Arc::new(SingleFlight::new()),
+            range_prefetch_limit: Arc::new(Semaphore::new(1)),
             config,
             bandwidth: BandwidthLimiter::unlimited(),
         }
     }
+
+    pub async fn new_async(client: ObjectClient<B>) -> anyhow::Result<Self> {
+        Self::new_with_configs_async(
+            client,
+            ChunksCacheConfig::default(),
+            BlockStoreConfig::default(),
+        )
+        .await
+    }
+
     /// Creates a new ObjectBlockStore with custom cache configuration
     #[allow(unused)]
     pub fn new_with_config(
@@ -249,10 +268,36 @@ impl<B: ObjectBackend> ObjectBlockStore<B> {
         let page_cache =
             ReadPageCache::new(store_config.page_cache_capacity, store_config.page_size);
         Ok(Self {
-            client,
+            client: Arc::new(client),
             block_cache,
             page_cache,
-            read_flight: SingleFlight::new(),
+            page_flight: SingleFlight::new(),
+            read_flight: Arc::new(SingleFlight::new()),
+            range_prefetch_limit: Arc::new(Semaphore::new(1)),
+            config: store_config,
+            bandwidth: BandwidthLimiter::unlimited(),
+        })
+    }
+
+    pub async fn new_with_configs_async(
+        client: ObjectClient<B>,
+        cache_config: ChunksCacheConfig,
+        store_config: BlockStoreConfig,
+    ) -> anyhow::Result<Self> {
+        store_config.validate()?;
+        let cache_dir = dirs::cache_dir().unwrap().join("slayerfs");
+        let _ = fs::create_dir_all(cache_dir.clone());
+
+        let block_cache = ChunksCache::new_with_config(cache_config).await?;
+        let page_cache =
+            ReadPageCache::new(store_config.page_cache_capacity, store_config.page_size);
+        Ok(Self {
+            client: Arc::new(client),
+            block_cache,
+            page_cache,
+            page_flight: SingleFlight::new(),
+            read_flight: Arc::new(SingleFlight::new()),
+            range_prefetch_limit: Arc::new(Semaphore::new(1)),
             config: store_config,
             bandwidth: BandwidthLimiter::unlimited(),
         })
@@ -269,10 +314,75 @@ impl<B: ObjectBackend> ObjectBlockStore<B> {
         let (chunk_id, block_index) = key;
         format!("chunks/{chunk_id}/{block_index}")
     }
+
+    fn populate_write_cache_background(&self, key: String, data: Vec<u8>) {
+        // Populate memory cache always (fast, no I/O). Disk cache only if a
+        // write permit is immediately available — this prevents write-heavy
+        // workloads from saturating disk I/O while still warming the SSD cache
+        // when I/O capacity is idle.
+        let cache = self.block_cache.clone();
+        tokio::spawn(async move {
+            cache.insert_hot(&key, data.clone()).await;
+            if let Some(permit) = cache.try_disk_store_permit(&key) {
+                let _ = cache.store_to_disk_with_permit(&key, data, permit).await;
+            }
+        });
+    }
+
+    fn prefetch_full_block_background(&self, key: BlockKey, key_str: String) {
+        let cache = self.block_cache.clone();
+        let client = self.client.clone();
+        let read_flight = self.read_flight.clone();
+        let prefetch_limit = self.range_prefetch_limit.clone();
+        let bandwidth = self.bandwidth.clone();
+        let compression = self.config.compression;
+        let block_size = self.config.block_size;
+
+        tokio::spawn(async move {
+            if cache.get(&key_str).await.is_some() {
+                return;
+            }
+
+            let Ok(_permit) = prefetch_limit.acquire_owned().await else {
+                return;
+            };
+            if cache.get(&key_str).await.is_some() {
+                return;
+            }
+
+            let block_data = read_flight
+                .execute(key, || async move {
+                    bandwidth.acquire_download(block_size).await;
+                    let raw = client.get_object(&key_str).await.map_err(|e| {
+                        anyhow::anyhow!("object store get failed: {key_str}, {e:?}")
+                    })?;
+                    let raw_bytes = raw.unwrap_or_default();
+                    let decompressed = if !matches!(compression, Compression::None) {
+                        decompress(&raw_bytes)
+                            .map_err(|e| anyhow::anyhow!("block decompression failed: {e}"))?
+                    } else {
+                        raw_bytes
+                    };
+                    Ok::<_, anyhow::Error>(Bytes::from(decompressed))
+                })
+                .await;
+
+            match block_data {
+                Ok(block_data) => {
+                    cache
+                        .insert_opportunistic(Self::key_for(key), block_data.to_vec())
+                        .await;
+                }
+                Err(err) => {
+                    tracing::debug!(error = %err, ?key, "background block prefetch failed");
+                }
+            }
+        });
+    }
 }
 
 #[async_trait]
-impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
+impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B> {
     #[tracing::instrument(name = "ObjectBlockStore.write_fresh_vectored", level = "trace", skip(self, chunks), fields(key = ?key, offset, chunk_count = chunks.len()))]
     async fn write_fresh_vectored(
         &self,
@@ -309,8 +419,10 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
             .await
             .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
 
-        // Write-through: populate read cache with uncompressed data.
-        let _ = self.block_cache.insert(&key_str, &full_block).await;
+        // Populate memory cache off the foreground upload path. Persistent
+        // disk cache is filled opportunistically by read misses to avoid
+        // write-heavy workloads spilling large backlogs into the next phase.
+        self.populate_write_cache_background(key_str, full_block);
 
         Ok(total_len as u64)
     }
@@ -349,8 +461,10 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
             .await
             .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
 
-        // Write-through: populate read cache with uncompressed data.
-        let _ = self.block_cache.insert(&key_str, &full_block).await;
+        // Populate memory cache off the foreground upload path. Persistent
+        // disk cache is filled opportunistically by read misses to avoid
+        // write-heavy workloads spilling large backlogs into the next phase.
+        self.populate_write_cache_background(key_str, full_block);
 
         Ok(data.len() as u64)
     }
@@ -382,7 +496,27 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
 
         let range_size_threshold = self.config.range_size_threshold();
 
-        if len <= range_size_threshold {
+        if matches!(self.config.compression, Compression::None)
+            && offset > 0
+            && len <= range_size_threshold
+        {
+            if let Some(block_data) = self.read_flight.try_piggyback(&key).await {
+                tracing::Span::current().record("strategy", "piggyback_full");
+                let block_data = block_data
+                    .map_err(|e| anyhow::anyhow!("SingleFlight piggyback read failed: {e}"))?;
+
+                let offset_usize = offset as usize;
+                let end = offset_usize + len;
+                let mut copy_len = 0;
+                if offset_usize < block_data.len() {
+                    let copy_end = end.min(block_data.len());
+                    copy_len = copy_end - offset_usize;
+                    buf[..copy_len].copy_from_slice(&block_data.as_ref()[offset_usize..copy_end]);
+                }
+                tracing::Span::current().record("read_len", copy_len);
+                return Ok(());
+            }
+
             // Small range read — serve via page-granularity cache so that
             // repeated small reads within the same 64KB page avoid a network
             // round-trip.
@@ -395,6 +529,7 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
             let page_cache = &self.page_cache;
             let mut pos: usize = 0;
             let mut total_read: usize = 0;
+            let mut range_missed = false;
 
             for page_idx in start_page..=end_page {
                 let page_start = page_idx * page_size;
@@ -407,19 +542,35 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
                     cached
                 } else {
                     tracing::Span::current().record("strategy", "page_cache_miss");
+                    range_missed = true;
                     let range_offset = page_start as u64;
                     let range_len = page_end - page_start;
-                    let mut page_buf = vec![0u8; range_len];
-                    let read_len = client
-                        .get_object_range(&key_str, range_offset, &mut page_buf)
+                    let page_key_str = key_str.clone();
+                    let page = self
+                        .page_flight
+                        .execute(cache_key, || async move {
+                            if let Some(cached) = page_cache.get(&cache_key).await {
+                                return Ok::<_, anyhow::Error>(cached);
+                            }
+
+                            let mut page_buf = vec![0u8; range_len];
+                            self.bandwidth.acquire_download(range_len).await;
+                            let read_len = client
+                                .get_object_range(&page_key_str, range_offset, &mut page_buf)
+                                .await
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "object store range read failed: {page_key_str}, {e:?}"
+                                    )
+                                })?;
+                            page_buf.truncate(read_len);
+                            let page_bytes = Bytes::from(page_buf);
+                            page_cache.insert(cache_key, page_bytes.clone()).await;
+                            Ok(page_bytes)
+                        })
                         .await
-                        .map_err(|e| {
-                            anyhow::anyhow!("object store range read failed: {key_str}, {e:?}")
-                        })?;
-                    page_buf.truncate(read_len);
-                    let page_bytes = Bytes::from(page_buf);
-                    page_cache.insert(cache_key, page_bytes.clone()).await;
-                    page_bytes
+                        .map_err(|e| anyhow::anyhow!("SingleFlight page read failed: {e}"))?;
+                    page.as_ref().clone()
                 };
 
                 // Determine the byte range within this page that the caller needs
@@ -443,6 +594,9 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
             }
 
             tracing::Span::current().record("read_len", total_read);
+            if range_missed && total_read > 0 {
+                self.prefetch_full_block_background(key, key_str);
+            }
             return Ok(());
         }
 
@@ -455,6 +609,9 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
             self.read_flight
                 .execute(key, || async move {
                     let key_str = Self::key_for(key);
+                    self.bandwidth
+                        .acquire_download(self.config.block_size)
+                        .await;
                     let raw = client.get_object(&key_str).await.map_err(|e| {
                         anyhow::anyhow!("object store get failed: {key_str}, {e:?}")
                     })?;
@@ -471,13 +628,11 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
                 .await
                 .map_err(|e| anyhow::anyhow!("SingleFlight read failed: {e}"))?;
 
-        // Rate limit download bandwidth (applied after receiving data)
-        self.bandwidth.acquire_download(block_data.len()).await;
-
-        // Populate cache with the decompressed full block for future reads.
-        let _ = self
-            .block_cache
-            .insert(&key_str, &block_data.to_vec())
+        // Populate memory cache immediately and disk cache opportunistically.
+        // Reads should not wait for local cache persistence after the object
+        // data has already been fetched.
+        self.block_cache
+            .insert_opportunistic(key_str.clone(), block_data.to_vec())
             .await;
 
         let offset_usize = offset as usize;
@@ -533,7 +688,7 @@ mod tests {
     async fn test_localfs_block_store_put_get() {
         let tmp = tempfile::tempdir().unwrap();
         let client = ObjectClient::new(LocalFsBackend::new(tmp.path()));
-        let store = ObjectBlockStore::new(client);
+        let store = ObjectBlockStore::new_async(client).await.unwrap();
         let layout = ChunkLayout::default();
 
         let data = vec![7u8; layout.block_size as usize / 2];
@@ -554,7 +709,9 @@ mod tests {
     async fn test_cache_effectiveness() -> io::Result<()> {
         let tmp = tempfile::tempdir()?;
         let client = ObjectClient::new(LocalFsBackend::new(tmp.path()));
-        let store = ObjectBlockStore::new(client);
+        let store = ObjectBlockStore::new_async(client)
+            .await
+            .map_err(io::Error::other)?;
         let layout = ChunkLayout::default();
         let data = vec![7u8; layout.block_size as usize / 2];
         store
@@ -607,7 +764,9 @@ mod tests {
                 let mut data = HashMap::new();
                 // Create a 4MB block with known pattern
                 let block_data: Vec<u8> = (0..4_194_304).map(|i| (i % 256) as u8).collect();
-                data.insert("chunks/42/3".to_string(), block_data);
+                data.insert("chunks/42/3".to_string(), block_data.clone());
+                data.insert("chunks/42/4".to_string(), block_data.clone());
+                data.insert("chunks/42/5".to_string(), block_data);
 
                 Self {
                     data: Arc::new(Mutex::new(data)),
@@ -684,32 +843,33 @@ mod tests {
         let config = BlockStoreConfig {
             block_size: 4 * 1024 * 1024,
             range_read_threshold: 0.25, // 1MB threshold
+            compression: Compression::None,
             ..Default::default()
         };
-        let store = Arc::new(ObjectBlockStore::new_with_configs(
-            client,
-            ChunksCacheConfig::default(),
-            config,
-        )?);
+        let store = Arc::new(
+            ObjectBlockStore::new_with_configs_async(client, ChunksCacheConfig::default(), config)
+                .await?,
+        );
 
         backend.reset_stats();
 
-        // Small read (512KB < 1MB threshold) — uses page cache.
-        // 512KB = 8 × 64KB pages, each page triggers one range GET on first access.
+        // Small read at block start should load the full block. JuiceFS only
+        // uses loadRange() when offset > 0, so sequential reads from the start
+        // warm the block cache immediately instead of fragmenting into pages.
         let mut small_buf = vec![0u8; 512 * 1024];
         store.read_range((42, 3), 0, &mut small_buf).await?;
 
         let stats = backend.get_stats();
         assert_eq!(
-            stats.get_object_range_calls, 8,
-            "512KB read should fetch 8 pages (8 × 64KB range reads)"
+            stats.get_object_calls, 1,
+            "Small read at block start should use full block read"
         );
         assert_eq!(
-            stats.get_object_calls, 0,
-            "Small read should not use full block read"
+            stats.get_object_range_calls, 0,
+            "Small read at block start should not use range reads"
         );
 
-        // Same read again — all pages should hit the page cache, zero new backend calls.
+        // Same read again should hit the full block cache.
         backend.reset_stats();
         let mut small_buf2 = vec![0u8; 512 * 1024];
         store.read_range((42, 3), 0, &mut small_buf2).await?;
@@ -718,18 +878,40 @@ mod tests {
         let stats = backend.get_stats();
         assert_eq!(
             stats.get_object_range_calls, 0,
-            "Re-read of same range should hit page cache (no new range reads)"
+            "Re-read of same range should hit block cache (no new range reads)"
         );
         assert_eq!(
             stats.get_object_calls, 0,
-            "Re-read should not fall back to full block read"
+            "Re-read should not issue another full block read"
+        );
+
+        // Non-zero small read still uses the page range path.
+        backend.reset_stats();
+        let mut range_buf = vec![0u8; 512 * 1024];
+        store.read_range((42, 4), 64 * 1024, &mut range_buf).await?;
+
+        let stats = backend.get_stats();
+        assert_eq!(
+            stats.get_object_range_calls, 8,
+            "Non-zero 512KB read should fetch 8 pages (8 x 64KB range reads)"
+        );
+        for _ in 0..100 {
+            if backend.get_stats().get_object_calls >= 1 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            backend.get_stats().get_object_calls,
+            1,
+            "Non-zero small read should trigger one background full-block prefetch"
         );
 
         backend.reset_stats();
 
         // Large read (2MB > 1MB threshold) — should use full block read.
         let mut large_buf = vec![0u8; 2 * 1024 * 1024];
-        store.read_range((42, 3), 0, &mut large_buf).await?;
+        store.read_range((42, 5), 0, &mut large_buf).await?;
 
         let stats = backend.get_stats();
         assert_eq!(stats.get_object_calls, 1, "Large read should use full read");
@@ -762,6 +944,685 @@ mod tests {
             stats.get_object_range_calls, 0,
             "Coalesced path should not fall back to range reads",
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_compressed_small_read_uses_full_object() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::cadapter::client::{ObjectBackend, ObjectClient};
+        use crate::chunk::compress::{Compression, compress};
+        use async_trait::async_trait;
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+        };
+
+        #[derive(Clone, Default)]
+        struct MockBackend {
+            data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+            get_object_calls: Arc<Mutex<usize>>,
+            get_object_range_calls: Arc<Mutex<usize>>,
+        }
+
+        #[async_trait]
+        impl ObjectBackend for MockBackend {
+            async fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+                self.data
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), data.to_vec());
+                Ok(())
+            }
+
+            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                *self.get_object_calls.lock().unwrap() += 1;
+                Ok(self.data.lock().unwrap().get(key).cloned())
+            }
+
+            async fn get_object_range(
+                &self,
+                key: &str,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                *self.get_object_range_calls.lock().unwrap() += 1;
+                if let Some(data) = self.data.lock().unwrap().get(key) {
+                    let offset = offset as usize;
+                    let end = (offset + buf.len()).min(data.len());
+                    if offset < data.len() {
+                        let copy_len = end - offset;
+                        buf[..copy_len].copy_from_slice(&data[offset..end]);
+                        return Ok(copy_len);
+                    }
+                }
+                Ok(0)
+            }
+
+            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
+                Ok("test_etag".to_string())
+            }
+
+            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+                self.data.lock().unwrap().remove(key);
+                Ok(())
+            }
+        }
+
+        let backend = MockBackend::default();
+        let raw = vec![0u8; 4 * 1024 * 1024];
+        let stored = compress(&raw, Compression::Lz4).into_owned();
+        assert!(stored.len() < raw.len() / 8);
+        backend
+            .data
+            .lock()
+            .unwrap()
+            .insert("chunks/7/0".to_string(), stored);
+
+        let config = BlockStoreConfig {
+            block_size: 4 * 1024 * 1024,
+            range_read_threshold: 0.25,
+            compression: Compression::Lz4,
+            ..Default::default()
+        };
+        let store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(backend.clone()),
+            ChunksCacheConfig::default(),
+            config,
+        )
+        .await?;
+
+        let mut out = vec![1u8; 512 * 1024];
+        store.read_range((7, 0), 2 * 1024 * 1024, &mut out).await?;
+
+        assert_eq!(out, vec![0u8; 512 * 1024]);
+        assert_eq!(*backend.get_object_calls.lock().unwrap(), 1);
+        assert_eq!(*backend.get_object_range_calls.lock().unwrap(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_small_reads_coalesce_same_page_miss()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::cadapter::client::{ObjectBackend, ObjectClient};
+        use async_trait::async_trait;
+        use futures::future;
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+        };
+        use tokio::time::{Duration, sleep};
+
+        #[derive(Clone, Default)]
+        struct MockBackend {
+            data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+            get_object_calls: Arc<Mutex<usize>>,
+            get_object_range_calls: Arc<Mutex<usize>>,
+        }
+
+        #[async_trait]
+        impl ObjectBackend for MockBackend {
+            async fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+                self.data
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), data.to_vec());
+                Ok(())
+            }
+
+            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                *self.get_object_calls.lock().unwrap() += 1;
+                Ok(self.data.lock().unwrap().get(key).cloned())
+            }
+
+            async fn get_object_range(
+                &self,
+                key: &str,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                sleep(Duration::from_millis(25)).await;
+                *self.get_object_range_calls.lock().unwrap() += 1;
+                if let Some(data) = self.data.lock().unwrap().get(key) {
+                    let offset = offset as usize;
+                    let end = (offset + buf.len()).min(data.len());
+                    if offset < data.len() {
+                        let copy_len = end - offset;
+                        buf[..copy_len].copy_from_slice(&data[offset..end]);
+                        return Ok(copy_len);
+                    }
+                }
+                Ok(0)
+            }
+
+            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
+                Ok("test_etag".to_string())
+            }
+
+            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+                self.data.lock().unwrap().remove(key);
+                Ok(())
+            }
+        }
+
+        let backend = MockBackend::default();
+        let block: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        backend
+            .data
+            .lock()
+            .unwrap()
+            .insert("chunks/55/0".to_string(), block);
+
+        let config = BlockStoreConfig {
+            block_size: 4 * 1024 * 1024,
+            range_read_threshold: 0.25,
+            compression: Compression::None,
+            ..Default::default()
+        };
+        let cache_dir = tempfile::tempdir()?;
+        let store = Arc::new(
+            ObjectBlockStore::new_with_configs_async(
+                ObjectClient::new(backend.clone()),
+                ChunksCacheConfig::with_budgets(
+                    16 * 1024 * 1024,
+                    16 * 1024 * 1024,
+                    cache_dir.path().to_path_buf(),
+                ),
+                config,
+            )
+            .await?,
+        );
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    store.read_range((55, 0), 1024, &mut buf).await?;
+                    anyhow::Ok(buf)
+                })
+            })
+            .collect();
+
+        let results = future::try_join_all(handles).await?;
+        for result in results {
+            assert_eq!(
+                result?,
+                (1024..1024 + 4096)
+                    .map(|i| (i % 251) as u8)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        assert_eq!(
+            *backend.get_object_range_calls.lock().unwrap(),
+            1,
+            "concurrent small reads for one page should share one range GET"
+        );
+
+        for _ in 0..100 {
+            if *backend.get_object_calls.lock().unwrap() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            *backend.get_object_calls.lock().unwrap(),
+            1,
+            "concurrent small range misses should trigger one background full-block prefetch"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_small_read_piggybacks_in_flight_full_block_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::cadapter::client::{ObjectBackend, ObjectClient};
+        use async_trait::async_trait;
+        use futures::future;
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+        };
+        use tokio::{
+            sync::Notify,
+            time::{Duration, sleep},
+        };
+
+        #[derive(Clone)]
+        struct MockBackend {
+            data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+            get_object_calls: Arc<Mutex<usize>>,
+            get_object_range_calls: Arc<Mutex<usize>>,
+            full_read_started: Arc<Notify>,
+            release_full_read: Arc<Notify>,
+        }
+
+        impl Default for MockBackend {
+            fn default() -> Self {
+                Self {
+                    data: Arc::new(Mutex::new(HashMap::new())),
+                    get_object_calls: Arc::new(Mutex::new(0)),
+                    get_object_range_calls: Arc::new(Mutex::new(0)),
+                    full_read_started: Arc::new(Notify::new()),
+                    release_full_read: Arc::new(Notify::new()),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl ObjectBackend for MockBackend {
+            async fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+                self.data
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), data.to_vec());
+                Ok(())
+            }
+
+            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                *self.get_object_calls.lock().unwrap() += 1;
+                self.full_read_started.notify_one();
+                self.release_full_read.notified().await;
+                Ok(self.data.lock().unwrap().get(key).cloned())
+            }
+
+            async fn get_object_range(
+                &self,
+                key: &str,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                *self.get_object_range_calls.lock().unwrap() += 1;
+                if let Some(data) = self.data.lock().unwrap().get(key) {
+                    let offset = offset as usize;
+                    let end = (offset + buf.len()).min(data.len());
+                    if offset < data.len() {
+                        let copy_len = end - offset;
+                        buf[..copy_len].copy_from_slice(&data[offset..end]);
+                        return Ok(copy_len);
+                    }
+                }
+                Ok(0)
+            }
+
+            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
+                Ok("test_etag".to_string())
+            }
+
+            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+                self.data.lock().unwrap().remove(key);
+                Ok(())
+            }
+        }
+
+        let backend = MockBackend::default();
+        let block: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        backend
+            .data
+            .lock()
+            .unwrap()
+            .insert("chunks/77/0".to_string(), block);
+
+        let config = BlockStoreConfig {
+            block_size: 4 * 1024 * 1024,
+            range_read_threshold: 0.25,
+            compression: Compression::None,
+            ..Default::default()
+        };
+        let cache_dir = tempfile::tempdir()?;
+        let store = Arc::new(
+            ObjectBlockStore::new_with_configs_async(
+                ObjectClient::new(backend.clone()),
+                ChunksCacheConfig::with_budgets(
+                    16 * 1024 * 1024,
+                    16 * 1024 * 1024,
+                    cache_dir.path().to_path_buf(),
+                ),
+                config,
+            )
+            .await?,
+        );
+
+        let large_store = store.clone();
+        let large_read = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2 * 1024 * 1024];
+            large_store.read_range((77, 0), 0, &mut buf).await?;
+            anyhow::Ok(buf)
+        });
+
+        backend.full_read_started.notified().await;
+
+        let small_store = store.clone();
+        let small_read = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            small_store.read_range((77, 0), 1024, &mut buf).await?;
+            anyhow::Ok(buf)
+        });
+
+        sleep(Duration::from_millis(20)).await;
+        backend.release_full_read.notify_waiters();
+
+        let large_buf = large_read.await??;
+        let small_buf = small_read.await??;
+
+        assert_eq!(
+            large_buf[..4096],
+            (0..4096).map(|i| (i % 251) as u8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            small_buf,
+            (1024..1024 + 4096)
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(*backend.get_object_calls.lock().unwrap(), 1);
+        assert_eq!(
+            *backend.get_object_range_calls.lock().unwrap(),
+            0,
+            "small read should join the in-flight full-block read instead of issuing range GET"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_small_range_read_prefetches_full_block_in_background()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::cadapter::client::{ObjectBackend, ObjectClient};
+        use async_trait::async_trait;
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+        };
+        use tokio::time::Duration;
+
+        #[derive(Clone, Default)]
+        struct MockBackend {
+            data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+            get_object_calls: Arc<Mutex<usize>>,
+            get_object_range_calls: Arc<Mutex<usize>>,
+        }
+
+        #[async_trait]
+        impl ObjectBackend for MockBackend {
+            async fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+                self.data
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), data.to_vec());
+                Ok(())
+            }
+
+            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                *self.get_object_calls.lock().unwrap() += 1;
+                Ok(self.data.lock().unwrap().get(key).cloned())
+            }
+
+            async fn get_object_range(
+                &self,
+                key: &str,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                *self.get_object_range_calls.lock().unwrap() += 1;
+                if let Some(data) = self.data.lock().unwrap().get(key) {
+                    let offset = offset as usize;
+                    let end = (offset + buf.len()).min(data.len());
+                    if offset < data.len() {
+                        let copy_len = end - offset;
+                        buf[..copy_len].copy_from_slice(&data[offset..end]);
+                        return Ok(copy_len);
+                    }
+                }
+                Ok(0)
+            }
+
+            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
+                Ok("test_etag".to_string())
+            }
+
+            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+                self.data.lock().unwrap().remove(key);
+                Ok(())
+            }
+        }
+
+        let backend = MockBackend::default();
+        let block: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        backend
+            .data
+            .lock()
+            .unwrap()
+            .insert("chunks/88/0".to_string(), block);
+
+        let cache_dir = tempfile::tempdir()?;
+        let config = BlockStoreConfig {
+            block_size: 4 * 1024 * 1024,
+            range_read_threshold: 0.25,
+            compression: Compression::None,
+            ..Default::default()
+        };
+        let store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(backend.clone()),
+            ChunksCacheConfig::with_budgets(
+                16 * 1024 * 1024,
+                16 * 1024 * 1024,
+                cache_dir.path().to_path_buf(),
+            ),
+            config,
+        )
+        .await?;
+
+        let mut small = vec![0u8; 4096];
+        store.read_range((88, 0), 1024, &mut small).await?;
+        assert_eq!(
+            small,
+            (1024..1024 + 4096)
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(*backend.get_object_range_calls.lock().unwrap(), 1);
+
+        for _ in 0..100 {
+            if *backend.get_object_calls.lock().unwrap() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            *backend.get_object_calls.lock().unwrap(),
+            1,
+            "range read should asynchronously prefetch the full block"
+        );
+        let block_cache_key = "chunks/88/0".to_string();
+        for _ in 0..50 {
+            if store.block_cache.get(&block_cache_key).await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            store.block_cache.get(&block_cache_key).await.is_some(),
+            "range read should asynchronously prefetch and cache the full block"
+        );
+        assert_eq!(*backend.get_object_calls.lock().unwrap(), 1);
+
+        let mut large = vec![0u8; 2 * 1024 * 1024];
+        store.read_range((88, 0), 0, &mut large).await?;
+        assert_eq!(
+            large[..4096],
+            (0..4096).map(|i| (i % 251) as u8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            *backend.get_object_calls.lock().unwrap(),
+            1,
+            "large read after background prefetch should hit block cache"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_background_range_prefetch_is_serialized() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::cadapter::client::{ObjectBackend, ObjectClient};
+        use async_trait::async_trait;
+        use futures::future;
+        use std::{
+            collections::HashMap,
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+            },
+        };
+        use tokio::time::Duration;
+
+        #[derive(Clone)]
+        struct MockBackend {
+            data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+            get_object_calls: Arc<AtomicUsize>,
+            get_object_range_calls: Arc<AtomicUsize>,
+            current_full_gets: Arc<AtomicUsize>,
+            max_full_gets: Arc<AtomicUsize>,
+            block_full_gets: Arc<AtomicBool>,
+        }
+
+        impl Default for MockBackend {
+            fn default() -> Self {
+                Self {
+                    data: Arc::new(Mutex::new(HashMap::new())),
+                    get_object_calls: Arc::new(AtomicUsize::new(0)),
+                    get_object_range_calls: Arc::new(AtomicUsize::new(0)),
+                    current_full_gets: Arc::new(AtomicUsize::new(0)),
+                    max_full_gets: Arc::new(AtomicUsize::new(0)),
+                    block_full_gets: Arc::new(AtomicBool::new(true)),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl ObjectBackend for MockBackend {
+            async fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+                self.data
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), data.to_vec());
+                Ok(())
+            }
+
+            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                self.get_object_calls.fetch_add(1, Ordering::SeqCst);
+                let active = self.current_full_gets.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_full_gets.fetch_max(active, Ordering::SeqCst);
+
+                while self.block_full_gets.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+
+                self.current_full_gets.fetch_sub(1, Ordering::SeqCst);
+                Ok(self.data.lock().unwrap().get(key).cloned())
+            }
+
+            async fn get_object_range(
+                &self,
+                key: &str,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                self.get_object_range_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(data) = self.data.lock().unwrap().get(key) {
+                    let offset = offset as usize;
+                    let end = (offset + buf.len()).min(data.len());
+                    if offset < data.len() {
+                        let copy_len = end - offset;
+                        buf[..copy_len].copy_from_slice(&data[offset..end]);
+                        return Ok(copy_len);
+                    }
+                }
+                Ok(0)
+            }
+
+            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
+                Ok("test_etag".to_string())
+            }
+
+            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+                self.data.lock().unwrap().remove(key);
+                Ok(())
+            }
+        }
+
+        let backend = MockBackend::default();
+        let block: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        {
+            let mut data = backend.data.lock().unwrap();
+            data.insert("chunks/90/0".to_string(), block.clone());
+            data.insert("chunks/91/0".to_string(), block);
+        }
+
+        let cache_dir = tempfile::tempdir()?;
+        let config = BlockStoreConfig {
+            block_size: 4 * 1024 * 1024,
+            range_read_threshold: 0.25,
+            compression: Compression::None,
+            ..Default::default()
+        };
+        let store = Arc::new(
+            ObjectBlockStore::new_with_configs_async(
+                ObjectClient::new(backend.clone()),
+                ChunksCacheConfig::with_budgets(
+                    16 * 1024 * 1024,
+                    16 * 1024 * 1024,
+                    cache_dir.path().to_path_buf(),
+                ),
+                config,
+            )
+            .await?,
+        );
+
+        let reads = [(90, 0), (91, 0)]
+            .into_iter()
+            .map(|key| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    store.read_range(key, 1024, &mut buf).await?;
+                    anyhow::Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+        future::try_join_all(reads).await?;
+        assert_eq!(backend.get_object_range_calls.load(Ordering::SeqCst), 2);
+
+        for _ in 0..100 {
+            if backend.get_object_calls.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        backend.block_full_gets.store(false, Ordering::SeqCst);
+        for _ in 0..100 {
+            if backend.get_object_calls.load(Ordering::SeqCst) >= 2
+                && backend.current_full_gets.load(Ordering::SeqCst) == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            backend.max_full_gets.load(Ordering::SeqCst),
+            1,
+            "background range prefetch should run one full-block GET at a time"
+        );
+        assert_eq!(backend.get_object_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.current_full_gets.load(Ordering::SeqCst), 0);
 
         Ok(())
     }

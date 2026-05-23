@@ -85,10 +85,12 @@ struct VfsBackgroundTasks {
 
 use crate::vfs::Inode;
 use crate::vfs::backend::Backend;
+use crate::vfs::cache::config::CacheConfig;
 use crate::vfs::config::VFSConfig;
 use crate::vfs::error::{PathHint, VfsError};
 use crate::vfs::handles::{DirHandle, FileHandle, HandleFlags};
 use crate::vfs::io::{DataReader, DataWriter};
+use crate::vfs::memory::MemoryBudget;
 
 struct HandleRegistry<B, M>
 where
@@ -265,7 +267,6 @@ where
     writer: Arc<DataWriter<S, M>>,
     modified: ModifiedTracker,
     append_locks: DashMap<i64, Arc<Mutex<()>>>,
-    read_cache: Arc<crate::vfs::cache::lru_cache::LruReadCache>,
     pub(crate) stats: Arc<crate::vfs::stats::FsStats>,
 }
 
@@ -275,12 +276,17 @@ where
     M: MetaLayer + Send + Sync + 'static,
 {
     fn new(config: Arc<VFSConfig>, backend: Arc<Backend<S, M>>) -> Self {
-        let prefetch_backend = backend.clone();
-        let prefetch_layout = config.read.layout;
-        let prefetcher: Arc<dyn crate::vfs::cache::prefetch::Prefetcher> =
-            Arc::new(crate::vfs::cache::prefetch::GlobalPrefetcher::new(
-                64,   // concurrency
-                1024, // queue depth
+        let memory_budget = (config.cache.memory_budget_bytes > 0)
+            .then(|| MemoryBudget::new(config.cache.memory_budget_bytes));
+
+        let prefetcher = if config.cache.prefetch_enabled {
+            let prefetch_backend = backend.clone();
+            let prefetch_layout = config.read.layout;
+            let prefetch_concurrency = config.cache.prefetch_concurrency.max(1);
+            let prefetch_queue_depth = prefetch_concurrency.saturating_mul(16).max(1024);
+            Some(Arc::new(crate::vfs::cache::prefetch::GlobalPrefetcher::new(
+                prefetch_concurrency,
+                prefetch_queue_depth,
                 move |ino, start, len| {
                     let backend = prefetch_backend.clone();
                     let layout = prefetch_layout;
@@ -303,16 +309,23 @@ where
                         }
                     }
                 },
-            ));
+            ))
+                as Arc<dyn crate::vfs::cache::prefetch::Prefetcher>)
+        } else {
+            None
+        };
 
-        let reader = Arc::new(
-            DataReader::new(config.read.clone(), backend.clone()).with_prefetcher(prefetcher),
-        );
+        let mut reader_builder = DataReader::new(config.read.clone(), backend.clone());
+        if let Some(memory_budget) = memory_budget.clone() {
+            reader_builder = reader_builder.with_memory_budget(memory_budget);
+        }
+        if let Some(prefetcher) = prefetcher {
+            reader_builder = reader_builder.with_prefetcher(prefetcher);
+        }
+        let reader = Arc::new(reader_builder);
 
         let write_back = {
-            let cache_root = dirs::cache_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                .join("slayerfs");
+            let cache_root = config.cache.cache_root.join("writeback");
             let _ = std::fs::create_dir_all(&cache_root);
             let wb = Arc::new(crate::vfs::cache::write_back::FsWriteBackCache::new(
                 cache_root,
@@ -334,12 +347,12 @@ where
             Some(wb)
         };
 
-        let writer = Arc::new(DataWriter::new(
-            config.write.clone(),
-            backend,
-            reader.clone(),
-            write_back,
-        ));
+        let mut writer_builder =
+            DataWriter::new(config.write.clone(), backend, reader.clone(), write_back);
+        if let Some(memory_budget) = memory_budget {
+            writer_builder = writer_builder.with_memory_budget(memory_budget);
+        }
+        let writer = Arc::new(writer_builder);
         writer.start_flush_background();
         Self {
             handles: HandleRegistry::new(),
@@ -348,9 +361,6 @@ where
             writer,
             modified: ModifiedTracker::new(),
             append_locks: DashMap::new(),
-            read_cache: Arc::new(crate::vfs::cache::lru_cache::LruReadCache::new(
-                256 * 1024 * 1024,
-            )),
             stats: Arc::new(crate::vfs::stats::FsStats::new()),
         }
     }
@@ -611,13 +621,29 @@ where
         meta_layer: Arc<MetaClient<R>>,
         compact_config: CompactConfig,
     ) -> Result<Self, VfsError> {
+        Self::with_meta_layer_with_cache_config(
+            layout,
+            store,
+            meta_layer,
+            compact_config,
+            CacheConfig::default(),
+        )
+    }
+
+    pub(crate) fn with_meta_layer_with_cache_config(
+        layout: ChunkLayout,
+        store: Arc<S>,
+        meta_layer: Arc<MetaClient<R>>,
+        compact_config: CompactConfig,
+        cache_config: CacheConfig,
+    ) -> Result<Self, VfsError> {
         let enabled = !meta_layer.options().no_background_jobs;
         let bg_config = VfsBackgroundConfig::from_compact_config(&layout, compact_config, enabled);
         let background_tasks =
             Self::start_background_tasks(&meta_layer, Arc::clone(&store), layout, bg_config);
 
         Self::from_components_with_background(
-            VFSConfig::new(layout),
+            VFSConfig::new_with_cache_config(layout, cache_config),
             store,
             meta_layer,
             background_tasks,
@@ -1876,6 +1902,26 @@ where
             });
         }
 
+        let file_size = self
+            .inode_size_cached(handle.ino)
+            .unwrap_or_else(|| handle.attr().size);
+        if offset >= file_size {
+            return Ok(Vec::new());
+        }
+        let actual_len = len.min((file_size - offset) as usize);
+        let writer = self.state.writer.clone();
+        let ino = handle.ino as u64;
+        if let Some(data) = handle
+            .try_read_overlay(offset, actual_len, move |offset, len| {
+                let writer = writer.clone();
+                async move { writer.read_dirty_if_fully_covered(ino, offset, len).await }
+            })
+            .await
+            .map_err(VfsError::from)?
+        {
+            return Ok(data);
+        }
+
         // Read committed data from the reader cache first, then overlay any
         // uncommitted dirty writes on top.  We intentionally do NOT call
         // flush_if_exists here: blocking every read on a full flush+commit
@@ -2259,24 +2305,31 @@ where
         // If we release the handle and remove the inode directly, there is
         // a time windows between checking and releasing. It causes the inode and writer
         // to be deleted mistakenly.
-        match self.lock_inode(handle.ino) {
+        let release_writer = match self.lock_inode(handle.ino) {
             Entry::Occupied(entry) => {
                 self.state.handles.release(fh);
-                self.state.reader.close_for_handle(handle.ino as u64, fh);
-
-                if handle.flags.write && !self.state.handles.has_write_handle(handle.ino) {
-                    self.state.writer.release(handle.ino as u64);
-                }
+                let release_writer =
+                    handle.flags.write && !self.state.handles.has_write_handle(handle.ino);
 
                 if self.state.handles.has_no_handle(handle.ino) {
                     entry.remove();
                 }
+                release_writer
             }
             Entry::Vacant(_) => {
                 // This is weird/impossible?
                 // It means the inode was deleted while we held a handle to it.
                 unreachable!("Try closing a file that has never been opened");
             }
+        };
+
+        self.state
+            .reader
+            .close_for_handle(handle.ino as u64, fh)
+            .await;
+
+        if release_writer {
+            self.state.writer.release(handle.ino as u64).await;
         }
 
         tracing::trace!(fh, ino = handle.ino, "vfs.close_done");
