@@ -2075,7 +2075,7 @@ mod tests {
         let client = ObjectClient::new(LocalFsBackend::new(tmp.path()));
         let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
         let metadata: Arc<dyn MetaStore> = meta_handle.store();
-        let store = ObjectBlockStore::new(client);
+        let store = ObjectBlockStore::new_async(client).await.unwrap();
         let config = FileSystemConfig::default().with_caller(CallerIdentity::root());
         FileSystem::with_config(layout, store, metadata, config)
             .await

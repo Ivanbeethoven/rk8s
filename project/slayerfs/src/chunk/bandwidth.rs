@@ -53,7 +53,10 @@ impl BandwidthLimiter {
             let burst = tokens_per_sec.max(4); // allow small bursts
             let quota = Quota::per_second(NonZeroU32::new(tokens_per_sec as u32)?);
             let quota = quota.allow_burst(NonZeroU32::new(burst as u32)?);
-            debug!("Upload bandwidth limiter: {} MiB/s ({} tokens/s)", mibps, tokens_per_sec);
+            debug!(
+                "Upload bandwidth limiter: {} MiB/s ({} tokens/s)",
+                mibps, tokens_per_sec
+            );
             Some(Arc::new(RateLimiter::direct(quota)))
         });
 
@@ -65,7 +68,10 @@ impl BandwidthLimiter {
             let burst = tokens_per_sec.max(4);
             let quota = Quota::per_second(NonZeroU32::new(tokens_per_sec as u32)?);
             let quota = quota.allow_burst(NonZeroU32::new(burst as u32)?);
-            debug!("Download bandwidth limiter: {} MiB/s ({} tokens/s)", mibps, tokens_per_sec);
+            debug!(
+                "Download bandwidth limiter: {} MiB/s ({} tokens/s)",
+                mibps, tokens_per_sec
+            );
             Some(Arc::new(RateLimiter::direct(quota)))
         });
 
@@ -109,7 +115,12 @@ impl BandwidthLimiter {
             match NonZeroU32::new(batch) {
                 Some(n) => {
                     let _ = limiter.until_n_ready(n).await;
-                    trace!("{} rate limit: acquired {} tokens ({} remaining)", direction, batch, remaining - batch);
+                    trace!(
+                        "{} rate limit: acquired {} tokens ({} remaining)",
+                        direction,
+                        batch,
+                        remaining - batch
+                    );
                 }
                 None => break,
             }

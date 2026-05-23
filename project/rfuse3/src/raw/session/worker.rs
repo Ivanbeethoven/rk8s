@@ -116,7 +116,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Workers<FS> {
             ))]
             let handle = task::spawn(async move {
                 while let Some(item) = rx.next().await {
-                    process_work_item(&ctx_clone, idx, item).await;
+                    let ctx = ctx_clone.clone();
+                    task::spawn(async move {
+                        process_work_item(&ctx, idx, item).await;
+                    })
+                    .detach();
                 }
                 debug!(worker=%idx, "worker exit");
             });
@@ -126,7 +130,10 @@ impl<FS: Filesystem + Send + Sync + 'static> Workers<FS> {
             ))]
             let handle = task::spawn(async move {
                 while let Some(item) = rx.next().await {
-                    process_work_item(&ctx_clone, idx, item).await;
+                    let ctx = ctx_clone.clone();
+                    task::spawn(async move {
+                        process_work_item(&ctx, idx, item).await;
+                    });
                 }
                 debug!(worker=%idx, "worker exit");
             });

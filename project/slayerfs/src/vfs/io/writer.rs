@@ -25,6 +25,7 @@ use crate::vfs::chunk_id_for;
 use crate::vfs::config::WriteConfig;
 use crate::vfs::extract_ino_and_chunk_index;
 use crate::vfs::io::split_chunk_spans;
+use crate::vfs::memory::{MemoryBudget, MemoryConsumer, MemoryUsageGuard, PressureLevel};
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::Mutex as ParkingMutex;
@@ -168,6 +169,7 @@ pub(crate) struct SliceState {
     upload_task_active: bool,
     data: CacheSlice,
     usage: UsageGuard,
+    memory_usage: Option<MemoryUsageGuard>,
     /// Error occurred at background thread.
     err: Option<String>,
     notify: Arc<Notify>,
@@ -194,6 +196,7 @@ impl SliceState {
         offset: u64,
         config: Arc<WriteConfig>,
         usage: Arc<AtomicU64>,
+        memory_budget: Option<MemoryBudget>,
         creation_unique: u64,
     ) -> Self {
         let now = Instant::now();
@@ -209,6 +212,8 @@ impl SliceState {
             upload_task_active: false,
             data: CacheSlice::new(config),
             usage: UsageGuard::new(usage),
+            memory_usage: memory_budget
+                .map(|budget| MemoryUsageGuard::new(budget, MemoryConsumer::Writer)),
             err: None,
             notify: Arc::new(Notify::new()),
             started: now,
@@ -217,6 +222,13 @@ impl SliceState {
             meta_write_started: false,
             creation_unique,
             max_write_unique: creation_unique,
+        }
+    }
+
+    fn update_usage(&mut self, bytes: u64) {
+        self.usage.update_bytes(bytes);
+        if let Some(memory_usage) = &mut self.memory_usage {
+            memory_usage.update_bytes(bytes);
         }
     }
 
@@ -350,7 +362,7 @@ where
         let wrote = self.with_mut(|s| match s.can_write(offset, buf.len()) {
             Some(action) => {
                 s.write(offset, buf, action)?;
-                s.usage.update_bytes(s.data.alloc_bytes());
+                s.update_usage(s.data.alloc_bytes());
                 Ok::<bool, anyhow::Error>(true)
             }
             None => Ok::<bool, anyhow::Error>(false),
@@ -416,7 +428,7 @@ where
             }
 
             // Keep uploaded pages resident until metadata commit removes the slice.
-            s.usage.update_bytes(s.data.alloc_bytes());
+            s.update_usage(s.data.alloc_bytes());
 
             if matches!(s.state, SliceStatus::Readonly | SliceStatus::Failed)
                 && s.in_flight == 0
@@ -442,7 +454,7 @@ where
                 s.block_done |= 1u64 << idx;
             }
 
-            s.usage.update_bytes(s.data.alloc_bytes());
+            s.update_usage(s.data.alloc_bytes());
 
             if matches!(s.state, SliceStatus::Readonly | SliceStatus::Failed)
                 && s.in_flight == 0
@@ -808,6 +820,7 @@ where
                     offset,
                     self.shared.config.clone(),
                     self.shared.buffer_usage.clone(),
+                    self.shared.memory_budget.clone(),
                     creation_unique,
                 )));
                 // Insert in sorted position by creation_unique so that slices
@@ -856,7 +869,12 @@ where
 
     /// Append data to a writable slice. If the slice reaches chunk end, freeze + flush it.
     #[tracing::instrument(level = "trace", skip(self, buf), fields(len = buf.len()))]
-    fn write_at(&mut self, offset: u64, buf: &[u8], creation_unique: u64) -> anyhow::Result<WriteAction> {
+    fn write_at(
+        &mut self,
+        offset: u64,
+        buf: &[u8],
+        creation_unique: u64,
+    ) -> anyhow::Result<WriteAction> {
         let mut start_commit = false;
         let mut flush = Vec::new();
 
@@ -920,6 +938,7 @@ struct Shared<B, M> {
     reader: Arc<DataReader<B, M>>,
     /// Local SSD write-back cache for persisting frozen slices before upload.
     write_back: Option<Arc<crate::vfs::cache::write_back::FsWriteBackCache>>,
+    memory_budget: Option<MemoryBudget>,
     /// Monotonically incremented on each write.  Used together with
     /// `last_flushed_gen` to let `has_pending()` avoid a lock acquisition
     /// when no new data has arrived since the last successful flush.
@@ -942,6 +961,7 @@ where
         reader: Arc<DataReader<B, M>>,
         buffer_usage: Arc<AtomicU64>,
         write_back: Option<Arc<crate::vfs::cache::write_back::FsWriteBackCache>>,
+        memory_budget: Option<MemoryBudget>,
     ) -> Self {
         Self {
             inode,
@@ -957,6 +977,7 @@ where
             backend,
             reader,
             write_back,
+            memory_budget,
             write_gen: AtomicU64::new(0),
             last_flushed_gen: AtomicU64::new(0),
             writeback_error: ParkingMutex::new(None),
@@ -1033,6 +1054,17 @@ where
     M: MetaLayer + Send + Sync + 'static,
 {
     async fn back_pressure(&self) -> anyhow::Result<()> {
+        if let Some(budget) = &self.shared.memory_budget {
+            let level = budget.pressure_level();
+            if level >= PressureLevel::High {
+                budget.log_state();
+            }
+            if level >= PressureLevel::Critical {
+                self.force_flush_for_pressure().await;
+                tokio::task::yield_now().await;
+            }
+        }
+
         let soft_limit = self.shared.config.buffer_size;
         if soft_limit == 0 {
             return Ok(());
@@ -1043,14 +1075,26 @@ where
             return Ok(());
         }
 
-        // Soft limit exceeded: yield to let flush/upload tasks drain the
-        // buffer rather than sleeping a fixed duration.  This avoids
-        // throttling high-frequency 4KB mmap writeback pages to ~400KB/s.
-        tokio::task::yield_now().await;
-
+        // Graduated backpressure: sleep proportionally to buffer fullness.
+        // This smooths write throughput instead of the harsh yield → 100ms jump
+        // that caused P99 spikes at the hard limit boundary.
         let hard_limit = soft_limit.saturating_mul(2);
-        let mut total_wait = Duration::ZERO;
+        let mid_limit = soft_limit + soft_limit / 2; // 1.5x soft
 
+        if usage <= mid_limit {
+            // Between soft and 1.5x: light sleep to let uploads drain
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            return Ok(());
+        }
+
+        if usage <= hard_limit {
+            // Between 1.5x and 2x: moderate sleep
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            return Ok(());
+        }
+
+        // Above hard limit: aggressive sleep loop until buffer drains
+        let mut total_wait = Duration::ZERO;
         while self.shared.buffer_usage.load(Ordering::Relaxed) > hard_limit {
             if total_wait >= WRITE_MAX_WAIT {
                 return Err(anyhow::anyhow!(
@@ -1061,11 +1105,45 @@ where
                 ));
             }
 
-            warn!("Reach write buffer hard limit: sleep for 100 millis");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            total_wait += Duration::from_millis(100);
+            warn!("Reach write buffer hard limit: sleep for 50 millis");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            total_wait += Duration::from_millis(50);
         }
         Ok(())
+    }
+
+    async fn force_flush_for_pressure(&self) {
+        const PRESSURE_FLUSH_LIMIT: usize = 16;
+
+        let slices: Vec<Arc<ParkingMutex<SliceState>>> = {
+            let guard = self.shared.inner.lock().await;
+            guard
+                .chunks
+                .values()
+                .flat_map(|chunk| chunk.slices.iter().cloned())
+                .collect()
+        };
+
+        let mut flushed = 0usize;
+        for slice in slices {
+            let handle = SliceHandle {
+                slice: &slice,
+                shared: &self.shared,
+            };
+
+            let should_try = handle.with_ref(|s| {
+                matches!(s.state, SliceStatus::Writable)
+                    && s.data.len() > 0
+                    && s.last_mod.elapsed() >= Duration::from_millis(10)
+            });
+            if should_try && handle.freeze() {
+                Self::spawn_flush_slice(self.shared.clone(), slice);
+                flushed += 1;
+                if flushed >= PRESSURE_FLUSH_LIMIT {
+                    break;
+                }
+            }
+        }
     }
 
     pub(crate) fn new(
@@ -1076,6 +1154,26 @@ where
         buffer_usage: Arc<AtomicU64>,
         write_back: Option<Arc<crate::vfs::cache::write_back::FsWriteBackCache>>,
     ) -> Self {
+        Self::new_with_memory_budget(
+            inode,
+            config,
+            backend,
+            reader,
+            buffer_usage,
+            write_back,
+            None,
+        )
+    }
+
+    fn new_with_memory_budget(
+        inode: Arc<Inode>,
+        config: Arc<WriteConfig>,
+        backend: Arc<Backend<B, M>>,
+        reader: Arc<DataReader<B, M>>,
+        buffer_usage: Arc<AtomicU64>,
+        write_back: Option<Arc<crate::vfs::cache::write_back::FsWriteBackCache>>,
+        memory_budget: Option<MemoryBudget>,
+    ) -> Self {
         let shared = Arc::new(Shared::new(
             inode,
             config,
@@ -1083,6 +1181,7 @@ where
             reader,
             buffer_usage,
             write_back,
+            memory_budget,
         ));
         let flush_shared = Arc::downgrade(&shared);
         tokio::spawn(async move { Self::auto_flush(flush_shared).await });
@@ -1111,7 +1210,8 @@ where
         buf: &[u8],
         creation_unique: u64,
     ) -> anyhow::Result<usize> {
-        self.write_at_inner(offset, buf, true, creation_unique).await
+        self.write_at_inner(offset, buf, true, creation_unique)
+            .await
     }
 
     async fn write_at_inner(
@@ -1168,7 +1268,11 @@ where
                 let ckey = guard.get_or_create_chunk(cid);
                 let mut handle = guard.chunk_handle(&self.shared, ckey);
                 let span_len = span.len.as_usize();
-                let action = handle.write_at(span.offset, &buf[position..position + span_len], creation_unique)?;
+                let action = handle.write_at(
+                    span.offset,
+                    &buf[position..position + span_len],
+                    creation_unique,
+                )?;
                 drop(guard);
 
                 for slice in action.flush {
@@ -1195,13 +1299,14 @@ where
         Ok(buf.len())
     }
 
-    pub(crate) async fn overlay_dirty(&self, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+    async fn overlay_dirty_impl(&self, offset: u64, buf: &mut [u8]) -> anyhow::Result<bool> {
         if buf.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
 
         let layout = self.shared.config.layout;
         let spans = split_chunk_spans(layout, offset, buf.len());
+        let mut missing = crate::utils::Intervals::new(offset, offset + buf.len() as u64);
 
         // Pre-compute chunk IDs (propagate errors immediately).
         let span_cids: Vec<_> = spans
@@ -1261,10 +1366,29 @@ where
                 state
                     .data
                     .copy_into(read_start - slice_start, &mut buf[dst_start..dst_end])?;
+                missing.cut(chunk_start + read_start, chunk_start + read_end);
             }
         }
 
+        Ok(missing.collect().is_empty())
+    }
+
+    pub(crate) async fn overlay_dirty(&self, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.overlay_dirty_impl(offset, buf).await?;
         Ok(())
+    }
+
+    pub(crate) async fn read_dirty_if_fully_covered(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let mut buf = vec![0u8; len];
+        if self.overlay_dirty_impl(offset, &mut buf).await? {
+            Ok(Some(buf))
+        } else {
+            Ok(None)
+        }
     }
 
     // Flush: freeze all slices, upload them, and wait for those slices to commit.
@@ -1429,7 +1553,7 @@ where
         for slice in slices {
             let mut guard = slice.lock();
             guard.data.release_all();
-            guard.usage.update_bytes(0);
+            guard.update_usage(0);
         }
 
         let mut guard = self.shared.inner.lock().await;
@@ -1569,8 +1693,9 @@ where
                                 local_seq: slice_id,
                                 epoch: 0,
                             };
-                            if let Err(e) =
-                                wb.persist_slice(key, all_chunks.clone(), batch_offset).await
+                            if let Err(e) = wb
+                                .persist_slice(key, all_chunks.clone(), batch_offset)
+                                .await
                             {
                                 tracing::debug!(
                                     ino, chunk_id, slice_id, error = ?e,
@@ -1681,10 +1806,7 @@ where
                             slice: &slice,
                             shared: &shared,
                         };
-                        handle.mark_failed(anyhow::anyhow!(
-                            "upload task panicked: {}",
-                            join_err
-                        ));
+                        handle.mark_failed(anyhow::anyhow!("upload task panicked: {}", join_err));
                         join_set.abort_all();
                         return;
                     }
@@ -2187,6 +2309,20 @@ where
 
                 // if there are too many slices, it should flush "a few more" to reduce memory usage.
                 let too_many = total_slices > MAX_SLICES_THRESHOLD;
+                let force_pressure_flush = shared
+                    .memory_budget
+                    .as_ref()
+                    .is_some_and(|budget| budget.should_force_flush());
+
+                // Size-based proactive flush: when buffer usage exceeds 70% of
+                // soft_limit, freeze oldest writable slices to start draining
+                // before backpressure kicks in.  This keeps the buffer from
+                // spiking past the soft limit during sustained sequential writes.
+                let soft_limit = shared.config.buffer_size;
+                let buffer_high = soft_limit > 0 && {
+                    let usage = shared.buffer_usage.load(Ordering::Relaxed);
+                    usage > soft_limit * 7 / 10
+                };
 
                 // Randomly select a half of chunk to do extra flush to avoid jitter.
                 let pick_bit = (rand::rng().next_u64() & 1) as usize;
@@ -2224,11 +2360,25 @@ where
                         let mut should = age > auto_flush_max
                             || (idle_time > idle && age > idle)
                             || age > FLUSH_DURATION;
+                        if !should && force_pressure_flush && idle_time >= Duration::from_millis(10)
+                        {
+                            should = true;
+                        }
                         if !should && too_many {
                             // idx <= half represents older slices.
                             if chunk_idx % 2 == pick_bit && idx <= half {
                                 should = true;
                             }
+                        }
+                        // Proactive size-based flush: freeze slices with enough
+                        // data when the buffer is filling up, even if they haven't
+                        // reached auto_flush_max_age.
+                        if !should
+                            && buffer_high
+                            && data_len >= shared.config.freeze_min_bytes
+                            && idle_time >= Duration::from_millis(5)
+                        {
+                            should = true;
                         }
 
                         if should && handle.freeze() {
@@ -2287,6 +2437,7 @@ pub(crate) struct DataWriter<B, M> {
     files: DashMap<u64, Arc<FileWriter<B, M>>>,
     buffer_usage: Arc<AtomicU64>,
     write_back: Option<Arc<crate::vfs::cache::write_back::FsWriteBackCache>>,
+    memory_budget: Option<MemoryBudget>,
 }
 
 impl<B, M> DataWriter<B, M>
@@ -2307,20 +2458,27 @@ where
             files: DashMap::new(),
             buffer_usage: Arc::new(AtomicU64::new(0)),
             write_back,
+            memory_budget: None,
         }
+    }
+
+    pub(crate) fn with_memory_budget(mut self, memory_budget: MemoryBudget) -> Self {
+        self.memory_budget = Some(memory_budget);
+        self
     }
 
     pub(crate) fn ensure_file(&self, inode: Arc<Inode>) -> Arc<FileWriter<B, M>> {
         self.files
             .entry(inode.ino() as u64)
             .or_insert_with(|| {
-                Arc::new(FileWriter::new(
+                Arc::new(FileWriter::new_with_memory_budget(
                     inode.clone(),
                     self.config.clone(),
                     self.backend.clone(),
                     self.reader.clone(),
                     self.buffer_usage.clone(),
                     self.write_back.clone(),
+                    self.memory_budget.clone(),
                 ))
             })
             .clone()
@@ -2391,6 +2549,21 @@ where
         Ok(())
     }
 
+    pub(crate) async fn read_dirty_if_fully_covered(
+        &self,
+        ino: u64,
+        offset: u64,
+        len: usize,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let writer = self.files.get(&ino).map(|entry| entry.value().clone());
+        match writer {
+            Some(ref writer) if writer.has_overlay_state().await => {
+                writer.read_dirty_if_fully_covered(offset, len).await
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Like `flush_if_exists` but propagates errors.  Used in truncate paths
     /// where a failed flush means data would be silently lost.
     pub(crate) async fn flush_required(&self, ino: u64) -> anyhow::Result<()> {
@@ -2458,11 +2631,9 @@ where
         }
     }
 
-    pub(crate) fn release(&self, ino: u64) {
+    pub(crate) async fn release(&self, ino: u64) {
         if let Some((_, writer)) = self.files.remove(&ino) {
-            tokio::spawn(async move {
-                writer.clear().await;
-            });
+            writer.clear().await;
         }
     }
 
@@ -2601,7 +2772,14 @@ mod tests {
             chunk_size: 16 * 1024,
             block_size: 4 * 1024,
         };
-        let mut slice = SliceState::new(1, 0, test_config(layout), Arc::new(AtomicU64::new(0)), 0);
+        let mut slice = SliceState::new(
+            1,
+            0,
+            test_config(layout),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            0,
+        );
         let len = layout.block_size as usize + (layout.block_size as usize / 2);
         slice.data.append(&vec![1u8; len]).unwrap();
 
@@ -2615,7 +2793,14 @@ mod tests {
             chunk_size: 16 * 1024,
             block_size: 4 * 1024,
         };
-        let mut slice = SliceState::new(1, 0, test_config(layout), Arc::new(AtomicU64::new(0)), 0);
+        let mut slice = SliceState::new(
+            1,
+            0,
+            test_config(layout),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            0,
+        );
         let len = layout.block_size as usize + (layout.block_size as usize / 2);
         let data = vec![2u8; len];
         slice.data.append(&data).unwrap();
@@ -2661,7 +2846,14 @@ mod tests {
             chunk_size: 16 * 1024,
             block_size: 4 * 1024,
         };
-        let mut slice = SliceState::new(1, 0, test_config(layout), Arc::new(AtomicU64::new(0)), 0);
+        let mut slice = SliceState::new(
+            1,
+            0,
+            test_config(layout),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            0,
+        );
         slice
             .data
             .append(&vec![0u8; layout.block_size as usize * 2])
@@ -2967,6 +3159,7 @@ mod tests {
             0,
             test_config(layout),
             Arc::new(AtomicU64::new(0)),
+            None,
             0,
         )));
         {
@@ -3018,6 +3211,7 @@ mod tests {
             0,
             test_config(layout),
             Arc::new(AtomicU64::new(0)),
+            None,
             0,
         )));
         {
@@ -3190,6 +3384,7 @@ mod tests {
             0,
             test_config(layout),
             Arc::new(AtomicU64::new(0)),
+            None,
             0,
         )));
         {

@@ -327,7 +327,9 @@ mod basic_tests {
         let client = crate::cadapter::client::ObjectClient::new(
             crate::cadapter::localfs::LocalFsBackend::new(tmp.path()),
         );
-        let store = crate::chunk::store::ObjectBlockStore::new(client);
+        let store = crate::chunk::store::ObjectBlockStore::new_async(client)
+            .await
+            .unwrap();
 
         let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
         let meta_store = meta_handle.store();
@@ -520,11 +522,55 @@ mod io_tests {
     use super::*;
     use crate::cadapter::client::ObjectClient;
     use crate::cadapter::localfs::LocalFsBackend;
-    use crate::chunk::store::ObjectBlockStore;
+    use crate::chunk::store::{BlockKey, ObjectBlockStore};
+    use async_trait::async_trait;
     use rand::rngs::StdRng;
     use rand::{Rng, RngCore, SeedableRng};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Barrier;
+
+    #[derive(Clone, Default)]
+    struct CountingBlockStore {
+        inner: Arc<InMemoryBlockStore>,
+        read_range_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingBlockStore {
+        fn reset_reads(&self) {
+            self.read_range_calls.store(0, Ordering::SeqCst);
+        }
+
+        fn read_range_calls(&self) -> usize {
+            self.read_range_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl BlockStore for CountingBlockStore {
+        async fn write_fresh_range(
+            &self,
+            key: BlockKey,
+            offset: u64,
+            data: &[u8],
+        ) -> anyhow::Result<u64> {
+            self.inner.write_fresh_range(key, offset, data).await
+        }
+
+        async fn read_range(
+            &self,
+            key: BlockKey,
+            offset: u64,
+            buf: &mut [u8],
+        ) -> anyhow::Result<()> {
+            self.read_range_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.read_range(key, offset, buf).await
+        }
+
+        async fn delete_range(&self, key: BlockKey, block_count: u64) -> anyhow::Result<()> {
+            self.inner.delete_range(key, block_count).await
+        }
+    }
 
     async fn open_file<S, M>(fs: &VFS<S, M>, path: &str, read: bool, write: bool) -> u64
     where
@@ -602,7 +648,7 @@ mod io_tests {
         };
         let tmp = tempfile::tempdir().unwrap();
         let client = ObjectClient::new(LocalFsBackend::new(tmp.path()));
-        let store = ObjectBlockStore::new(client);
+        let store = ObjectBlockStore::new_async(client).await.unwrap();
 
         let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
         let meta_store = meta_handle.store();
@@ -645,7 +691,7 @@ mod io_tests {
         let layout = ChunkLayout::default();
         let tmp = tempfile::tempdir().unwrap();
         let client = ObjectClient::new(LocalFsBackend::new(tmp.path()));
-        let store = ObjectBlockStore::new(client);
+        let store = ObjectBlockStore::new_async(client).await.unwrap();
 
         let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
         let meta_store = meta_handle.store();
@@ -718,6 +764,56 @@ mod io_tests {
             writer.has_pending().await,
             "dirty slice must still be present after read (read no longer flushes)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_fully_covered_by_dirty_write_skips_backend_read() {
+        let layout = ChunkLayout {
+            chunk_size: 64 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = CountingBlockStore::default();
+        let counters = store.clone();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let fs = VFS::new(layout, store, meta_store).await.unwrap();
+
+        fs.create_file("/dirty-covered.bin").await.unwrap();
+        let attr = fs.stat("/dirty-covered.bin").await.unwrap();
+        let initial = vec![0x11; 4096];
+        let fh = fs
+            .open(attr.ino, attr.clone(), false, true, false)
+            .await
+            .unwrap();
+        fs.write(fh, 0, &initial).await.unwrap();
+        fs.flush(fh).await.unwrap();
+        fs.close(fh).await.unwrap();
+
+        counters.reset_reads();
+
+        let attr = fs.stat("/dirty-covered.bin").await.unwrap();
+        let fh = fs
+            .open(attr.ino, attr.clone(), true, true, false)
+            .await
+            .unwrap();
+        let replacement = vec![0x7d; 4096];
+        fs.write(fh, 0, &replacement).await.unwrap();
+
+        let writer = fs
+            .state
+            .writer
+            .ensure_file(fs.ensure_inode_registered(attr.ino).await.unwrap());
+        assert!(writer.has_pending().await);
+
+        let out = fs.read(fh, 0, replacement.len()).await.unwrap();
+        assert_eq!(out, replacement);
+        assert_eq!(
+            counters.read_range_calls(),
+            0,
+            "read fully covered by pending dirty data should not fetch old committed blocks"
+        );
+
+        fs.close(fh).await.unwrap();
     }
 
     #[tokio::test]

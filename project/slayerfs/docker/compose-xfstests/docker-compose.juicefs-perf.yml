@@ -1,10 +1,31 @@
 services:
+  redis:
+    image: docker.io/library/redis:7.2-alpine
+    container_name: redis-juicefs-perf
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    ports:
+      - "${REDIS_HOST_BIND:-127.0.0.1}:${REDIS_HOST_PORT:-16379}:6379"
+    networks:
+      - juicefs-xfstests
+
   rustfs:
     image: rustfs/rustfs:latest
-    container_name: rustfs-slayerfs-xfstests-sqlite
+    container_name: rustfs-juicefs-perf
     expose:
       - "9000"
       - "9001"
+    ports:
+      - "${RUSTFS_HOST_BIND:-127.0.0.1}:${RUSTFS_S3_HOST_PORT:-19000}:9000"
+      - "${RUSTFS_HOST_BIND:-127.0.0.1}:${RUSTFS_CONSOLE_HOST_PORT:-19001}:9001"
     environment:
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
@@ -22,9 +43,9 @@ services:
       - ${RUSTFS_SECRET_KEY:-rustfsadmin}
       - /data
     volumes:
-      - rustfs-data-sqlite:/data
+      - rustfs-data-juicefs-perf:/data
     networks:
-      - slayerfs-xfstests
+      - juicefs-xfstests
 
   rustfs-init:
     image: amazon/aws-cli:latest
@@ -49,40 +70,29 @@ services:
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
       AWS_EC2_METADATA_DISABLED: ${AWS_EC2_METADATA_DISABLED:-true}
     networks:
-      - slayerfs-xfstests
+      - juicefs-xfstests
 
-  xfstests:
-    image: slayerfs-xfstests:local
+  perf:
+    image: juicefs-xfstests-perf:local
     build:
       context: ../../..
-      dockerfile: slayerfs/docker/compose-xfstests/Dockerfile
+      dockerfile: slayerfs/docker/compose-xfstests/Dockerfile.juicefs-perf
     depends_on:
-      rustfs-init:
-        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     environment:
-      SLAYERFS_META_BACKEND: sqlite
-      SLAYERFS_SQLITE_PATH: /var/lib/slayerfs/metadata.db
-      SLAYERFS_DATA_BACKEND: ${SLAYERFS_DATA_BACKEND:-local-fs}
-      SLAYERFS_DATA_DIR: /var/lib/slayerfs/data
-      SLAYERFS_S3_BUCKET: ${SLAYERFS_S3_BUCKET:-slayerfs-data}
-      SLAYERFS_S3_ENDPOINT: ${SLAYERFS_S3_ENDPOINT:-http://rustfs:9000}
-      SLAYERFS_S3_REGION: ${SLAYERFS_S3_REGION:-us-east-1}
-      SLAYERFS_S3_FORCE_PATH_STYLE: ${SLAYERFS_S3_FORCE_PATH_STYLE:-true}
-      SLAYERFS_CONFIG_PATH: /run/slayerfs/config.yaml
-      SLAYERFS_LOG_FILE: /artifacts/slayerfs.log
-      SLAYERFS_FUSE_OP_LOG: ${SLAYERFS_FUSE_OP_LOG:-0}
-      SLAYERFS_MOUNT_WAIT_SECS: ${SLAYERFS_MOUNT_WAIT_SECS:-60}
-      SLAYERFS_PRE_MOUNT_WAIT_SECS: ${SLAYERFS_PRE_MOUNT_WAIT_SECS:-10}
-      SLAYERFS_MOUNT_READY_DELAY_SECS: ${SLAYERFS_MOUNT_READY_DELAY_SECS:-1}
-      SLAYERFS_FUSE_LOG_FILE: /artifacts/slayerfs_fuse_ops.log
+      JFS_META_URL: redis://redis:6379/0
+      JFS_S3_BUCKET: ${SLAYERFS_S3_BUCKET:-slayerfs-data}
+      JFS_S3_ENDPOINT: ${SLAYERFS_S3_ENDPOINT:-http://rustfs:9000}
+      JFS_S3_REGION: ${SLAYERFS_S3_REGION:-us-east-1}
       SLAYERFS_ARTIFACT_DIR: ${SLAYERFS_ARTIFACT_DIR:-}
       SLAYERFS_ARTIFACT_ROOT: /artifacts
-      XFSTESTS_CASES: ${XFSTESTS_CASES:-}
-      XFSTESTS_CHECK_ARGS: ${XFSTESTS_CHECK_ARGS:-}
+      XFSTESTS_DIR: /opt/xfstests-dev
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-rustfsadmin}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-rustfsadmin}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
       AWS_EC2_METADATA_DISABLED: ${AWS_EC2_METADATA_DISABLED:-true}
+      RUST_LOG: ${RUST_LOG:-error}
     privileged: true
     devices:
       - /dev/fuse:/dev/fuse
@@ -92,15 +102,14 @@ services:
       - apparmor=unconfined
     volumes:
       - ./artifacts:/artifacts
-      - ./run_xfstests_in_container.sh:/usr/local/bin/run_xfstests_in_container.sh:ro
-      - slayerfs-state-sqlite:/var/lib/slayerfs
+      - juicefs-state-perf:/var/lib/juicefs
     networks:
-      - slayerfs-xfstests
+      - juicefs-xfstests
 
 networks:
-  slayerfs-xfstests:
+  juicefs-xfstests:
     driver: bridge
 
 volumes:
-  slayerfs-state-sqlite:
-  rustfs-data-sqlite:
+  rustfs-data-juicefs-perf:
+  juicefs-state-perf:

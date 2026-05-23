@@ -20,6 +20,7 @@ xfstests_dir="${XFSTESTS_DIR:-/opt/xfstests-dev}"
 artifact_root="${SLAYERFS_ARTIFACT_ROOT:-/artifacts}"
 artifact_dir="${SLAYERFS_ARTIFACT_DIR:-}"
 perf_tools="${PERF_TOOLS:-fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest}"
+nofile_limit="${SLAYERFS_NOFILE_LIMIT:-1048576}"
 
 env_or_default() {
     local specific_var="$1"
@@ -30,6 +31,14 @@ env_or_default() {
         printf '%s' "$value"
     else
         printf '%s' "${!common_var:-$default_value}"
+    fi
+}
+
+raise_nofile_limit() {
+    if ulimit -n "$nofile_limit" >/dev/null 2>&1; then
+        info "nofile limit: $(ulimit -n)"
+    else
+        err "无法提升 nofile limit 到 $nofile_limit，当前: $(ulimit -n)"
     fi
 }
 
@@ -126,6 +135,16 @@ layout:
   chunk_size: ${SLAYERFS_CHUNK_SIZE:-67108864}
   block_size: ${SLAYERFS_BLOCK_SIZE:-4194304}
 EOF
+
+        # Cache section (compression, etc.)
+        local comp="${SLAYERFS_COMPRESSION:-none}"
+        if [[ "$comp" != "none" ]]; then
+            echo
+            cat <<EOF
+cache:
+  compression: ${comp}
+EOF
+        fi
     } >"$config_path"
 }
 
@@ -146,6 +165,48 @@ log_file="${SLAYERFS_LOG_FILE:-/artifacts/slayerfs.log}"
 
 mkdir -p "$target" "$(dirname "$log_file")"
 
+is_slayerfs_mounted() {
+    findmnt -rn --target "$target" --output FSTYPE 2>/dev/null | grep -Eq '^fuse(\.|$)'
+}
+
+pre_wait_secs="${SLAYERFS_PRE_MOUNT_WAIT_SECS:-10}"
+pre_deadline=$((SECONDS + pre_wait_secs))
+while is_slayerfs_mounted; do
+    if (( SECONDS >= pre_deadline )); then
+        echo "target $target is still mounted before starting SlayerFS after ${pre_wait_secs}s" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+
+EOF
+
+    append_env_export() {
+        local name="$1"
+        local default="${2-}"
+        local value="${!name:-$default}"
+        if [[ -n "$value" || $# -ge 2 ]]; then
+            printf 'export %s=%q\n' "$name" "$value" >>"$helper"
+        fi
+    }
+    append_env_export AWS_ACCESS_KEY_ID "rustfsadmin"
+    append_env_export AWS_SECRET_ACCESS_KEY "rustfsadmin"
+    append_env_export AWS_DEFAULT_REGION "us-east-1"
+    append_env_export AWS_EC2_METADATA_DISABLED "true"
+    append_env_export AWS_SESSION_TOKEN
+    append_env_export SLAYERFS_MOUNT_WAIT_SECS "60"
+    append_env_export SLAYERFS_PRE_MOUNT_WAIT_SECS "10"
+    append_env_export SLAYERFS_MOUNT_READY_DELAY_SECS "1"
+    append_env_export SLAYERFS_NOFILE_LIMIT "1048576"
+    append_env_export PERF_FUSE_OPS_LOG "0"
+    append_env_export RUST_LOG
+
+    cat >>"$helper" <<'EOF'
+if [[ -n "${SLAYERFS_NOFILE_LIMIT:-}" ]]; then
+    ulimit -n "$SLAYERFS_NOFILE_LIMIT" >/dev/null 2>&1 \
+        || echo "failed to raise nofile limit to $SLAYERFS_NOFILE_LIMIT; current=$(ulimit -n)" >&2
+fi
+
 # Enable FUSE op tracing when PERF_FUSE_OPS_LOG=1 for detailed profiling
 if [[ "${PERF_FUSE_OPS_LOG:-0}" == "1" ]]; then
     export RUST_LOG="${RUST_LOG:-slayerfs=info,rfuse3::raw::logfs=debug}"
@@ -154,9 +215,34 @@ else
 fi
 
 /usr/local/bin/slayerfs mount --privileged --config "$config_path" "$target" >>"$log_file" 2>&1 &
-sleep "${SLAYERFS_MOUNT_WAIT_SECS:-1}"
-exit 0
+slayerfs_pid=$!
+
+wait_secs="${SLAYERFS_MOUNT_WAIT_SECS:-60}"
+deadline=$((SECONDS + wait_secs))
+while (( SECONDS < deadline )); do
+    if is_slayerfs_mounted; then
+        sleep "${SLAYERFS_MOUNT_READY_DELAY_SECS:-1}"
+        exit 0
+    fi
+    if ! kill -0 "$slayerfs_pid" 2>/dev/null; then
+        status=0
+        wait "$slayerfs_pid" || status=$?
+        if (( status == 0 )); then
+            status=1
+        fi
+        echo "slayerfs mount process exited before $target became a mountpoint (status=$status)" >&2
+        exit "$status"
+    fi
+    sleep 0.1
+done
+
+echo "timed out after ${wait_secs}s waiting for SlayerFS mount at $target" >&2
+echo "slayerfs_pid=$slayerfs_pid running=$(kill -0 "$slayerfs_pid" 2>/dev/null && echo yes || echo no)" >&2
+echo "findmnt: $(findmnt -rn --target "$target" --output TARGET,FSTYPE,SOURCE 2>/dev/null || true)" >&2
+ps -o pid,ppid,stat,etime,comm,args -p "$slayerfs_pid" >&2 || true
+exit 1
 EOF
+
     chmod +x "$helper"
 }
 
@@ -178,13 +264,19 @@ copy_artifacts() {
 }
 
 cleanup() {
-    while mount | grep -q " on $mount_dir "; do
+    while findmnt -rn --target "$mount_dir" --output FSTYPE 2>/dev/null | grep -Eq '^fuse(\.|$)'; do
         fusermount3 -u "$mount_dir" >/dev/null 2>&1 \
             || umount -f "$mount_dir" >/dev/null 2>&1 \
             || umount -l "$mount_dir" >/dev/null 2>&1 \
             || sleep 1
     done
-    pkill -f "/usr/local/bin/slayerfs mount" >/dev/null 2>&1 || true
+    local pids
+    pids="$(ps -eo pid=,args= | awk '$0 ~ /\/usr\/local\/bin\/slayerfs mount/ && $0 !~ /awk/ {print $1}')" || true
+    if [[ -n "$pids" ]]; then
+        while read -r pid; do
+            [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
+        done <<<"$pids"
+    fi
 }
 
 on_exit() {
@@ -205,7 +297,7 @@ require_tool_bin() {
 
 mount_slayerfs() {
     mkdir -p "$mount_dir"
-    if mountpoint -q "$mount_dir"; then
+    if findmnt -rn --target "$mount_dir" --output FSTYPE 2>/dev/null | grep -Eq '^fuse(\.|$)'; then
         cleanup
     fi
 
@@ -214,7 +306,7 @@ mount_slayerfs() {
 
     local i=0
     for ((i = 0; i < 15; i++)); do
-        if mountpoint -q "$mount_dir"; then
+        if findmnt -rn --target "$mount_dir" --output FSTYPE 2>/dev/null | grep -Eq '^fuse(\.|$)'; then
             ok "SlayerFS 已挂载"
             return 0
         fi
@@ -1002,6 +1094,7 @@ main() {
     export SLAYERFS_LOG_FILE="$log_file"
 
     trap on_exit EXIT INT TERM
+    raise_nofile_limit
 
     info "写入 SlayerFS 配置: $config_path"
     write_config

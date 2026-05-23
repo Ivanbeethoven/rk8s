@@ -308,6 +308,24 @@ where
         Ok(data)
     }
 
+    pub(crate) async fn try_read_overlay<F, Fut>(
+        &self,
+        offset: u64,
+        len: usize,
+        f: F,
+    ) -> anyhow::Result<Option<Vec<u8>>>
+    where
+        F: FnOnce(u64, usize) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Option<Vec<u8>>>>,
+    {
+        let _guard = self.gate.read_lock().await;
+        let data = f(offset, len).await?;
+        if let Some(data) = &data {
+            self.update_offset(offset + data.len() as u64);
+        }
+        Ok(data)
+    }
+
     pub(crate) async fn write(&self, offset: u64, data: &[u8]) -> anyhow::Result<usize> {
         let _guard = self.gate.write_lock().await;
         self.write_unlocked(offset, data).await

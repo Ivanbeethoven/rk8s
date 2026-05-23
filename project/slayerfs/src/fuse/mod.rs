@@ -40,7 +40,23 @@ use rfuse3::raw::Filesystem;
 use rfuse3::{FileType as FuseFileType, SetAttr, Timestamp};
 use tracing::{debug, error, info, trace, warn};
 
-const FUSE_CACHE_TTL: Duration = Duration::ZERO;
+/// Runtime-configurable kernel attribute/entry cache TTL.
+/// Non-zero lets the kernel serve repeated getattr/lookup from its own cache
+/// without round-tripping to userspace — eliminating the stat() performance gap.
+/// Default: 1s (matches JuiceFS).  Override via SLAYERFS_CACHE_TTL_MS=0 for
+/// strict multi-client coherency.
+fn fuse_cache_ttl() -> Duration {
+    static TTL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        match std::env::var("SLAYERFS_CACHE_TTL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            Some(ms) => Duration::from_millis(ms),
+            None => Duration::from_secs(1),
+        }
+    })
+}
 
 /// Virtual inode for the `.stats` file exposed at the mount root.
 /// Uses a high inode number unlikely to collide with real inodes.
@@ -74,7 +90,9 @@ mod mount_tests {
         let meta = create_meta_store_from_url("sqlite::memory:")
             .await
             .expect("create meta store");
-        let store = ObjectBlockStore::new(client);
+        let store = ObjectBlockStore::new_async(client)
+            .await
+            .expect("create block store");
 
         let fs = VFS::new(layout, store, meta.store().clone())
             .await
@@ -382,7 +400,7 @@ where
         let attr = vfs_to_fuse_attr(&vattr, &req, self.blocks_for_attr(&vattr));
         // Keep generation at 0 and set TTL to 1s (tunable)
         Ok(ReplyEntry {
-            ttl: FUSE_CACHE_TTL,
+            ttl: fuse_cache_ttl(),
             attr,
             generation: 0,
         })
@@ -665,7 +683,7 @@ where
 
         let attr = vfs_to_fuse_attr(&vattr, &req, self.blocks_for_attr(&vattr));
         Ok(ReplyAttr {
-            ttl: FUSE_CACHE_TTL,
+            ttl: fuse_cache_ttl(),
             attr,
         })
     }
@@ -693,7 +711,7 @@ where
             };
             let attr = vfs_to_fuse_attr(&vattr, &req, self.blocks_for_attr(&vattr));
             return Ok(ReplyAttr {
-                ttl: FUSE_CACHE_TTL,
+                ttl: fuse_cache_ttl(),
                 attr,
             });
         }
@@ -732,7 +750,7 @@ where
         let ttl = if meta_req.size.is_some() {
             Duration::ZERO
         } else {
-            FUSE_CACHE_TTL
+            fuse_cache_ttl()
         };
         Ok(ReplyAttr { ttl, attr })
     }
@@ -850,7 +868,7 @@ where
         _lock_owner: u64,
     ) -> FuseResult<ReplyDirectoryPlus<BoxStream<'a, FuseResult<DirectoryEntryPlus>>>> {
         debug!(unique = req.unique, ino, fh, offset, "fuse.readdirplus");
-        let ttl = FUSE_CACHE_TTL;
+        let ttl = fuse_cache_ttl();
         let mut all: Vec<DirectoryEntryPlus> = Vec::new();
 
         // Rewinddir: same logic as readdir().
@@ -1070,7 +1088,7 @@ where
 
         let attr = vfs_to_fuse_attr(&vattr, &req, self.blocks_for_attr(&vattr));
         Ok(ReplyEntry {
-            ttl: FUSE_CACHE_TTL,
+            ttl: fuse_cache_ttl(),
             attr,
             generation: 0,
         })
@@ -1119,7 +1137,7 @@ where
         };
         let attr = vfs_to_fuse_attr(&vattr, &req, self.blocks_for_attr(&vattr));
         Ok(ReplyEntry {
-            ttl: FUSE_CACHE_TTL,
+            ttl: fuse_cache_ttl(),
             attr,
             generation: 0,
         })
@@ -1190,7 +1208,7 @@ where
             .await
             .map_err(Into::<Errno>::into)?;
         Ok(ReplyCreated {
-            ttl: FUSE_CACHE_TTL,
+            ttl: fuse_cache_ttl(),
             attr,
             generation: 0,
             fh,
@@ -1258,7 +1276,7 @@ where
 
         let fuse_attr = vfs_to_fuse_attr(&attr, &req, self.blocks_for_attr(&attr));
         Ok(ReplyEntry {
-            ttl: FUSE_CACHE_TTL,
+            ttl: fuse_cache_ttl(),
             attr: fuse_attr,
             generation: 0,
         })
@@ -1307,7 +1325,7 @@ where
             .unwrap_or(vattr);
 
         Ok(ReplyEntry {
-            ttl: FUSE_CACHE_TTL,
+            ttl: fuse_cache_ttl(),
             attr: vfs_to_fuse_attr(&attr, &req, self.blocks_for_attr(&attr)),
             generation: 0,
         })

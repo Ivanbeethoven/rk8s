@@ -59,15 +59,13 @@ pub fn compress<'a>(data: &'a [u8], algo: Compression) -> Cow<'a, [u8]> {
 
     let compressed_body = match algo {
         Compression::Lz4 => lz4_flex::compress_prepend_size(data),
-        Compression::Zstd(level) => {
-            match zstd::bulk::compress(data, level) {
-                Ok(c) => c,
-                Err(e) => {
-                    debug!("Zstd compression failed, storing uncompressed: {}", e);
-                    return Cow::Borrowed(data);
-                }
+        Compression::Zstd(level) => match zstd::bulk::compress(data, level) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("Zstd compression failed, storing uncompressed: {}", e);
+                return Cow::Borrowed(data);
             }
-        }
+        },
         Compression::None => unreachable!(),
     };
 
@@ -114,10 +112,8 @@ pub fn decompress(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 
     match algo {
         Compression::None => Ok(body.to_vec()),
-        Compression::Lz4 => {
-            lz4_flex::decompress_size_prepended(body)
-                .map_err(|e| anyhow::anyhow!("LZ4 decompression failed: {}", e))
-        }
+        Compression::Lz4 => lz4_flex::decompress_size_prepended(body)
+            .map_err(|e| anyhow::anyhow!("LZ4 decompression failed: {}", e)),
         Compression::Zstd(_) => {
             zstd::bulk::decompress(body, 64 * 1024 * 1024) // max 64MB decompressed
                 .map_err(|e| anyhow::anyhow!("Zstd decompression failed: {}", e))

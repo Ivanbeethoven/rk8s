@@ -208,7 +208,9 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         ttl: CacheTtl,
         mut options: MetaClientOptions,
     ) -> Arc<Self> {
+        debug!("MetaClient::with_options begin");
         let store_name = store.name();
+        debug!(store_name, "MetaClient::with_options store ready");
         // Always use the predefined configuration values.
         // TODO: Make the values configurable.
         options.batch_prefetch = BatchPrefetchConfig::for_store(store_name);
@@ -245,10 +247,13 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
         } else {
             None
         };
+        debug!("MetaClient::with_options watch worker ready");
 
         let root_ino = store.root_ino();
+        debug!(root_ino, "MetaClient::with_options root ready");
 
         // Create MetaClient
+        debug!("MetaClient::with_options cache structures begin");
         let client = Arc::new(Self {
             store: store.clone(),
             options,
@@ -266,6 +271,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
             control_plane: Mutex::new(None),
             watch_worker: watch_worker.as_ref().map(|(w, _)| w.clone()),
         });
+        debug!("MetaClient::with_options cache structures complete");
 
         // Start cache invalidation handler if Watch Worker is active
         if let Some((_, rx)) = watch_worker.clone() {
@@ -284,6 +290,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
             });
         }
 
+        debug!("MetaClient::with_options complete");
         client
     }
 

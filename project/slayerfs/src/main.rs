@@ -35,11 +35,13 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::cadapter::client::ObjectClient;
+use crate::cadapter::client::{ObjectBackend, ObjectClient};
 use crate::cadapter::localfs::LocalFsBackend;
 use crate::cadapter::s3::{S3Backend, S3Config};
+use crate::chunk::bandwidth::BandwidthLimiter;
+use crate::chunk::cache::ChunksCacheConfig;
 use crate::chunk::layout::ChunkLayout;
-use crate::chunk::store::{BlockStore, ObjectBlockStore};
+use crate::chunk::store::{BlockStore, BlockStoreConfig, ObjectBlockStore};
 use crate::control::client::send_request;
 use crate::control::job::JobOutcome;
 use crate::control::protocol::{ControlRequest, ControlResponse};
@@ -48,8 +50,8 @@ use crate::fuse::mount::{FuseConcurrencyConfig, mount_vfs_privileged, mount_vfs_
 use crate::meta::MetaStore;
 use crate::meta::client::MetaClient;
 use crate::meta::config::{
-    CacheConfig, ClientOptions, CompactConfig, Config, DatabaseConfig, DatabaseType,
-    MetaClientConfig,
+    CacheConfig as MetaCacheConfig, ClientOptions, CompactConfig, Config, DatabaseConfig,
+    DatabaseType, MetaClientConfig,
 };
 use crate::meta::factory::MetaStoreFactory;
 use crate::meta::layer::MetaLayer;
@@ -59,6 +61,7 @@ use crate::vfs::fs::VFS;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
+    raise_nofile_limit();
 
     let cli = Cli::parse();
     let result = match cli.cmd {
@@ -70,6 +73,90 @@ async fn main() -> anyhow::Result<()> {
     shutdown_chrome();
     result
 }
+
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    const DEFAULT_NOFILE_LIMIT: u64 = 1_048_576;
+
+    let target = std::env::var("SLAYERFS_NOFILE_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_NOFILE_LIMIT) as libc::rlim_t;
+
+    // SAFETY: getrlimit/setrlimit are process-local libc calls. We pass valid
+    // pointers to stack-allocated rlimit values and do not retain those pointers.
+    unsafe {
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) != 0 {
+            tracing::warn!(
+                error = ?std::io::Error::last_os_error(),
+                "failed to read RLIMIT_NOFILE"
+            );
+            return;
+        }
+
+        if current.rlim_cur >= target {
+            tracing::debug!(
+                soft = current.rlim_cur,
+                hard = current.rlim_max,
+                "RLIMIT_NOFILE already sufficient"
+            );
+            return;
+        }
+
+        let requested_hard = if current.rlim_max == libc::RLIM_INFINITY {
+            current.rlim_max
+        } else {
+            current.rlim_max.max(target)
+        };
+        let requested = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: requested_hard,
+        };
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &requested) == 0 {
+            tracing::info!(
+                soft = requested.rlim_cur,
+                hard = requested.rlim_max,
+                "raised RLIMIT_NOFILE"
+            );
+            return;
+        }
+
+        let fallback_soft = if current.rlim_max == libc::RLIM_INFINITY {
+            target
+        } else {
+            target.min(current.rlim_max)
+        };
+        if fallback_soft > current.rlim_cur {
+            let fallback = libc::rlimit {
+                rlim_cur: fallback_soft,
+                rlim_max: current.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &fallback) == 0 {
+                tracing::info!(
+                    soft = fallback.rlim_cur,
+                    hard = fallback.rlim_max,
+                    "raised RLIMIT_NOFILE to hard limit"
+                );
+                return;
+            }
+        }
+
+        tracing::warn!(
+            soft = current.rlim_cur,
+            hard = current.rlim_max,
+            target,
+            error = ?std::io::Error::last_os_error(),
+            "failed to raise RLIMIT_NOFILE"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_nofile_limit() {}
 
 #[cfg(feature = "profiling")]
 fn init_tracing() {
@@ -246,20 +333,56 @@ async fn mount_cmd(args: MountConfig) -> anyhow::Result<()> {
         block_size: args.block_size,
     };
 
+    tracing::info!(
+        mount_point = %args.mount_point.display(),
+        meta_backend = ?args.meta_backend,
+        data_backend = ?args.data_backend,
+        "mount startup begin"
+    );
     let meta_store = create_meta_store(&args).await?;
+    tracing::info!("mount startup meta store ready");
 
     match args.data_backend {
         DataBackendKind::LocalFs => {
             let client = create_localfs_client(&args)?;
-            let store = ObjectBlockStore::new(client);
+            tracing::info!("mount startup localfs client ready");
+            let store = create_object_store(client, layout, &args.cache).await?;
             mount_with_store(layout, store, meta_store, &args).await
         }
         DataBackendKind::S3 => {
             let client = create_s3_client(&args).await?;
-            let store = ObjectBlockStore::new(client);
+            tracing::info!("mount startup s3 client ready");
+            let store = create_object_store(client, layout, &args.cache).await?;
             mount_with_store(layout, store, meta_store, &args).await
         }
     }
+}
+
+async fn create_object_store<B>(
+    client: ObjectClient<B>,
+    layout: ChunkLayout,
+    cache: &crate::vfs::cache::config::CacheConfig,
+) -> anyhow::Result<ObjectBlockStore<B>>
+where
+    B: ObjectBackend + Send + Sync + 'static,
+{
+    let chunks_cache_config = ChunksCacheConfig::with_budgets(
+        cache.read_memory_bytes,
+        cache.read_ssd_bytes,
+        cache.cache_root.join("chunks"),
+    );
+    let block_store_config = BlockStoreConfig {
+        block_size: layout.block_size as usize,
+        compression: cache.compression,
+        ..BlockStoreConfig::default()
+    };
+    let bandwidth = BandwidthLimiter::new(&cache.bandwidth);
+
+    Ok(
+        ObjectBlockStore::new_with_configs_async(client, chunks_cache_config, block_store_config)
+            .await?
+            .with_bandwidth(bandwidth),
+    )
 }
 
 fn create_localfs_client(args: &MountConfig) -> anyhow::Result<ObjectClient<LocalFsBackend>> {
@@ -314,32 +437,47 @@ where
     let mut meta_config = MetaClientConfig::default();
     meta_config.options.mount_point = Some(mount_point.display().to_string());
 
+    tracing::info!("mount startup meta client create begin");
     let meta_client = MetaClient::with_options(
         meta_store,
         meta_config.capacity.clone(),
         meta_config.effective_ttl(),
         meta_config.options,
     );
+    tracing::info!("mount startup meta client create complete");
+    tracing::info!("mount startup meta client initialize begin");
     meta_client
         .initialize()
         .await
         .map_err(anyhow::Error::from)?;
+    tracing::info!("mount startup meta client initialize complete");
+    tracing::info!("mount startup control plane begin");
     meta_client
         .start_control_plane()
         .await
         .map_err(anyhow::Error::from)?;
+    tracing::info!("mount startup control plane complete");
 
-    let fs = VFS::with_meta_layer_with_compact_config(
+    tracing::info!("mount startup vfs create begin");
+    let fs = VFS::with_meta_layer_with_cache_config(
         layout,
         store,
         meta_client.clone(),
         meta_config.compact.clone(),
+        args.cache.clone(),
     )
     .map_err(anyhow::Error::from)?;
+    tracing::info!("mount startup vfs create complete");
     let concurrency = FuseConcurrencyConfig {
         worker_count: args.fuse_workers,
         max_background: args.fuse_max_background,
     };
+    tracing::info!(
+        privileged = args.privileged,
+        worker_count = args.fuse_workers,
+        max_background = args.fuse_max_background,
+        "mount startup fuse mount begin"
+    );
     let handle = if args.privileged {
         mount_vfs_privileged(fs, mount_point, concurrency).await?
     } else {
@@ -519,7 +657,7 @@ async fn create_meta_store(args: &MountConfig) -> anyhow::Result<Arc<dyn MetaSto
                 database: DatabaseConfig {
                     db_config: database_type_from_url(&args.meta_url),
                 },
-                cache: CacheConfig::default(),
+                cache: MetaCacheConfig::default(),
                 client,
                 compact,
             };
@@ -540,7 +678,7 @@ async fn create_meta_store(args: &MountConfig) -> anyhow::Result<Arc<dyn MetaSto
                         urls: args.meta_etcd_urls.clone(),
                     },
                 },
-                cache: CacheConfig::default(),
+                cache: MetaCacheConfig::default(),
                 client,
                 compact,
             };
@@ -557,7 +695,7 @@ async fn create_meta_store(args: &MountConfig) -> anyhow::Result<Arc<dyn MetaSto
                         url: args.meta_url.clone(),
                     },
                 },
-                cache: CacheConfig::default(),
+                cache: MetaCacheConfig::default(),
                 client,
                 compact,
             };

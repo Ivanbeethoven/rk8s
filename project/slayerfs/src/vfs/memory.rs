@@ -4,8 +4,8 @@
 //! reader prefetch pool and writer dirty buffers. Watermark-based pressure levels
 //! allow subsystems to adapt their behavior (reduce prefetch, force-flush writes).
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::{debug, trace, warn};
 
@@ -51,7 +51,10 @@ struct Inner {
 impl MemoryBudget {
     /// Create a new memory budget with the given total capacity.
     pub fn new(total_bytes: u64) -> Self {
-        debug!("MemoryBudget created: total={:.1} MiB", total_bytes as f64 / 1048576.0);
+        debug!(
+            "MemoryBudget created: total={:.1} MiB",
+            total_bytes as f64 / 1048576.0
+        );
         Self {
             inner: Arc::new(Inner {
                 total_bytes,
@@ -106,11 +109,35 @@ impl MemoryBudget {
         }
     }
 
+    fn fetch_sub_saturating(counter: &AtomicU64, bytes: u64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(bytes))
+        });
+    }
+
+    fn alloc_reader(&self, bytes: u64) -> PressureLevel {
+        self.inner.used_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.inner.reader_bytes.fetch_add(bytes, Ordering::Relaxed);
+        let level = self.pressure_level();
+        if level >= PressureLevel::High {
+            debug!(
+                "Reader alloc under pressure: +{:.1} MiB, total={:.1}/{:.1} MiB, level={:?}",
+                bytes as f64 / 1048576.0,
+                self.used_bytes() as f64 / 1048576.0,
+                self.inner.total_bytes as f64 / 1048576.0,
+                level
+            );
+        }
+        level
+    }
+
     /// Try to allocate bytes for the reader (prefetch).
     /// Returns true if allocation succeeded (pressure < critical), false otherwise.
     pub fn try_alloc_reader(&self, bytes: u64) -> bool {
         let current = self.inner.used_bytes.load(Ordering::Relaxed);
-        if current + bytes > (self.inner.total_bytes as f64 * WATERMARK_CRITICAL) as u64 {
+        if current.saturating_add(bytes)
+            > (self.inner.total_bytes as f64 * WATERMARK_CRITICAL) as u64
+        {
             trace!(
                 "Reader alloc rejected: used={:.1} MiB + request={:.1} MiB > critical={:.1} MiB",
                 current as f64 / 1048576.0,
@@ -119,14 +146,7 @@ impl MemoryBudget {
             );
             return false;
         }
-        self.inner.used_bytes.fetch_add(bytes, Ordering::Relaxed);
-        self.inner.reader_bytes.fetch_add(bytes, Ordering::Relaxed);
-        trace!(
-            "Reader alloc: +{:.1} MiB, total used={:.1} MiB ({:.0}%)",
-            bytes as f64 / 1048576.0,
-            (current + bytes) as f64 / 1048576.0,
-            (current + bytes) as f64 / self.inner.total_bytes as f64 * 100.0
-        );
+        self.alloc_reader(bytes);
         true
     }
 
@@ -150,15 +170,15 @@ impl MemoryBudget {
 
     /// Free reader bytes (prefetch buffer released).
     pub fn free_reader(&self, bytes: u64) {
-        self.inner.reader_bytes.fetch_sub(bytes, Ordering::Relaxed);
-        self.inner.used_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        Self::fetch_sub_saturating(&self.inner.reader_bytes, bytes);
+        Self::fetch_sub_saturating(&self.inner.used_bytes, bytes);
         trace!("Reader free: -{:.1} MiB", bytes as f64 / 1048576.0);
     }
 
     /// Free writer bytes (slice uploaded/committed).
     pub fn free_writer(&self, bytes: u64) {
-        self.inner.writer_bytes.fetch_sub(bytes, Ordering::Relaxed);
-        self.inner.used_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        Self::fetch_sub_saturating(&self.inner.writer_bytes, bytes);
+        Self::fetch_sub_saturating(&self.inner.used_bytes, bytes);
         trace!("Writer free: -{:.1} MiB", bytes as f64 / 1048576.0);
     }
 
@@ -204,6 +224,59 @@ impl MemoryBudget {
                 writer as f64 / 1048576.0,
             );
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MemoryConsumer {
+    Reader,
+    Writer,
+}
+
+pub(crate) struct MemoryUsageGuard {
+    budget: MemoryBudget,
+    consumer: MemoryConsumer,
+    bytes: u64,
+}
+
+impl MemoryUsageGuard {
+    pub(crate) fn new(budget: MemoryBudget, consumer: MemoryConsumer) -> Self {
+        Self {
+            budget,
+            consumer,
+            bytes: 0,
+        }
+    }
+
+    pub(crate) fn update_bytes(&mut self, bytes: u64) {
+        match bytes.cmp(&self.bytes) {
+            std::cmp::Ordering::Greater => {
+                let delta = bytes - self.bytes;
+                match self.consumer {
+                    MemoryConsumer::Reader => {
+                        self.budget.alloc_reader(delta);
+                    }
+                    MemoryConsumer::Writer => {
+                        self.budget.alloc_writer(delta);
+                    }
+                }
+            }
+            std::cmp::Ordering::Less => {
+                let delta = self.bytes - bytes;
+                match self.consumer {
+                    MemoryConsumer::Reader => self.budget.free_reader(delta),
+                    MemoryConsumer::Writer => self.budget.free_writer(delta),
+                }
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        self.bytes = bytes;
+    }
+}
+
+impl Drop for MemoryUsageGuard {
+    fn drop(&mut self) {
+        self.update_bytes(0);
     }
 }
 
@@ -273,5 +346,38 @@ mod tests {
         assert!(!budget.should_force_flush());
         budget.alloc_writer(960);
         assert!(budget.should_force_flush());
+    }
+
+    #[test]
+    fn test_usage_guard_tracks_and_frees_reader_bytes() {
+        let budget = MemoryBudget::new(1000);
+        {
+            let mut guard = MemoryUsageGuard::new(budget.clone(), MemoryConsumer::Reader);
+            guard.update_bytes(400);
+            assert_eq!(budget.reader_bytes(), 400);
+            assert_eq!(budget.used_bytes(), 400);
+
+            guard.update_bytes(250);
+            assert_eq!(budget.reader_bytes(), 250);
+            assert_eq!(budget.used_bytes(), 250);
+        }
+
+        assert_eq!(budget.reader_bytes(), 0);
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn test_usage_guard_tracks_and_frees_writer_bytes() {
+        let budget = MemoryBudget::new(1000);
+        {
+            let mut guard = MemoryUsageGuard::new(budget.clone(), MemoryConsumer::Writer);
+            guard.update_bytes(600);
+            assert_eq!(budget.writer_bytes(), 600);
+            assert_eq!(budget.pressure_level(), PressureLevel::Normal);
+        }
+
+        assert_eq!(budget.writer_bytes(), 0);
+        assert_eq!(budget.used_bytes(), 0);
+        assert_eq!(budget.pressure_level(), PressureLevel::Low);
     }
 }

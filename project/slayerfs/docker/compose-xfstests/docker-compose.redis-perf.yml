@@ -137,6 +137,10 @@ services:
       SLAYERFS_CONFIG_PATH: /run/slayerfs/config.yaml
       SLAYERFS_LOG_FILE: /artifacts/slayerfs.log
       SLAYERFS_FUSE_OP_LOG: ${SLAYERFS_FUSE_OP_LOG:-0}
+      SLAYERFS_MOUNT_WAIT_SECS: ${SLAYERFS_MOUNT_WAIT_SECS:-60}
+      SLAYERFS_PRE_MOUNT_WAIT_SECS: ${SLAYERFS_PRE_MOUNT_WAIT_SECS:-10}
+      SLAYERFS_MOUNT_READY_DELAY_SECS: ${SLAYERFS_MOUNT_READY_DELAY_SECS:-1}
+      SLAYERFS_NOFILE_LIMIT: ${SLAYERFS_NOFILE_LIMIT:-1048576}
       SLAYERFS_FUSE_LOG_FILE: /artifacts/slayerfs_fuse_ops.log
       SLAYERFS_ARTIFACT_DIR: ${SLAYERFS_ARTIFACT_DIR:-}
       SLAYERFS_ARTIFACT_ROOT: /artifacts
@@ -154,6 +158,10 @@ services:
       - SYS_ADMIN
     security_opt:
       - apparmor=unconfined
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
     volumes:
       - ./artifacts:/artifacts
       - ./run_perf_in_container.sh:/usr/local/bin/run_perf_in_container.sh:ro

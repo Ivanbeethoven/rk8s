@@ -100,7 +100,14 @@ impl S3Backend {
             aws_config_loader = aws_config_loader.region(Region::new(region.clone()));
         }
 
+        tracing::info!(
+            endpoint = ?config.endpoint,
+            region = ?config.region,
+            bucket = %config.bucket,
+            "s3 backend aws config load begin"
+        );
         let aws_config = aws_config_loader.load().await;
+        tracing::info!("s3 backend aws config load complete");
 
         let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&aws_config);
 
@@ -124,6 +131,7 @@ impl S3Backend {
         }
 
         let client = Client::from_conf(s3_config_builder.build());
+        tracing::info!("s3 backend client ready");
 
         Ok(Self { client, config })
     }

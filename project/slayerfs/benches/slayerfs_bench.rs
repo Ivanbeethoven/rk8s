@@ -250,10 +250,15 @@ enum BenchStore {
 
 #[async_trait]
 impl BlockStore for BenchStore {
-    async fn write_range(&self, key: BlockKey, offset: u64, data: &[u8]) -> anyhow::Result<u64> {
+    async fn write_fresh_range(
+        &self,
+        key: BlockKey,
+        offset: u64,
+        data: &[u8],
+    ) -> anyhow::Result<u64> {
         match self {
-            BenchStore::Local(store) => store.write_range(key, offset, data).await,
-            BenchStore::S3(store) => store.write_range(key, offset, data).await,
+            BenchStore::Local(store) => store.write_fresh_range(key, offset, data).await,
+            BenchStore::S3(store) => store.write_fresh_range(key, offset, data).await,
         }
     }
 
@@ -381,9 +386,13 @@ async fn create_backend_store(cfg: &BenchConfig) -> Result<(BenchStore, Option<B
 }
 
 fn tokio_runtime(thread_num: usize) -> Runtime {
+    // Allocate extra worker threads beyond the application-level concurrency:
+    // upload tasks and commit_chunk tasks are spawned on the same runtime and
+    // must not be starved by the benchmark's own write tasks.
+    let total = (thread_num * 3).max(4);
     Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(thread_num.max(2))
+        .worker_threads(total)
         .build()
         .expect("failed to build tokio runtime")
 }

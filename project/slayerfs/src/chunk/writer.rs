@@ -16,19 +16,23 @@ const FG_UPLOAD_PERMITS: usize = 192;
 /// Background upload permits (compaction/warmup) — lower priority, smaller pool.
 const BG_UPLOAD_PERMITS: usize = 64;
 
-static FG_UPLOAD_SEM: LazyLock<Semaphore> =
-    LazyLock::new(|| Semaphore::new(FG_UPLOAD_PERMITS));
-static BG_UPLOAD_SEM: LazyLock<Semaphore> =
-    LazyLock::new(|| Semaphore::new(BG_UPLOAD_PERMITS));
+static FG_UPLOAD_SEM: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(FG_UPLOAD_PERMITS));
+static BG_UPLOAD_SEM: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(BG_UPLOAD_PERMITS));
 
 /// Acquire a foreground upload permit (flush/fsync path).
 pub(crate) async fn fg_upload_permit() -> tokio::sync::SemaphorePermit<'static> {
-    FG_UPLOAD_SEM.acquire().await.expect("fg upload semaphore closed")
+    FG_UPLOAD_SEM
+        .acquire()
+        .await
+        .expect("fg upload semaphore closed")
 }
 
 /// Acquire a background upload permit (compaction/GC).
 pub(crate) async fn upload_permit() -> tokio::sync::SemaphorePermit<'static> {
-    BG_UPLOAD_SEM.acquire().await.expect("bg upload semaphore closed")
+    BG_UPLOAD_SEM
+        .acquire()
+        .await
+        .expect("bg upload semaphore closed")
 }
 
 struct ChunkCursor<'a> {

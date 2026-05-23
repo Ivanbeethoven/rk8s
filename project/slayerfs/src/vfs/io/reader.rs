@@ -15,6 +15,7 @@ use crate::vfs::backend::Backend;
 use crate::vfs::chunk_id_for;
 use crate::vfs::config::ReadConfig;
 use crate::vfs::io::split_chunk_spans;
+use crate::vfs::memory::{MemoryBudget, MemoryConsumer, MemoryUsageGuard, PressureLevel};
 use dashmap::{DashMap, Entry};
 use parking_lot::Mutex as ParkingMutex;
 use std::collections::{HashMap, VecDeque};
@@ -37,6 +38,7 @@ pub(crate) struct DataReader<B, M> {
     files: DashMap<u64, Vec<(u64, Arc<FileReader<B, M>>)>>, // ino -> (fh, reader)
     backend: Arc<Backend<B, M>>,
     prefetcher: Option<Arc<dyn crate::vfs::cache::prefetch::Prefetcher>>,
+    memory_budget: Option<MemoryBudget>,
 }
 
 impl<B, M> DataReader<B, M>
@@ -51,6 +53,7 @@ where
             files: DashMap::new(),
             backend,
             prefetcher: None,
+            memory_budget: None,
         }
     }
 
@@ -62,6 +65,11 @@ where
         self
     }
 
+    pub(crate) fn with_memory_budget(mut self, memory_budget: MemoryBudget) -> Self {
+        self.memory_budget = Some(memory_budget);
+        self
+    }
+
     pub(crate) fn open_for_handle(&self, ino: Arc<Inode>, fh: u64) -> Arc<FileReader<B, M>> {
         let ino_number = ino.ino();
         let reader = Arc::new(FileReader::new(
@@ -69,6 +77,7 @@ where
             self.buffer_usage.clone(),
             ino,
             self.backend.clone(),
+            self.memory_budget.clone(),
         ));
 
         self.files
@@ -78,14 +87,12 @@ where
         reader
     }
 
-    pub(crate) fn close_for_handle(&self, ino: u64, fh: u64) {
+    pub(crate) async fn close_for_handle(&self, ino: u64, fh: u64) {
         if let Some(prefetcher) = &self.prefetcher {
-            let p = prefetcher.clone();
-            let ino_i64 = ino as i64;
-            tokio::spawn(async move { p.cancel_for_handle(ino_i64, fh).await });
+            prefetcher.cancel_for_handle(ino as i64, fh).await;
         }
 
-        if let Entry::Occupied(mut entry) = self.files.entry(ino) {
+        let removed = if let Entry::Occupied(mut entry) = self.files.entry(ino) {
             let mut removed = Vec::new();
             let list = entry.get_mut();
 
@@ -102,11 +109,13 @@ where
                 entry.remove();
             }
 
-            for reader in removed {
-                tokio::spawn(async move {
-                    reader.invalidate_all().await;
-                });
-            }
+            removed
+        } else {
+            Vec::new()
+        };
+
+        for reader in removed {
+            reader.invalidate_all().await;
         }
     }
 
@@ -114,9 +123,23 @@ where
     /// Called by the VFS after each successful read to warm the cache.
     pub(crate) fn submit_prefetch(&self, ino: i64, fh: u64, offset: u64, read_len: u64) {
         if let Some(prefetcher) = &self.prefetcher {
+            if self
+                .memory_budget
+                .as_ref()
+                .is_some_and(|budget| budget.pressure_level() >= PressureLevel::Critical)
+            {
+                return;
+            }
+
             use crate::vfs::cache::prefetch::{PrefetchPriority, PrefetchTask};
             let ahead_start = offset + read_len;
-            let ahead_len = read_len.max(self.config.layout.block_size as u64);
+            let mut ahead_len = read_len.max(self.config.layout.block_size as u64);
+            if let Some(budget) = &self.memory_budget {
+                let block_size = self.config.layout.block_size as u64;
+                ahead_len = ((ahead_len as f64 * budget.readahead_factor()).ceil() as u64)
+                    .max(block_size)
+                    .min(self.config.max_ahead.max(block_size));
+            }
             let p = prefetcher.clone();
             let task = PrefetchTask {
                 ino,
@@ -285,6 +308,7 @@ struct SliceState {
     range: (u64, u64),
     page: Vec<u8>,
     usage: UsageGuard,
+    memory_usage: Option<MemoryUsageGuard>,
     state: SliceStatus,
     err: Option<String>,
     notify: Arc<Notify>,
@@ -301,12 +325,20 @@ struct SliceState {
 }
 
 impl SliceState {
-    fn new(index: u64, range: (u64, u64), refs: u16, usage: Arc<AtomicU64>) -> Self {
+    fn new(
+        index: u64,
+        range: (u64, u64),
+        refs: u16,
+        usage: Arc<AtomicU64>,
+        memory_budget: Option<MemoryBudget>,
+    ) -> Self {
         Self {
             index,
             range,
             page: Vec::new(),
             usage: UsageGuard::new(usage),
+            memory_usage: memory_budget
+                .map(|budget| MemoryUsageGuard::new(budget, MemoryConsumer::Reader)),
             state: SliceStatus::New,
             err: None,
             notify: Arc::new(Notify::new()),
@@ -315,6 +347,13 @@ impl SliceState {
             queue_delay_ms: None,
             fetch_ms: None,
             last_access: Instant::now(),
+        }
+    }
+
+    fn update_usage(&mut self, bytes: u64) {
+        self.usage.update_bytes(bytes);
+        if let Some(memory_usage) = &mut self.memory_usage {
+            memory_usage.update_bytes(bytes);
         }
     }
 
@@ -399,13 +438,13 @@ impl SliceState {
                     guard.state = SliceStatus::Ready;
                     guard.page = out;
                     let new_len = guard.page.len() as u64;
-                    guard.usage.update_bytes(new_len);
+                    guard.update_usage(new_len);
                     guard.err = None;
                 }
                 Err(e) => {
                     guard.state = SliceStatus::Invalid;
                     guard.page = Vec::new();
-                    guard.usage.update_bytes(0);
+                    guard.update_usage(0);
                     guard.err = Some(e.to_string());
                 }
             }
@@ -444,6 +483,7 @@ pub(crate) struct FileReader<B, M> {
     slices: Mutex<VecDeque<Arc<ParkingMutex<SliceState>>>>,
     sessions: ParkingMutex<[Session; READ_SESSIONS]>,
     backend: Arc<Backend<B, M>>,
+    memory_budget: Option<MemoryBudget>,
 }
 
 impl<B, M> FileReader<B, M>
@@ -456,6 +496,7 @@ where
         buffer_usage: Arc<AtomicU64>,
         inode: Arc<Inode>,
         backend: Arc<Backend<B, M>>,
+        memory_budget: Option<MemoryBudget>,
     ) -> Self {
         Self {
             config,
@@ -464,6 +505,7 @@ where
             slices: Mutex::new(VecDeque::new()),
             sessions: ParkingMutex::new([Session::default(); READ_SESSIONS]),
             backend,
+            memory_budget,
         }
     }
 
@@ -576,15 +618,34 @@ where
     }
 
     fn total_ahead_limit(&self) -> u64 {
-        if self.config.buffer_size > 0 {
+        let limit = if self.config.buffer_size > 0 {
             self.config.buffer_size * 8 / 10
         } else {
             DEFAULT_TOTAL_AHEAD_LIMIT
+        };
+        self.apply_readahead_factor(limit)
+    }
+
+    fn apply_readahead_factor(&self, value: u64) -> u64 {
+        let Some(budget) = &self.memory_budget else {
+            return value;
+        };
+        if value == 0 {
+            return 0;
         }
+        let factor = budget.readahead_factor();
+        if factor >= 1.0 {
+            return value;
+        }
+        let block_size = self.config.layout.block_size as u64;
+        ((value as f64 * factor).ceil() as u64)
+            .max(block_size.min(value))
+            .min(value)
     }
 
     fn max_ahead(&self) -> u64 {
-        self.config.max_ahead.min(self.total_ahead_limit())
+        self.apply_readahead_factor(self.config.max_ahead)
+            .min(self.total_ahead_limit())
     }
 
     fn max_slice_amount(&self) -> usize {
@@ -687,10 +748,26 @@ where
                 total_wait += Duration::from_millis(100);
             }
         }
+        if let Some(budget) = &self.memory_budget {
+            let level = budget.pressure_level();
+            if level >= PressureLevel::High {
+                budget.log_state();
+                tokio::task::yield_now().await;
+            }
+        }
         Ok(())
     }
 
     async fn prepare_ahead_slices(&self, offset: u64, ahead: u64, guards: &mut Vec<SlicePinGuard>) {
+        if ahead == 0
+            || self
+                .memory_budget
+                .as_ref()
+                .is_some_and(|budget| budget.pressure_level() >= PressureLevel::Critical)
+        {
+            return;
+        }
+
         let aligned = (offset + ahead).next_multiple_of(self.config.layout.block_size as u64);
 
         let spans = split_chunk_spans(self.config.layout, offset, (aligned - offset).as_usize());
@@ -750,9 +827,15 @@ where
         let ahead = tracing::trace_span!("read_at.check_session", offset, len = actual_len)
             .in_scope(|| self.check_session(offset, actual_len));
 
-        tracing::trace_span!("FileReader.read_at.prepare_ahead_slices", offset, ahead)
-            .in_scope(|| self.prepare_ahead_slices(offset, ahead, &mut pin_guard))
-            .await;
+        let ahead_start = offset + actual_len as u64;
+        let ahead = ahead.min(file_size.saturating_sub(ahead_start));
+        tracing::trace_span!(
+            "FileReader.read_at.prepare_ahead_slices",
+            offset = ahead_start,
+            ahead
+        )
+        .in_scope(|| self.prepare_ahead_slices(ahead_start, ahead, &mut pin_guard))
+        .await;
 
         let mut tail = buf;
         let result = async {
@@ -930,6 +1013,7 @@ where
                 range,
                 1,
                 self.buffer_usage.clone(),
+                self.memory_budget.clone(),
             )));
 
             SliceState::background_fetch(
@@ -1017,7 +1101,7 @@ where
             state.generation = state.generation.saturating_add(1);
             state.state = SliceStatus::Invalid;
             state.page = Vec::new();
-            state.usage.update_bytes(0);
+            state.update_usage(0);
             state.notify.notify_waiters();
         }
     }
@@ -1196,6 +1280,77 @@ mod tests {
         reader.invalidate(ino as u64, 0, data2.len()).await.unwrap();
         let out2 = file_reader.read(0, data2.len()).await.unwrap();
         assert_eq!(out2, data2);
+    }
+
+    #[tokio::test]
+    async fn test_readahead_starts_after_current_read() {
+        let layout = ChunkLayout {
+            chunk_size: 16 * 1024,
+            block_size: 4 * 1024,
+        };
+        let block_store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(block_store.clone(), meta.clone()));
+
+        let ino: i64 = 33;
+        let data = vec![7u8; (layout.block_size * 2) as usize];
+        let slice_id = meta_store.next_id(SLICE_ID_KEY).await.unwrap();
+        let uploader = DataUploader::new(layout, backend.as_ref());
+        uploader
+            .write_at_vectored(
+                slice_id as u64,
+                0u64.into(),
+                &[Bytes::copy_from_slice(&data)],
+            )
+            .await
+            .unwrap();
+        meta_store
+            .append_slice(
+                chunk_id_for(ino, 0).unwrap(),
+                SliceDesc {
+                    slice_id: slice_id as u64,
+                    chunk_id: chunk_id_for(ino, 0).unwrap(),
+                    offset: 0,
+                    length: data.len() as u64,
+                },
+            )
+            .await
+            .unwrap();
+
+        let inode = Inode::new(ino, data.len() as u64);
+        let config = Arc::new(
+            ReadConfig::new(layout)
+                .buffer_size(64 * 1024)
+                .max_ahead(layout.block_size as u64),
+        );
+        let reader = DataReader::new(config, backend.clone());
+        let file_reader = reader.open_for_handle(inode, 1);
+
+        let out = file_reader
+            .read(0, layout.block_size as usize)
+            .await
+            .unwrap();
+        assert_eq!(out, data[..layout.block_size as usize]);
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let ranges = {
+            let guard = file_reader.slices.lock().await;
+            guard
+                .iter()
+                .map(|slice| slice.lock().range)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            ranges
+                .iter()
+                .any(|&(start, end)| start <= layout.block_size as u64
+                    && end >= layout.block_size as u64 * 2),
+            "readahead should queue the block after the current read, ranges={ranges:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

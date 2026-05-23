@@ -1,4 +1,5 @@
 use crate::chunk::ChunkLayout;
+use crate::vfs::cache::config::CacheConfig;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -155,6 +156,7 @@ impl WriteConfig {
 pub struct VFSConfig {
     pub read: Arc<ReadConfig>,
     pub write: Arc<WriteConfig>,
+    pub cache: Arc<CacheConfig>,
 }
 
 #[allow(dead_code)]
@@ -174,14 +176,67 @@ impl VFSConfig {
     }
 
     pub fn new(layout: ChunkLayout) -> Self {
-        let read = Arc::new(ReadConfig::new(layout));
+        Self::new_with_cache_config(layout, CacheConfig::default())
+    }
+
+    pub fn new_with_cache_config(layout: ChunkLayout, cache: CacheConfig) -> Self {
+        let cache = Arc::new(cache);
         let page_size = if layout.block_size.is_multiple_of(DEFAULT_PAGE_SIZE) {
             DEFAULT_PAGE_SIZE
         } else {
             layout.block_size
         };
 
-        let write = Arc::new(WriteConfig::new(layout).page_size(page_size));
-        Self { read, write }
+        let read = Arc::new(
+            ReadConfig::new(layout)
+                .buffer_size(cache.read_memory_bytes)
+                .max_ahead(cache.prefetch_max_bytes),
+        );
+        let write = Arc::new(
+            WriteConfig::new(layout)
+                .page_size(page_size)
+                .buffer_size(cache.write_memory_bytes)
+                .freeze_min_bytes(cache.dirty_slice_target_size)
+                .auto_flush_max_age(Duration::from_millis(cache.dirty_slice_max_age_ms))
+                .writeback_mode(cache.writeback_mode),
+        );
+
+        Self { read, write, cache }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vfs::cache::config::WriteBackMode;
+
+    #[test]
+    fn vfs_config_applies_cache_budget_knobs() {
+        let layout = ChunkLayout {
+            chunk_size: 16 * 1024 * 1024,
+            block_size: 4 * 1024 * 1024,
+        };
+        let cache = CacheConfig {
+            read_memory_bytes: 11 * 1024 * 1024,
+            write_memory_bytes: 12 * 1024 * 1024,
+            dirty_slice_target_size: 2 * 1024 * 1024,
+            dirty_slice_max_age_ms: 123,
+            prefetch_max_bytes: 3 * 1024 * 1024,
+            writeback_mode: WriteBackMode::CommitBeforeUpload,
+            ..CacheConfig::default()
+        };
+
+        let config = VFSConfig::new_with_cache_config(layout, cache.clone());
+
+        assert_eq!(config.read.buffer_size, cache.read_memory_bytes);
+        assert_eq!(config.read.max_ahead, cache.prefetch_max_bytes);
+        assert_eq!(config.write.buffer_size, cache.write_memory_bytes);
+        assert_eq!(config.write.freeze_min_bytes, cache.dirty_slice_target_size);
+        assert_eq!(
+            config.write.auto_flush_max_age,
+            Duration::from_millis(cache.dirty_slice_max_age_ms)
+        );
+        assert_eq!(config.write.writeback_mode, cache.writeback_mode);
+        assert_eq!(config.cache.memory_budget_bytes, cache.memory_budget_bytes);
     }
 }

@@ -8,17 +8,31 @@
 #   ./run_perf.sh --no-build   # Skip rebuild
 #   ./run_perf.sh --quick      # Shorter benchmarks for quick iteration
 #   ./run_perf.sh --no-cleanup # Leave containers and mount point after run
+#   ./run_perf.sh --compress lz4  # Enable LZ4 compression
+#   ./run_perf.sh --compress zstd # Enable Zstd compression
+#
+# Results are saved to: tools/perf/results/<timestamp>/
+#   ├── config.yaml       # Mount config used
+#   ├── flame/            # Flame graphs (.svg) and folded stacks
+#   ├── fio/              # Fio JSON outputs
+#   ├── llm-report.txt    # LLM-readable analysis
+#   └── report.md         # Markdown report
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-PERF_DIR="${PERF_DIR:-/tmp/slayerfs-perf}"
-CONFIG_PATH="$PERF_DIR/config.yaml"
-FLAME_DIR="$PERF_DIR/flame"
-MNT_DIR="$PERF_DIR/mnt"
-DATA_DIR="$PERF_DIR/data"
-RESULTS_DIR="$PERF_DIR/results"
+
+# Results directory: tools/perf/results/<timestamp>
+RUN_TS="$(date +%Y%m%d-%H%M%S)"
+RESULTS_BASE="$SCRIPT_DIR/results"
+RUN_DIR="$RESULTS_BASE/$RUN_TS"
+
+# Working directory (temp, cleaned up)
+WORK_DIR="/tmp/slayerfs-perf-$$"
+CONFIG_PATH="$WORK_DIR/config.yaml"
+MNT_DIR="$WORK_DIR/mnt"
+DATA_DIR="$WORK_DIR/data"
 
 REDIS_PORT="${REDIS_PORT:-16379}"
 RUSTFS_S3_PORT="${RUSTFS_S3_PORT:-19000}"
@@ -31,15 +45,18 @@ QUICK=0
 CLEANUP=1
 SKIP_ONCPU=0
 SKIP_OFFCPU=0
+COMPRESSION="${SLAYERFS_COMPRESSION:-none}"
 
-for arg in "$@"; do
-    case "$arg" in
-        --no-build) BUILD=0 ;;
-        --quick) QUICK=1 ;;
-        --no-cleanup) CLEANUP=0 ;;
-        --skip-oncpu) SKIP_ONCPU=1 ;;
-        --skip-offcpu) SKIP_OFFCPU=1 ;;
-        *) echo "Unknown: $arg"; exit 1 ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-build) BUILD=0; shift ;;
+        --quick) QUICK=1; shift ;;
+        --no-cleanup) CLEANUP=0; shift ;;
+        --skip-oncpu) SKIP_ONCPU=1; shift ;;
+        --skip-offcpu) SKIP_OFFCPU=1; shift ;;
+        --compress|--compression)
+            COMPRESSION="${2:-lz4}"; shift 2 ;;
+        *) echo "Unknown: $1"; exit 1 ;;
     esac
 done
 
@@ -57,14 +74,20 @@ info()  { echo -e "${GREEN}[perf]${NC} ${BOLD}$*${NC}"; }
 warn()  { echo -e "${YELLOW}[perf]${NC} $*"; }
 err()   { echo -e "${RED}[perf]${NC} $*"; }
 
+SLAYERFS_PID=""
+
 cleanup() {
     if [ "$CLEANUP" -eq 1 ]; then
         info "cleaning up..."
         fusermount3 -u "$MNT_DIR" 2>/dev/null || true
-        pkill -f "slayerfs mount" 2>/dev/null || true
+        # Kill slayerfs by saved PID (avoid pkill)
+        if [[ -n "$SLAYERFS_PID" ]] && kill -0 "$SLAYERFS_PID" 2>/dev/null; then
+            kill "$SLAYERFS_PID" 2>/dev/null || true
+            wait "$SLAYERFS_PID" 2>/dev/null || true
+        fi
         sleep 1
         docker compose -f "$SCRIPT_DIR/docker-compose.yml" down -v 2>/dev/null || true
-        rm -rf "$PERF_DIR"
+        rm -rf "$WORK_DIR"
     fi
 }
 trap cleanup EXIT
@@ -103,8 +126,12 @@ fi
 
 # ---- Setup ----
 info "setting up environment..."
-rm -rf "$PERF_DIR"
-mkdir -p "$PERF_DIR" "$FLAME_DIR" "$MNT_DIR" "$DATA_DIR" "$RESULTS_DIR"
+rm -rf "$WORK_DIR"
+mkdir -p "$WORK_DIR" "$MNT_DIR" "$DATA_DIR"
+mkdir -p "$RUN_DIR/flame" "$RUN_DIR/fio"
+
+FLAME_DIR="$RUN_DIR/flame"
+FIO_DIR="$RUN_DIR/fio"
 
 # ---- Start infrastructure ----
 info "starting redis + rustfs..."
@@ -146,6 +173,18 @@ fuse:
   max_background: 512
 YEOF
 
+# Append cache section if compression is set
+if [[ "$COMPRESSION" != "none" ]]; then
+    cat >> "$CONFIG_PATH" << YEOF
+cache:
+  compression: $COMPRESSION
+YEOF
+fi
+
+# Save a copy of the config to results
+cp "$CONFIG_PATH" "$RUN_DIR/config.yaml"
+info "config: compression=$COMPRESSION"
+
 # ---- Mount ----
 info "mounting slayerfs..."
 fusermount3 -u "$MNT_DIR" 2>/dev/null || true
@@ -157,6 +196,7 @@ AWS_ACCESS_KEY_ID="$RUSTFS_ACCESS_KEY" \
     AWS_EC2_METADATA_DISABLED=true \
     RUST_LOG=error \
     "$BINARY" mount --privileged --config "$CONFIG_PATH" 2>/dev/null &
+SLAYERFS_PID=$!
 
 for i in $(seq 1 15); do
     mount | grep -q " on $MNT_DIR " && break
@@ -176,7 +216,7 @@ rm -rf "$MNT_DIR"/* 2>/dev/null || true
 run_fio() {
     local label="$1"; shift
     info "  fio $label..."
-    local tmp_json="$RESULTS_DIR/fio-${label}.json.tmp"
+    local tmp_json="$FIO_DIR/fio-${label}.json.tmp"
     fio "$@" --directory="$MNT_DIR" --runtime="$RUNTIME" --time_based \
         --group_reporting --eta=never --output-format=json 2>/dev/null \
         | tee "$tmp_json" \
@@ -191,23 +231,22 @@ for j in d.get('jobs',[]):
             lat=j[op]['lat_ns']['mean']/1e6
             print(f'    {op}: {bw/1024/1024:.0f} MiB/s, iops={iops:.1f}, lat_avg={lat:.2f}ms')
 " 2>/dev/null || true
-    mv "$tmp_json" "$RESULTS_DIR/fio-${label}.json" 2>/dev/null || true
+    mv "$tmp_json" "$FIO_DIR/fio-${label}.json" 2>/dev/null || true
 }
 
 # ---- Helper: run perf script safely ----
-# Handles addr2line issues with large debug binaries by using --no-inline
-# and pointing at the correct symbol file.
+# Handles addr2line issues with large debug binaries.
 run_perf_script() {
     local perf_data="$1"
     local output="$2"
 
-    # Try with --no-inline first (avoids addr2line "could not read first record" on large binaries)
-    if perf script --no-inline -i "$perf_data" --symfs "$(dirname "$BINARY")" > "$output" 2>/dev/null; then
+    # Use --symfs / to let perf find the binary at its original path
+    if perf script -i "$perf_data" --symfs / > "$output" 2>/dev/null; then
         return 0
     fi
 
-    # Fallback: plain perf script without --no-inline
-    if perf script -i "$perf_data" > "$output" 2>/dev/null; then
+    # Fallback: try --no-inline (avoids addr2line "could not read first record")
+    if perf script --no-inline -i "$perf_data" --symfs / > "$output" 2>/dev/null; then
         return 0
     fi
 
@@ -324,16 +363,24 @@ HOTSPOTS_ARG=""
 if [ -f "$FLAME_DIR/oncpu-slayerfs.folded" ]; then
     HOTSPOTS_ARG="--hotspots $FLAME_DIR/oncpu-slayerfs.folded"
 fi
-python3 "$SCRIPT_DIR/analyze_perf.py" --llm $HOTSPOTS_ARG "$PERF_DIR" \
-    > "$PERF_DIR/llm-report.txt" 2>/dev/null || true
-info "  LLM report: $PERF_DIR/llm-report.txt"
-cat "$PERF_DIR/llm-report.txt" 2>/dev/null || true
+
+# The analyze_perf.py expects a "results" dir with fio*.json — symlink from our fio dir
+ln -sfn "$FIO_DIR" "$RUN_DIR/results"
+
+python3 "$SCRIPT_DIR/analyze_perf.py" --llm --bottleneck $HOTSPOTS_ARG "$RUN_DIR" \
+    > "$RUN_DIR/llm-report.txt" 2>/dev/null || true
+info "  LLM report: $RUN_DIR/llm-report.txt"
+cat "$RUN_DIR/llm-report.txt" 2>/dev/null || true
+
+# Generate markdown report too
+python3 "$SCRIPT_DIR/analyze_perf.py" --bottleneck $HOTSPOTS_ARG "$RUN_DIR" \
+    -o "$RUN_DIR/report.md" 2>/dev/null || true
 
 # =========================================================================
 # Summary
 # =========================================================================
 info "=============================================="
-info "results saved to: $FLAME_DIR"
+info "results saved to: $RUN_DIR"
 ls -lh "$FLAME_DIR"/*.svg 2>/dev/null || true
 info "=============================================="
 echo ""
@@ -343,5 +390,13 @@ for svg in "$FLAME_DIR"/*.svg; do
     echo "    file://$svg"
 done
 echo ""
-echo "  perf data (for further analysis):"
-ls -lh "$FLAME_DIR"/*.data 2>/dev/null || true
+echo "  reports:"
+echo "    $RUN_DIR/llm-report.txt"
+echo "    $RUN_DIR/report.md"
+echo ""
+echo "  fio results:"
+ls "$FIO_DIR"/*.json 2>/dev/null || true
+
+# Create a 'latest' symlink for convenience
+ln -sfn "$RUN_TS" "$RESULTS_BASE/latest"
+info "symlink: $RESULTS_BASE/latest -> $RUN_TS"

@@ -12,6 +12,64 @@ use std::sync::Arc;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 
+#[test]
+fn local_txlock_slot_is_stable_for_same_key() {
+    assert_eq!(
+        super::RedisMetaStore::local_lock_slot_for_key("c42_0"),
+        super::RedisMetaStore::local_lock_slot_for_key("c42_0")
+    );
+    assert!(
+        super::RedisMetaStore::local_lock_slot_for_key("c42_0") < super::REDIS_TXN_LOCK_STRIPES
+    );
+}
+
+#[tokio::test]
+async fn local_txlock_serializes_same_primary_key() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+
+    let first_active = active.clone();
+    let first_max = max_active.clone();
+    let first_started = started.clone();
+    let first_release = release.clone();
+    let first = tokio::spawn(async move {
+        super::RedisMetaStore::with_local_lock_for_key("cserialized_0", async move {
+            let now = first_active.fetch_add(1, Ordering::SeqCst) + 1;
+            first_max.fetch_max(now, Ordering::SeqCst);
+            first_started.notify_one();
+            first_release.notified().await;
+            first_active.fetch_sub(1, Ordering::SeqCst);
+        })
+        .await;
+    });
+
+    started.notified().await;
+
+    let second_active = active.clone();
+    let second_max = max_active.clone();
+    let second = tokio::spawn(async move {
+        super::RedisMetaStore::with_local_lock_for_key("cserialized_0", async move {
+            let now = second_active.fetch_add(1, Ordering::SeqCst) + 1;
+            second_max.fetch_max(now, Ordering::SeqCst);
+            second_active.fetch_sub(1, Ordering::SeqCst);
+        })
+        .await;
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(max_active.load(Ordering::SeqCst), 1);
+
+    release.notify_one();
+    first.await.unwrap();
+    second.await.unwrap();
+    assert_eq!(max_active.load(Ordering::SeqCst), 1);
+}
+
 async fn cleanup_test_data() -> Result<(), MetaError> {
     let url = "redis://127.0.0.1:6379/0";
     let client = redis::Client::open(url)

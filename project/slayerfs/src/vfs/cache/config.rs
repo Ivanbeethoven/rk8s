@@ -64,7 +64,7 @@ pub struct CacheConfig {
     // Bandwidth limiting
     pub bandwidth: BandwidthConfig,
 
-    // Global memory budget (reader + writer combined)
+    // VFS reader/writer buffer budget. Object/page caches are configured separately.
     pub memory_budget_bytes: u64,
 }
 
@@ -74,24 +74,24 @@ impl Default for CacheConfig {
             cache_root: dirs::cache_dir()
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join("slayerfs"),
-            read_memory_bytes: 1024 * 1024 * 1024,
+            read_memory_bytes: 300 * 1024 * 1024,
             read_ssd_bytes: 20 * 1024 * 1024 * 1024,
-            write_memory_bytes: 512 * 1024 * 1024,
+            write_memory_bytes: 300 * 1024 * 1024,
             write_ssd_bytes: 20 * 1024 * 1024 * 1024,
-            dirty_slice_target_size: 16 * 1024 * 1024,
+            dirty_slice_target_size: 8 * 1024 * 1024,
             dirty_slice_max_age_ms: 500,
             upload_concurrency: 32,
             prefetch_enabled: true,
             prefetch_initial_bytes: 4 * 1024 * 1024,
-            prefetch_max_bytes: 128 * 1024 * 1024,
+            prefetch_max_bytes: 32 * 1024 * 1024,
             prefetch_concurrency: 64,
             strict_posix: true,
             writeback_mode: WriteBackMode::UploadBeforeCommit,
             min_free_disk_bytes: 1024 * 1024 * 1024,
-            compression: Compression::None,
+            compression: Compression::Lz4,
             bandwidth: BandwidthConfig::default(),
-            // Default: read_memory + write_memory = 1.5 GiB, add 512 MiB headroom = 2 GiB
-            memory_budget_bytes: 2 * 1024 * 1024 * 1024,
+            // Default: read/write soft buffers plus headroom for transient overlap.
+            memory_budget_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -105,5 +105,16 @@ mod tests {
         let config = CacheConfig::default();
 
         assert_eq!(config.prefetch_concurrency, 64);
+    }
+
+    #[test]
+    fn cache_config_defaults_preserve_hot_path_settings() {
+        let config = CacheConfig::default();
+
+        assert_eq!(config.compression, Compression::Lz4);
+        assert_eq!(config.read_memory_bytes, 300 * 1024 * 1024);
+        assert_eq!(config.write_memory_bytes, 300 * 1024 * 1024);
+        assert_eq!(config.dirty_slice_target_size, 8 * 1024 * 1024);
+        assert_eq!(config.prefetch_max_bytes, 32 * 1024 * 1024);
     }
 }

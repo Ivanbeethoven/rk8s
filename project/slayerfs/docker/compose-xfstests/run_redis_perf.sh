@@ -269,6 +269,8 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e PERF_FIO_IODEPTH \
     -e PERF_FIO_DIRECT \
     -e PERF_FIO_RUNTIME \
+    -e SLAYERFS_NOFILE_LIMIT \
+    -e SLAYERFS_COMPRESSION \
     -e PERF_LOG_TO_CONSOLE \
     perf
 container_status=$?

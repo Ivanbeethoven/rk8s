@@ -2,7 +2,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+use crate::chunk::bandwidth::BandwidthConfig;
+use crate::chunk::compress::Compression;
 use crate::chunk::layout::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
+use crate::vfs::cache::config::CacheConfig as VfsCacheConfig;
 
 pub const DEFAULT_DATA_DIR: &str = "./data";
 pub const DEFAULT_META_URL: &str = "sqlite::memory:";
@@ -159,6 +162,7 @@ pub struct MountFileConfig {
     pub meta: Option<MetaFileConfig>,
     pub layout: Option<LayoutFileConfig>,
     pub fuse: Option<FuseFileConfig>,
+    pub cache: Option<CacheFileConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -215,6 +219,31 @@ pub struct FuseFileConfig {
     pub privileged: Option<bool>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CacheFileConfig {
+    #[serde(alias = "root")]
+    pub cache_root: Option<PathBuf>,
+    pub read_memory_bytes: Option<u64>,
+    pub read_ssd_bytes: Option<u64>,
+    pub write_memory_bytes: Option<u64>,
+    pub write_ssd_bytes: Option<u64>,
+    pub dirty_slice_target_size: Option<u64>,
+    pub dirty_slice_max_age_ms: Option<u64>,
+    pub prefetch_enabled: Option<bool>,
+    pub prefetch_max_bytes: Option<u64>,
+    pub prefetch_concurrency: Option<usize>,
+    pub memory_budget_bytes: Option<u64>,
+    pub compression: Option<String>,
+    pub zstd_level: Option<i32>,
+    pub bandwidth: Option<BandwidthFileConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct BandwidthFileConfig {
+    pub upload_limit_mibps: Option<u64>,
+    pub download_limit_mibps: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MountConfig {
     pub mount_point: PathBuf,
@@ -235,6 +264,7 @@ pub struct MountConfig {
     pub fuse_workers: usize,
     pub fuse_max_background: usize,
     pub privileged: bool,
+    pub cache: VfsCacheConfig,
 }
 
 impl MountConfig {
@@ -256,6 +286,8 @@ impl MountConfig {
         let etcd_cfg = meta_cfg.etcd.unwrap_or_default();
         let layout_cfg = file_cfg.layout.unwrap_or_default();
         let fuse_cfg = file_cfg.fuse.unwrap_or_default();
+        let cache_cfg = file_cfg.cache.unwrap_or_default();
+        let cache = cache_cfg.into_cache_config()?;
 
         let mount_point = args.mount_point.or(file_cfg.mount_point).ok_or_else(|| {
             anyhow::anyhow!("mount point is required (positional arg or config.mount_point)")
@@ -324,7 +356,70 @@ impl MountConfig {
                 .or(fuse_cfg.max_background)
                 .unwrap_or(DEFAULT_FUSE_MAX_BACKGROUND),
             privileged: args.privileged || fuse_cfg.privileged.unwrap_or(false),
+            cache,
         })
+    }
+}
+
+impl CacheFileConfig {
+    fn into_cache_config(self) -> anyhow::Result<VfsCacheConfig> {
+        let mut cache = VfsCacheConfig::default();
+
+        if let Some(cache_root) = self.cache_root {
+            cache.cache_root = cache_root;
+        }
+        if let Some(read_memory_bytes) = self.read_memory_bytes {
+            cache.read_memory_bytes = read_memory_bytes;
+        }
+        if let Some(read_ssd_bytes) = self.read_ssd_bytes {
+            cache.read_ssd_bytes = read_ssd_bytes;
+        }
+        if let Some(write_memory_bytes) = self.write_memory_bytes {
+            cache.write_memory_bytes = write_memory_bytes;
+        }
+        if let Some(write_ssd_bytes) = self.write_ssd_bytes {
+            cache.write_ssd_bytes = write_ssd_bytes;
+        }
+        if let Some(dirty_slice_target_size) = self.dirty_slice_target_size {
+            cache.dirty_slice_target_size = dirty_slice_target_size;
+        }
+        if let Some(dirty_slice_max_age_ms) = self.dirty_slice_max_age_ms {
+            cache.dirty_slice_max_age_ms = dirty_slice_max_age_ms;
+        }
+        if let Some(prefetch_enabled) = self.prefetch_enabled {
+            cache.prefetch_enabled = prefetch_enabled;
+        }
+        if let Some(prefetch_max_bytes) = self.prefetch_max_bytes {
+            cache.prefetch_max_bytes = prefetch_max_bytes;
+        }
+        if let Some(prefetch_concurrency) = self.prefetch_concurrency {
+            cache.prefetch_concurrency = prefetch_concurrency;
+        }
+        if let Some(memory_budget_bytes) = self.memory_budget_bytes {
+            cache.memory_budget_bytes = memory_budget_bytes;
+        }
+        if let Some(compression) = self.compression {
+            cache.compression = parse_compression(&compression, self.zstd_level)?;
+        }
+        if let Some(bandwidth) = self.bandwidth {
+            cache.bandwidth = BandwidthConfig {
+                upload_limit_mibps: bandwidth.upload_limit_mibps,
+                download_limit_mibps: bandwidth.download_limit_mibps,
+            };
+        }
+
+        Ok(cache)
+    }
+}
+
+fn parse_compression(value: &str, zstd_level: Option<i32>) -> anyhow::Result<Compression> {
+    match value.to_ascii_lowercase().as_str() {
+        "none" | "off" | "disable" | "disabled" => Ok(Compression::None),
+        "lz4" => Ok(Compression::Lz4),
+        "zstd" | "zstd-default" => Ok(Compression::Zstd(zstd_level.unwrap_or(3))),
+        other => {
+            anyhow::bail!("unsupported cache.compression '{other}' (expected none, lz4, or zstd)")
+        }
     }
 }
 
@@ -332,6 +427,30 @@ impl MountConfig {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    fn empty_mount_args(config: Option<PathBuf>, mount_point: Option<PathBuf>) -> MountArgs {
+        MountArgs {
+            config,
+            mount_point,
+            data_backend: None,
+            data_dir: None,
+            s3_bucket: None,
+            s3_endpoint: None,
+            s3_region: None,
+            s3_part_size: None,
+            s3_max_concurrency: None,
+            s3_force_path_style: None,
+            s3_disable_payload_checksum: None,
+            meta_backend: None,
+            meta_url: None,
+            meta_etcd_urls: None,
+            chunk_size: None,
+            block_size: None,
+            fuse_workers: None,
+            fuse_max_background: None,
+            privileged: false,
+        }
+    }
 
     #[test]
     fn info_subcommand_parses_mount_point() {
@@ -424,5 +543,61 @@ mod tests {
 
         assert_eq!(config.s3_max_concurrency, DEFAULT_S3_MAX_CONCURRENCY);
         assert_eq!(config.s3_max_concurrency, 32);
+    }
+
+    #[test]
+    fn mount_config_parses_cache_section() {
+        let path = std::env::temp_dir().join(format!(
+            "slayerfs-cache-config-{}-{}.yaml",
+            std::process::id(),
+            "parse"
+        ));
+        std::fs::write(
+            &path,
+            r#"
+mount_point: /mnt/slayer
+cache:
+  root: /tmp/slayer-cache
+  read_memory_bytes: 1048576
+  read_ssd_bytes: 2097152
+  write_memory_bytes: 3145728
+  write_ssd_bytes: 4194304
+  dirty_slice_target_size: 524288
+  dirty_slice_max_age_ms: 250
+  prefetch_enabled: false
+  prefetch_max_bytes: 8388608
+  prefetch_concurrency: 7
+  memory_budget_bytes: 9437184
+  compression: zstd
+  zstd_level: 5
+  bandwidth:
+    upload_limit_mibps: 10
+    download_limit_mibps: 20
+"#,
+        )
+        .unwrap();
+
+        let config = MountConfig::from_sources(empty_mount_args(Some(path.clone()), None)).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(config.cache.cache_root, PathBuf::from("/tmp/slayer-cache"));
+        assert_eq!(config.cache.read_memory_bytes, 1048576);
+        assert_eq!(config.cache.read_ssd_bytes, 2097152);
+        assert_eq!(config.cache.write_memory_bytes, 3145728);
+        assert_eq!(config.cache.write_ssd_bytes, 4194304);
+        assert_eq!(config.cache.dirty_slice_target_size, 524288);
+        assert_eq!(config.cache.dirty_slice_max_age_ms, 250);
+        assert!(!config.cache.prefetch_enabled);
+        assert_eq!(config.cache.prefetch_max_bytes, 8388608);
+        assert_eq!(config.cache.prefetch_concurrency, 7);
+        assert_eq!(config.cache.memory_budget_bytes, 9437184);
+        assert_eq!(config.cache.compression, Compression::Zstd(5));
+        assert_eq!(config.cache.bandwidth.upload_limit_mibps, Some(10));
+        assert_eq!(config.cache.bandwidth.download_limit_mibps, Some(20));
+    }
+
+    #[test]
+    fn parse_compression_rejects_unknown_values() {
+        assert!(parse_compression("gzip", None).is_err());
     }
 }

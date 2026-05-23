@@ -2547,6 +2547,7 @@ impl MetaStore for EtcdMetaStore {
 
         EtcdTxn::new(&self.client)
             .max_retries(10)
+            .lock_key(key.clone())
             .run(|tx| {
                 let key = key.clone();
 
@@ -2576,6 +2577,7 @@ impl MetaStore for EtcdMetaStore {
 
         EtcdTxn::new(&self.client)
             .max_retries(10)
+            .lock_key(slice_key.clone())
             .run(|tx| {
                 let slice_key = slice_key.clone();
                 let inode_key = inode_key.clone();
@@ -2956,6 +2958,7 @@ impl MetaStore for EtcdMetaStore {
 
         EtcdTxn::new(&self.client)
             .max_retries(10)
+            .lock_key(slice_key.clone())
             .run(|tx| {
                 let slice_key = slice_key.clone();
                 let new_slices = new_slices.to_vec();
@@ -3011,6 +3014,7 @@ impl MetaStore for EtcdMetaStore {
 
         EtcdTxn::new(&self.client)
             .max_retries(10)
+            .lock_key(slice_key.clone())
             .run(|tx| {
                 let slice_key = slice_key.clone();
                 let new_slices = new_slices.to_vec();

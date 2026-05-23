@@ -1,10 +1,16 @@
 use crate::meta::store::MetaError;
 use etcd_client::{Client as EtcdClient, Compare, CompareOp, PutOptions, Txn, TxnOp};
+use rand::{RngCore, rng};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
+
+const ETCD_TXN_LOCK_STRIPES: usize = 1024;
+
+static ETCD_TXN_LOCKS: OnceLock<Vec<tokio::sync::Mutex<()>>> = OnceLock::new();
 
 enum EtcdTxnWriteOp {
     Put {
@@ -298,6 +304,7 @@ impl<'a> EtcdTxnCtx<'a> {
 pub(crate) struct EtcdTxn<'a> {
     client: &'a EtcdClient,
     max_retries: u64,
+    lock_key: Option<String>,
 }
 
 impl<'a> EtcdTxn<'a> {
@@ -305,6 +312,7 @@ impl<'a> EtcdTxn<'a> {
         Self {
             client,
             max_retries: 10,
+            lock_key: None,
         }
     }
 
@@ -313,12 +321,67 @@ impl<'a> EtcdTxn<'a> {
         self
     }
 
+    /// Serializes this process's transactions that share the same primary key.
+    ///
+    /// This mirrors JuiceFS's local txlock phase: it does not provide distributed
+    /// exclusion, but it prevents same-process writers from stampeding into CAS
+    /// failures for the same metadata key.
+    pub(crate) fn lock_key(mut self, key: impl Into<String>) -> Self {
+        self.lock_key = Some(key.into());
+        self
+    }
+
+    fn local_locks() -> &'static [tokio::sync::Mutex<()>] {
+        ETCD_TXN_LOCKS.get_or_init(|| {
+            (0..ETCD_TXN_LOCK_STRIPES)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect()
+        })
+    }
+
+    pub(crate) fn local_lock_slot_for_key(key: &str) -> usize {
+        let mut hash = 2166136261u32;
+        for byte in key.as_bytes() {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(16777619);
+        }
+        hash as usize % ETCD_TXN_LOCK_STRIPES
+    }
+
+    fn local_lock_for_key(key: &str) -> &'static tokio::sync::Mutex<()> {
+        &Self::local_locks()[Self::local_lock_slot_for_key(key)]
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn with_local_lock_for_key<Fut>(key: &str, fut: Fut) -> Fut::Output
+    where
+        Fut: Future,
+    {
+        let _guard = Self::local_lock_for_key(key).lock().await;
+        fut.await
+    }
+
     /// Executes the transaction closure with automatic retry on CAS conflicts.
     ///
     /// The closure must be self-contained and retry-safe: it may run multiple times,
     /// so avoid irreversible side effects inside it. Only etcd reads via `tx` and
     /// in-memory staging should happen in the closure body.
     pub(crate) async fn run<R, F>(&self, mut task: F) -> Result<R, MetaError>
+    where
+        F: for<'task> FnMut(
+            &'task mut EtcdTxnCtx<'a>,
+        )
+            -> Pin<Box<dyn Future<Output = Result<R, MetaError>> + Send + 'task>>,
+    {
+        if let Some(lock_key) = &self.lock_key {
+            let _guard = Self::local_lock_for_key(lock_key).lock().await;
+            self.run_inner(&mut task).await
+        } else {
+            self.run_inner(&mut task).await
+        }
+    }
+
+    async fn run_inner<R, F>(&self, task: &mut F) -> Result<R, MetaError>
     where
         F: for<'task> FnMut(
             &'task mut EtcdTxnCtx<'a>,
@@ -334,7 +397,8 @@ impl<'a> EtcdTxn<'a> {
             }
 
             if attempt + 1 < self.max_retries {
-                let backoff_ms = 20 + (1 << attempt.min(16));
+                let jitter_bound = (attempt + 1).saturating_mul(attempt + 1).max(1);
+                let backoff_ms = 20 + (rng().next_u64() % jitter_bound);
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
             }
         }
@@ -345,8 +409,12 @@ impl<'a> EtcdTxn<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::EtcdTxn;
     use crate::meta::entities::EntryType;
     use crate::meta::entities::etcd::EtcdForwardEntry;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::{Duration, sleep};
 
     #[test]
     fn typed_json_helpers_roundtrip() {
@@ -362,5 +430,40 @@ mod tests {
         let decoded: EtcdForwardEntry = serde_json::from_slice(&encoded).expect("decode");
 
         assert_eq!(decoded.inode, 2);
+    }
+
+    #[test]
+    fn local_lock_slot_is_stable_for_same_key() {
+        assert_eq!(
+            EtcdTxn::local_lock_slot_for_key("slices/42"),
+            EtcdTxn::local_lock_slot_for_key("slices/42")
+        );
+    }
+
+    #[tokio::test]
+    async fn local_lock_serializes_same_primary_key() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+
+        for _ in 0..8 {
+            let in_flight = in_flight.clone();
+            let max_seen = max_seen.clone();
+            tasks.push(tokio::spawn(async move {
+                EtcdTxn::with_local_lock_for_key("slices/serialized", async move {
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(current, Ordering::SeqCst);
+                    sleep(Duration::from_millis(5)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await;
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(max_seen.load(Ordering::SeqCst), 1);
     }
 }
