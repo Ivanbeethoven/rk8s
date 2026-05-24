@@ -315,18 +315,52 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
         format!("chunks/{chunk_id}/{block_index}")
     }
 
-    fn populate_write_cache_background(&self, key: String, data: Vec<u8>) {
-        // Populate memory hot cache immediately. Persist to disk if a write
-        // permit is available — with 32 permits this covers most workloads.
-        // Skipping under extreme I/O pressure avoids queuing hundreds of
-        // background tasks that compete with foreground uploads.
+    async fn populate_write_cache_after_upload(&self, key: String, data: Vec<u8>) {
+        // Make freshly uploaded data immediately visible in the hottest read
+        // tier before returning to the caller. Disk persistence stays best-
+        // effort so foreground uploads are not blocked by local cache I/O.
+        self.block_cache.insert_hot(&key, data.clone()).await;
+
+        // Persist to disk if a write permit is available. Skipping under
+        // extreme I/O pressure avoids queuing hundreds of background tasks
+        // that compete with foreground uploads.
         let cache = self.block_cache.clone();
-        tokio::spawn(async move {
-            cache.insert_hot(&key, data.clone()).await;
-            if let Some(permit) = cache.try_disk_store_permit(&key) {
+        if let Some(permit) = cache.try_disk_store_permit(&key) {
+            tokio::spawn(async move {
                 let _ = cache.store_to_disk_with_permit(&key, data, permit).await;
-            }
-        });
+            });
+        }
+    }
+
+    async fn populate_page_cache_from_block(&self, key: BlockKey, block_data: &[u8]) {
+        let page_size = self.page_cache.page_size();
+        for (page_idx, page) in block_data.chunks(page_size).enumerate() {
+            self.page_cache
+                .insert(
+                    (key.0, key.1, page_idx as u32),
+                    Bytes::copy_from_slice(page),
+                )
+                .await;
+        }
+    }
+
+    async fn try_promote_page_cache_to_block_cache(&self, key: BlockKey) -> bool {
+        let page_size = self.page_cache.page_size();
+        let page_count = self.config.block_size.div_ceil(page_size);
+        let mut block = Vec::with_capacity(self.config.block_size);
+
+        for page_idx in 0..page_count {
+            let Some(page) = self.page_cache.get(&(key.0, key.1, page_idx as u32)).await else {
+                return false;
+            };
+            block.extend_from_slice(page.as_ref());
+        }
+        block.truncate(self.config.block_size);
+
+        self.block_cache
+            .insert_opportunistic(Self::key_for(key), block)
+            .await;
+        true
     }
 
     fn prefetch_full_block_background(&self, key: BlockKey, key_str: String) {
@@ -422,10 +456,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             .await
             .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
 
-        // Populate memory cache off the foreground upload path. Persistent
-        // disk cache is filled opportunistically by read misses to avoid
-        // write-heavy workloads spilling large backlogs into the next phase.
-        self.populate_write_cache_background(key_str, full_block);
+        self.populate_write_cache_after_upload(key_str, full_block)
+            .await;
 
         Ok(total_len as u64)
     }
@@ -464,10 +496,8 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             .await
             .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
 
-        // Populate memory cache off the foreground upload path. Persistent
-        // disk cache is filled opportunistically by read misses to avoid
-        // write-heavy workloads spilling large backlogs into the next phase.
-        self.populate_write_cache_background(key_str, full_block);
+        self.populate_write_cache_after_upload(key_str, full_block)
+            .await;
 
         Ok(data.len() as u64)
     }
@@ -486,6 +516,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         // Try cache first — blocks are immutable once committed, so a cache
         // hit is always valid regardless of read size or offset.
         if let Some(cached) = self.block_cache.get(&key_str).await {
+            tracing::info!(key = %key_str, len = cached.len(), "block_cache HIT");
             tracing::Span::current().record("strategy", "cache_hit");
             let offset_usize = offset as usize;
             let end = (offset_usize + len).min(cached.len());
@@ -598,7 +629,9 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
 
             tracing::Span::current().record("read_len", total_read);
             if range_missed && total_read > 0 {
-                self.prefetch_full_block_background(key, key_str);
+                if !self.try_promote_page_cache_to_block_cache(key).await {
+                    self.prefetch_full_block_background(key, key_str);
+                }
             }
             return Ok(());
         }
@@ -644,6 +677,11 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             buf[..copy_len].copy_from_slice(&block_data.as_ref()[offset_usize..copy_end]);
         }
         tracing::Span::current().record("read_len", copy_len);
+
+        if !matches!(compression, Compression::None) {
+            self.populate_page_cache_from_block(key, block_data.as_ref())
+                .await;
+        }
 
         // Populate caches after serving the read — the hot cache insert is
         // fast (in-memory) so we await it to ensure subsequent reads hit.
@@ -853,9 +891,18 @@ mod tests {
             compression: Compression::None,
             ..Default::default()
         };
+        let cache_dir = tempfile::tempdir()?;
         let store = Arc::new(
-            ObjectBlockStore::new_with_configs_async(client, ChunksCacheConfig::default(), config)
-                .await?,
+            ObjectBlockStore::new_with_configs_async(
+                client,
+                ChunksCacheConfig::with_budgets(
+                    16 * 1024 * 1024,
+                    16 * 1024 * 1024,
+                    cache_dir.path().to_path_buf(),
+                ),
+                config,
+            )
+            .await?,
         );
 
         backend.reset_stats();
@@ -1046,6 +1093,171 @@ mod tests {
         assert_eq!(out, vec![0u8; 512 * 1024]);
         assert_eq!(*backend.get_object_calls.lock().unwrap(), 1);
         assert_eq!(*backend.get_object_range_calls.lock().unwrap(), 0);
+        assert!(
+            store.page_cache.get(&(7, 0, 32)).await.is_some(),
+            "decompressed full-block reads should populate page_cache for future range reads"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_write_fresh_range_populates_hot_cache_before_return()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::cadapter::client::{ObjectBackend, ObjectClient};
+        use async_trait::async_trait;
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+        };
+
+        #[derive(Clone, Default)]
+        struct MockBackend {
+            data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        }
+
+        #[async_trait]
+        impl ObjectBackend for MockBackend {
+            async fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+                self.data
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), data.to_vec());
+                Ok(())
+            }
+
+            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(self.data.lock().unwrap().get(key).cloned())
+            }
+
+            async fn get_object_range(
+                &self,
+                key: &str,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                if let Some(data) = self.data.lock().unwrap().get(key) {
+                    let offset = offset as usize;
+                    let end = (offset + buf.len()).min(data.len());
+                    if offset < data.len() {
+                        let copy_len = end - offset;
+                        buf[..copy_len].copy_from_slice(&data[offset..end]);
+                        return Ok(copy_len);
+                    }
+                }
+                Ok(0)
+            }
+
+            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
+                Ok("test_etag".to_string())
+            }
+
+            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+                self.data.lock().unwrap().remove(key);
+                Ok(())
+            }
+        }
+
+        let cache_dir = tempfile::tempdir()?;
+        let store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(MockBackend::default()),
+            ChunksCacheConfig::with_budgets(
+                16 * 1024 * 1024,
+                16 * 1024 * 1024,
+                cache_dir.path().to_path_buf(),
+            ),
+            BlockStoreConfig {
+                block_size: 4 * 1024 * 1024,
+                compression: Compression::None,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let data = vec![3u8; 128 * 1024];
+        store.write_fresh_range((123, 0), 0, &data).await?;
+
+        assert_eq!(
+            store.block_cache.stats().hot_entries,
+            1,
+            "write_fresh_range should synchronously populate hot cache before returning"
+        );
+        assert_eq!(
+            store.block_cache.get(&"chunks/123/0".to_string()).await,
+            Some(data)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_complete_page_cache_promotes_to_block_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::cadapter::client::{ObjectBackend, ObjectClient};
+        use async_trait::async_trait;
+
+        #[derive(Clone, Default)]
+        struct MockBackend;
+
+        #[async_trait]
+        impl ObjectBackend for MockBackend {
+            async fn put_object(&self, _key: &str, _data: &[u8]) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn get_object(&self, _key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+
+            async fn get_object_range(
+                &self,
+                _key: &str,
+                _offset: u64,
+                _buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                Ok(0)
+            }
+
+            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
+                Ok("test_etag".to_string())
+            }
+
+            async fn delete_object(&self, _key: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let cache_dir = tempfile::tempdir()?;
+        let store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(MockBackend),
+            ChunksCacheConfig::with_budgets(
+                16 * 1024 * 1024,
+                16 * 1024 * 1024,
+                cache_dir.path().to_path_buf(),
+            ),
+            BlockStoreConfig {
+                block_size: 128 * 1024,
+                page_size: 64 * 1024,
+                compression: Compression::None,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let first = Bytes::from(vec![1u8; 64 * 1024]);
+        let second = Bytes::from(vec![2u8; 64 * 1024]);
+        store.page_cache.insert((200, 0, 0), first).await;
+        store.page_cache.insert((200, 0, 1), second).await;
+
+        assert!(store.try_promote_page_cache_to_block_cache((200, 0)).await);
+
+        let cached = store
+            .block_cache
+            .get(&"chunks/200/0".to_string())
+            .await
+            .expect("complete page cache should promote to full block cache");
+        assert_eq!(cached[..64 * 1024], vec![1u8; 64 * 1024]);
+        assert_eq!(cached[64 * 1024..], vec![2u8; 64 * 1024]);
 
         Ok(())
     }

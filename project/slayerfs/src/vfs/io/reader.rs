@@ -1,39 +1,53 @@
 // Read pipeline (high-level):
 // - FileReader::read_at splits a file read into chunk spans and prepares slices.
-// - prepare_slices ensures SliceState records exist for target ranges and kicks off
-//   background_fetch to pull data from object storage.
-// - read_from_slice waits until the slice is Ready (or Invalid) and copies data into
-//   the caller buffer. Overlapping slices obey "latest slice wins" ordering.
-// - Writer commit will call DataReader::invalidate(...) to mark cached slices stale.
+// - prepare_slices ensures SliceState records exist for target ranges; ahead/tail
+//   prefetch uses background_fetch to warm the unified chunk cache.
+// - read_chunk_span reads through BlockStore/DataFetcher so all data is served by
+//   the unified cache layer; SliceState is only updated as metadata.
+// - Writer commit calls DataReader::invalidate(...) to mark slice metadata stale.
 
 use crate::chunk::reader::DataFetcher;
 use crate::chunk::{BlockStore, ChunkLayout};
 use crate::meta::MetaLayer;
-use crate::utils::{Intervals, NumCastExt, UsageGuard};
+use crate::utils::{Intervals, NumCastExt};
 use crate::vfs::Inode;
 use crate::vfs::backend::Backend;
 use crate::vfs::chunk_id_for;
 use crate::vfs::config::ReadConfig;
 use crate::vfs::io::split_chunk_spans;
-use crate::vfs::memory::{MemoryBudget, MemoryConsumer, MemoryUsageGuard, PressureLevel};
+use crate::vfs::memory::{MemoryBudget, PressureLevel};
 use dashmap::{DashMap, Entry};
 use parking_lot::Mutex as ParkingMutex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
 use tracing::Instrument;
 
-const MAX_WAIT: Duration = Duration::from_secs(30);
 const DEFAULT_TOTAL_AHEAD_LIMIT: u64 = 256 * 1024 * 1024;
 const READ_SESSIONS: usize = 2;
+const MAX_SLICE_READ_RETRIES: u32 = 5;
+
+fn is_transient_read_error(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:?}").to_lowercase();
+    msg.contains("timeout")
+        || msg.contains("connection reset")
+        || msg.contains("connection refused")
+        || msg.contains("temporary failure")
+        || msg.contains("eagain")
+        || msg.contains("broken pipe")
+        || msg.contains("request canceled")
+}
+
+fn retry_delay(attempt: u32) -> Duration {
+    let attempt = attempt.saturating_add(1);
+    Duration::from_millis(u64::from((attempt * attempt * 10).min(1000)))
+}
 
 #[allow(clippy::type_complexity)]
 pub(crate) struct DataReader<B, M> {
     config: Arc<ReadConfig>,
-    buffer_usage: Arc<AtomicU64>,
     /// Per-handle readers, grouped by inode
     files: DashMap<u64, Vec<(u64, Arc<FileReader<B, M>>)>>, // ino -> (fh, reader)
     backend: Arc<Backend<B, M>>,
@@ -49,7 +63,6 @@ where
     pub(crate) fn new(config: Arc<ReadConfig>, backend: Arc<Backend<B, M>>) -> Self {
         Self {
             config,
-            buffer_usage: Arc::new(AtomicU64::new(0)),
             files: DashMap::new(),
             backend,
             prefetcher: None,
@@ -74,7 +87,6 @@ where
         let ino_number = ino.ino();
         let reader = Arc::new(FileReader::new(
             self.config.clone(),
-            self.buffer_usage.clone(),
             ino,
             self.backend.clone(),
             self.memory_budget.clone(),
@@ -302,14 +314,17 @@ enum SliceStatus {
     Refresh,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SliceFetchMode {
+    Demand,
+    Background,
+}
+
 struct SliceState {
     /// Chunk index it belongs to
     index: u64,
     /// Range it contains
     range: (u64, u64),
-    page: Vec<u8>,
-    usage: UsageGuard,
-    memory_usage: Option<MemoryUsageGuard>,
     state: SliceStatus,
     err: Option<String>,
     notify: Arc<Notify>,
@@ -326,20 +341,10 @@ struct SliceState {
 }
 
 impl SliceState {
-    fn new(
-        index: u64,
-        range: (u64, u64),
-        refs: u16,
-        usage: Arc<AtomicU64>,
-        memory_budget: Option<MemoryBudget>,
-    ) -> Self {
+    fn new(index: u64, range: (u64, u64), refs: u16) -> Self {
         Self {
             index,
             range,
-            page: Vec::new(),
-            usage: UsageGuard::new(usage),
-            memory_usage: memory_budget
-                .map(|budget| MemoryUsageGuard::new(budget, MemoryConsumer::Reader)),
             state: SliceStatus::New,
             err: None,
             notify: Arc::new(Notify::new()),
@@ -348,13 +353,6 @@ impl SliceState {
             queue_delay_ms: None,
             fetch_ms: None,
             last_access: Instant::now(),
-        }
-    }
-
-    fn update_usage(&mut self, bytes: u64) {
-        self.usage.update_bytes(bytes);
-        if let Some(memory_usage) = &mut self.memory_usage {
-            memory_usage.update_bytes(bytes);
         }
     }
 
@@ -424,7 +422,23 @@ impl SliceState {
                 Ok::<_, anyhow::Error>(out)
             };
 
-            let result = f().await;
+            let mut result = f().await;
+            for attempt in 0..MAX_SLICE_READ_RETRIES.saturating_sub(1) {
+                let should_retry = match &result {
+                    Ok(_) => false,
+                    Err(err) => is_transient_read_error(err),
+                };
+                if !should_retry {
+                    break;
+                }
+
+                let _ = backend
+                    .meta()
+                    .invalidate_chunk_slices(ino as i64, index)
+                    .await;
+                tokio::time::sleep(retry_delay(attempt)).await;
+                result = f().await;
+            }
             let fetch_ms = start_at.elapsed().as_millis() as u64;
             let mut guard = this.lock();
 
@@ -435,17 +449,12 @@ impl SliceState {
 
             guard.fetch_ms = Some(fetch_ms);
             match result {
-                Ok(out) => {
+                Ok(_) => {
                     guard.state = SliceStatus::Ready;
-                    guard.page = out;
-                    let new_len = guard.page.len() as u64;
-                    guard.update_usage(new_len);
                     guard.err = None;
                 }
                 Err(e) => {
                     guard.state = SliceStatus::Invalid;
-                    guard.page = Vec::new();
-                    guard.update_usage(0);
                     guard.err = Some(e.to_string());
                 }
             }
@@ -479,7 +488,6 @@ impl Drop for SlicePinGuard {
 
 pub(crate) struct FileReader<B, M> {
     config: Arc<ReadConfig>,
-    buffer_usage: Arc<AtomicU64>,
     inode: Arc<Inode>,
     slices: Mutex<VecDeque<Arc<ParkingMutex<SliceState>>>>,
     sessions: ParkingMutex<[Session; READ_SESSIONS]>,
@@ -494,7 +502,6 @@ where
 {
     pub(crate) fn new(
         config: Arc<ReadConfig>,
-        buffer_usage: Arc<AtomicU64>,
         inode: Arc<Inode>,
         backend: Arc<Backend<B, M>>,
         memory_budget: Option<MemoryBudget>,
@@ -502,7 +509,6 @@ where
         Self {
             config,
             inode,
-            buffer_usage,
             slices: Mutex::new(VecDeque::new()),
             sessions: ParkingMutex::new([Session::default(); READ_SESSIONS]),
             backend,
@@ -607,15 +613,11 @@ where
             self.config.layout.block_size as u64,
             self.max_ahead(),
             self.total_ahead_limit(),
-            self.buffer_usage(),
+            0,
             offset,
             len as u64,
         );
         session[selected].ahead
-    }
-
-    fn buffer_usage(&self) -> u64 {
-        self.buffer_usage.load(Ordering::Relaxed)
     }
 
     fn total_ahead_limit(&self) -> u64 {
@@ -719,36 +721,6 @@ where
     }
 
     async fn back_pressure(&self) -> anyhow::Result<()> {
-        tracing::trace!(
-            "Memory usage: {}MiB",
-            self.buffer_usage.load(Ordering::Relaxed) / 1024 / 1024
-        );
-
-        let mut total_wait = Duration::ZERO;
-        let hard_limit = self.config.buffer_size * 2;
-        // buffer size limit is just a soft limit. It is perfectly normal to see that the current memory usage exceed it.
-        if self.buffer_usage.load(Ordering::Relaxed) > self.config.buffer_size {
-            // Yield instead of sleeping a fixed 10ms: this allows other tasks
-            // (upload, eviction) to make progress without unnecessarily throttling
-            // hot-path reads that happen to briefly exceed the soft limit.
-            tokio::task::yield_now().await;
-
-            // `2 * buffer size limit` is a hard limit. A read operation idle until memory pressure is relieved.
-            while self.buffer_usage.load(Ordering::Relaxed) > hard_limit {
-                if total_wait >= MAX_WAIT {
-                    return Err(anyhow::anyhow!(
-                        "Timeout waiting for buffer space after {:?}. Current usage: {} bytes, limit: {} bytes",
-                        total_wait,
-                        self.buffer_usage.load(Ordering::Relaxed),
-                        hard_limit,
-                    ));
-                }
-
-                tracing::warn!("Reach buffer size hard limit: sleep for 100 millis");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                total_wait += Duration::from_millis(100);
-            }
-        }
         if let Some(budget) = &self.memory_budget {
             let level = budget.pressure_level();
             if level >= PressureLevel::High {
@@ -772,11 +744,62 @@ where
         let aligned = (offset + ahead).next_multiple_of(self.config.layout.block_size as u64);
 
         let spans = split_chunk_spans(self.config.layout, offset, (aligned - offset).as_usize());
+        let block_size = self.config.layout.block_size as u64;
         for span in spans.iter().copied() {
-            guards.push(
-                self.prepare_slices(span.index, (span.offset, span.offset + span.len))
-                    .await,
-            );
+            let mut start = span.offset;
+            let end = span.offset + span.len;
+            while start < end {
+                let next_block = ((start / block_size) + 1) * block_size;
+                let stop = end.min(next_block);
+                guards.push(
+                    self.prepare_slices(span.index, (start, stop), SliceFetchMode::Background)
+                        .await,
+                );
+                start = stop;
+            }
+        }
+    }
+
+    async fn prepare_tail_slices(&self, offset: u64, len: usize, guards: &mut Vec<SlicePinGuard>) {
+        if self
+            .memory_budget
+            .as_ref()
+            .is_some_and(|budget| budget.pressure_level() >= PressureLevel::Critical)
+        {
+            return;
+        }
+
+        let file_size = self.inode.file_size();
+        if file_size == 0 {
+            return;
+        }
+
+        let read_end = offset.saturating_add(len as u64);
+        let tail_threshold = file_size.saturating_sub(32 * 1024);
+        if read_end < tail_threshold {
+            return;
+        }
+
+        let block_size = self.config.layout.block_size as u64;
+        let tail_start = tail_threshold / block_size * block_size;
+        let tail_len = file_size.saturating_sub(tail_start);
+        if tail_len == 0 {
+            return;
+        }
+
+        let spans = split_chunk_spans(self.config.layout, tail_start, tail_len.as_usize());
+        for span in spans.iter().copied() {
+            let mut start = span.offset;
+            let end = span.offset + span.len;
+            while start < end {
+                let next_block = ((start / block_size) + 1) * block_size;
+                let stop = end.min(next_block);
+                guards.push(
+                    self.prepare_slices(span.index, (start, stop), SliceFetchMode::Background)
+                        .await,
+                );
+                start = stop;
+            }
         }
     }
 
@@ -812,16 +835,21 @@ where
 
         let mut pin_guard = Vec::new();
         for span in spans.iter().copied() {
-            // `prepare_slices` don't wait for all data is ready.
+            // Demand reads fill data through a single DataFetcher below; the
+            // slice records here are metadata reservations, not data owners.
             pin_guard.push(
-                self.prepare_slices(span.index, (span.offset, span.offset + span.len))
-                    .instrument(tracing::trace_span!(
-                        "read_at.prepare_slice",
-                        index = span.index,
-                        offset = span.offset,
-                        len = span.len
-                    ))
-                    .await,
+                self.prepare_slices(
+                    span.index,
+                    (span.offset, span.offset + span.len),
+                    SliceFetchMode::Demand,
+                )
+                .instrument(tracing::trace_span!(
+                    "read_at.prepare_slice",
+                    index = span.index,
+                    offset = span.offset,
+                    len = span.len
+                ))
+                .await,
             );
         }
 
@@ -838,13 +866,21 @@ where
         .in_scope(|| self.prepare_ahead_slices(ahead_start, ahead, &mut pin_guard))
         .await;
 
+        self.prepare_tail_slices(offset, actual_len, &mut pin_guard)
+            .instrument(tracing::trace_span!(
+                "FileReader.read_at.prepare_tail_slices",
+                offset,
+                len = actual_len
+            ))
+            .await;
+
         let mut tail = buf;
         let result = async {
             for span in spans {
                 let span_len = span.len.as_usize();
                 let (seg, rest) = tail.split_at_mut(span_len);
                 tail = rest;
-                self.read_from_slice(span.index, span.offset, seg).await?;
+                self.read_chunk_span(span.index, span.offset, seg).await?;
             }
             Ok::<_, anyhow::Error>(actual_len)
         }
@@ -860,128 +896,108 @@ where
         result
     }
 
-    #[tracing::instrument(
-        level = "trace",
-        skip(slice),
-        fields(
-            total_wait_ms = tracing::field::Empty,
-            waits = tracing::field::Empty,
-            queue_ms = tracing::field::Empty,
-            fetch_ms = tracing::field::Empty
-        )
-    )]
-    async fn wait_ready(slice: &Arc<ParkingMutex<SliceState>>) -> anyhow::Result<()> {
-        let mut total_wait = Duration::ZERO;
-        let mut waits: u64 = 0;
-        loop {
-            let notify = {
-                let guard = slice.lock();
-
-                match guard.state {
-                    SliceStatus::Ready => {
-                        if let Some(queue_ms) = guard.queue_delay_ms {
-                            tracing::Span::current().record("queue_ms", queue_ms);
-                        }
-                        if let Some(fetch_ms) = guard.fetch_ms {
-                            tracing::Span::current().record("fetch_ms", fetch_ms);
-                        }
-                        tracing::Span::current()
-                            .record("total_wait_ms", total_wait.as_millis() as u64);
-                        tracing::Span::current().record("waits", waits);
-                        return Ok(());
-                    }
-                    SliceStatus::Invalid => {
-                        let err = guard.err.as_deref().unwrap_or("slice invalid");
-                        if let Some(queue_ms) = guard.queue_delay_ms {
-                            tracing::Span::current().record("queue_ms", queue_ms);
-                        }
-                        if let Some(fetch_ms) = guard.fetch_ms {
-                            tracing::Span::current().record("fetch_ms", fetch_ms);
-                        }
-                        tracing::Span::current()
-                            .record("total_wait_ms", total_wait.as_millis() as u64);
-                        tracing::Span::current().record("waits", waits);
-                        return Err(anyhow::anyhow!("Slice fetch failed: {err}"));
-                    }
-                    _ => guard.notify.clone(),
-                }
-            };
-            let start = Instant::now();
-            notify
-                .notified()
-                .instrument(tracing::trace_span!("wait_ready.wait"))
-                .await;
-            total_wait += start.elapsed();
-            waits = waits.saturating_add(1);
-            tracing::Span::current().record("total_wait_ms", total_wait.as_millis() as u64);
-            tracing::Span::current().record("waits", waits);
-        }
-    }
-
-    // Read from cached slices for a chunk. This waits for slice readiness and copies
-    // overlapping ranges into the provided buffer.
+    // Read one chunk span through a single DataFetcher. SliceState is updated
+    // only as metadata so later reads/readahead can reuse the prepared ranges.
     #[tracing::instrument(level = "trace", skip(self, buf), fields(index, offset, len = buf.len()))]
-    async fn read_from_slice(&self, index: u64, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
-        let slices = async {
-            let guard = self.slices.lock().await;
-            guard
-                .iter()
-                .filter(|s| s.lock().index == index)
-                .cloned()
-                .collect::<Vec<_>>()
-        }
-        .instrument(tracing::trace_span!(
-            "read_from_slice.collect_slices",
+    async fn read_chunk_span(&self, index: u64, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        let data = self.read_backend_range(index, offset, buf.len()).await;
+        self.complete_demand_slices(index, offset, buf.len(), data.as_ref().err())
+            .await;
+
+        let data = data?;
+        tracing::trace_span!(
+            "read_chunk_span.copy_out_backend",
             index,
             offset,
-            len = buf.len()
-        ))
-        .await;
-
-        for slice in slices {
-            // There locks the slice twice, but it is still worth it
-            // as the parking_lot::Mutex is lightweight.
-            let (dst_start, dst_end) = {
-                let guard = slice.lock();
-                (
-                    offset.max(guard.range.0),
-                    guard.range.1.min(offset + buf.len() as u64),
-                )
-            };
-
-            if dst_start >= dst_end {
-                continue;
-            }
-
-            Self::wait_ready(&slice).await?;
-
-            let mut guard = slice.lock();
-            guard.last_access = Instant::now();
-
-            let dst_local_start = dst_start - offset;
-            let dst_local_end = dst_end - offset;
-            let src_start = dst_start - guard.range.0;
-            let src_end = dst_end - guard.range.0;
-
-            tracing::trace_span!(
-                "read_from_slice.copy_out",
-                index,
-                dst_start,
-                dst_end,
-                src_start,
-                src_end,
-                bytes = (dst_end - dst_start)
-            )
-            .in_scope(|| {
-                buf[dst_local_start.as_usize()..dst_local_end.as_usize()]
-                    .copy_from_slice(&guard.page[src_start.as_usize()..src_end.as_usize()]);
-            });
-        }
+            bytes = buf.len()
+        )
+        .in_scope(|| {
+            buf.copy_from_slice(&data);
+        });
         Ok(())
     }
 
+    async fn complete_demand_slices(
+        &self,
+        index: u64,
+        offset: u64,
+        len: usize,
+        err: Option<&anyhow::Error>,
+    ) {
+        let end = offset.saturating_add(len as u64);
+        let slices = {
+            let guard = self.slices.lock().await;
+            guard
+                .iter()
+                .filter(|slice| {
+                    let state = slice.lock();
+                    state.index == index && state.range.0 < end && offset < state.range.1
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        for slice in slices {
+            let mut state = slice.lock();
+            state.last_access = Instant::now();
+            if let Some(err) = err {
+                state.state = SliceStatus::Invalid;
+                state.err = Some(err.to_string());
+            } else if !matches!(state.state, SliceStatus::Invalid) {
+                state.state = SliceStatus::Ready;
+                state.err = None;
+            }
+            state.notify.notify_waiters();
+        }
+    }
+
+    async fn read_backend_range(
+        &self,
+        index: u64,
+        offset: u64,
+        len: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        let chunk_id = chunk_id_for(self.inode.ino(), index)?;
+        let mut result = async {
+            let mut fetcher = DataFetcher::new(self.config.layout, chunk_id, &self.backend);
+            fetcher.prepare_slices().await?;
+            fetcher.read_at(offset.into(), len).await
+        }
+        .await;
+
+        for attempt in 0..MAX_SLICE_READ_RETRIES.saturating_sub(1) {
+            let should_retry = match &result {
+                Ok(_) => false,
+                Err(err) => is_transient_read_error(err),
+            };
+            if !should_retry {
+                break;
+            }
+
+            let _ = self
+                .backend
+                .meta()
+                .invalidate_chunk_slices(self.inode.ino(), index)
+                .await;
+            tokio::time::sleep(retry_delay(attempt)).await;
+            result = async {
+                let mut fetcher = DataFetcher::new(self.config.layout, chunk_id, &self.backend);
+                fetcher.prepare_slices().await?;
+                fetcher.read_at(offset.into(), len).await
+            }
+            .await;
+        }
+
+        result
+    }
+
     #[tracing::instrument(level = "trace", skip(self), fields(index, start, end))]
-    async fn prepare_slices(&self, index: u64, (start, end): (u64, u64)) -> SlicePinGuard {
+    async fn prepare_slices(
+        &self,
+        index: u64,
+        (start, end): (u64, u64),
+        mode: SliceFetchMode,
+    ) -> SlicePinGuard {
         let mut pinned = SlicePinGuard::new();
         let mut cutter = Intervals::new(start, end);
 
@@ -1009,20 +1025,17 @@ where
         }
 
         for range in cutter.collect() {
-            let slice = Arc::new(ParkingMutex::new(SliceState::new(
-                index,
-                range,
-                1,
-                self.buffer_usage.clone(),
-                self.memory_budget.clone(),
-            )));
+            let slice = Arc::new(ParkingMutex::new(SliceState::new(index, range, 1)));
 
-            SliceState::background_fetch(
-                slice.clone(),
-                self.inode.ino() as u64,
-                self.config.layout,
-                self.backend.clone(),
-            );
+            if mode == SliceFetchMode::Background {
+                // Spawn background fetch for readahead/tail prefetch only.
+                SliceState::background_fetch(
+                    slice.clone(),
+                    self.inode.ino() as u64,
+                    self.config.layout,
+                    self.backend.clone(),
+                );
+            }
             pinned.add(slice.clone());
             guard.push_back(slice);
         }
@@ -1101,8 +1114,6 @@ where
             let mut state = slice.lock();
             state.generation = state.generation.saturating_add(1);
             state.state = SliceStatus::Invalid;
-            state.page = Vec::new();
-            state.update_usage(0);
             state.notify.notify_waiters();
         }
     }
@@ -1120,7 +1131,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunk::store::InMemoryBlockStore;
+    use crate::chunk::store::{BlockKey, BlockStore, InMemoryBlockStore};
     use crate::chunk::writer::DataUploader;
     use crate::chunk::{ChunkLayout, SliceDesc};
     use crate::meta::MetaLayer;
@@ -1131,8 +1142,11 @@ mod tests {
     use crate::vfs::config::{ReadConfig, WriteConfig};
     use crate::vfs::io::writer::FileWriter;
     use bytes::Bytes;
+    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
 
@@ -1296,7 +1310,7 @@ mod tests {
         let backend = Arc::new(Backend::new(block_store.clone(), meta.clone()));
 
         let ino: i64 = 33;
-        let data = vec![7u8; (layout.block_size * 2) as usize];
+        let data = vec![7u8; (layout.block_size * 3) as usize];
         let slice_id = meta_store.next_id(SLICE_ID_KEY).await.unwrap();
         let uploader = DataUploader::new(layout, backend.as_ref());
         uploader
@@ -1324,7 +1338,7 @@ mod tests {
         let config = Arc::new(
             ReadConfig::new(layout)
                 .buffer_size(64 * 1024)
-                .max_ahead(layout.block_size as u64),
+                .max_ahead(layout.block_size as u64 * 2),
         );
         let reader = DataReader::new(config, backend.clone());
         let file_reader = reader.open_for_handle(inode, 1);
@@ -1351,6 +1365,335 @@ mod tests {
                 .any(|&(start, end)| start <= layout.block_size as u64
                     && end >= layout.block_size as u64 * 2),
             "readahead should queue the block after the current read, ranges={ranges:?}"
+        );
+        assert!(
+            ranges
+                .iter()
+                .all(|&(start, end)| end - start <= layout.block_size as u64),
+            "readahead slices should stay block-sized so a foreground 4MiB read does not wait for later blocks, ranges={ranges:?}"
+        );
+    }
+
+    #[derive(Default)]
+    struct FlakyBlockStore {
+        data: StdMutex<HashMap<BlockKey, Vec<u8>>>,
+        read_attempts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl BlockStore for FlakyBlockStore {
+        async fn write_fresh_range(
+            &self,
+            key: BlockKey,
+            offset: u64,
+            data: &[u8],
+        ) -> anyhow::Result<u64> {
+            let mut guard = self.data.lock().unwrap();
+            let entry = guard.entry(key).or_default();
+            let start = offset as usize;
+            let end = start + data.len();
+            if entry.len() < end {
+                entry.resize(end, 0);
+            }
+            entry[start..end].copy_from_slice(data);
+            Ok(data.len() as u64)
+        }
+
+        async fn read_range(
+            &self,
+            key: BlockKey,
+            offset: u64,
+            buf: &mut [u8],
+        ) -> anyhow::Result<()> {
+            let attempt = self.read_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt <= 2 {
+                anyhow::bail!("timeout reading test block");
+            }
+
+            let guard = self.data.lock().unwrap();
+            if let Some(src) = guard.get(&key) {
+                let start = offset as usize;
+                let end = (start + buf.len()).min(src.len());
+                if start < end {
+                    buf[..end - start].copy_from_slice(&src[start..end]);
+                }
+            }
+            Ok(())
+        }
+
+        async fn delete_range(&self, key: BlockKey, block_count: u64) -> anyhow::Result<()> {
+            let mut guard = self.data.lock().unwrap();
+            for block in key.1..key.1 + block_count as u32 {
+                guard.remove(&(key.0, block));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_slice_read_retries_transient_failures() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 4 * 1024,
+        };
+        let block_store = Arc::new(FlakyBlockStore::default());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(block_store.clone(), meta.clone()));
+
+        let ino: i64 = 44;
+        let data = vec![9u8; 2048];
+        let slice_id = meta_store.next_id(SLICE_ID_KEY).await.unwrap();
+        block_store
+            .write_fresh_range((slice_id as u64, 0), 0, &data)
+            .await
+            .unwrap();
+        meta_store
+            .append_slice(
+                chunk_id_for(ino, 0).unwrap(),
+                SliceDesc {
+                    slice_id: slice_id as u64,
+                    chunk_id: chunk_id_for(ino, 0).unwrap(),
+                    offset: 0,
+                    length: data.len() as u64,
+                },
+            )
+            .await
+            .unwrap();
+
+        let inode = Inode::new(ino, data.len() as u64);
+        let reader = DataReader::new(Arc::new(ReadConfig::new(layout)), backend.clone());
+        let file_reader = reader.open_for_handle(inode, 1);
+
+        let out = file_reader.read(0, data.len()).await.unwrap();
+        assert_eq!(out, data);
+        assert!(
+            block_store.read_attempts.load(Ordering::SeqCst) >= 3,
+            "transient failures should be retried before the read succeeds"
+        );
+    }
+
+    #[derive(Default)]
+    struct CountingBlockStore {
+        data: StdMutex<HashMap<BlockKey, Vec<u8>>>,
+        read_attempts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl BlockStore for CountingBlockStore {
+        async fn write_fresh_range(
+            &self,
+            key: BlockKey,
+            offset: u64,
+            data: &[u8],
+        ) -> anyhow::Result<u64> {
+            let mut guard = self.data.lock().unwrap();
+            let entry = guard.entry(key).or_default();
+            let start = offset as usize;
+            let end = start + data.len();
+            if entry.len() < end {
+                entry.resize(end, 0);
+            }
+            entry[start..end].copy_from_slice(data);
+            Ok(data.len() as u64)
+        }
+
+        async fn read_range(
+            &self,
+            key: BlockKey,
+            offset: u64,
+            buf: &mut [u8],
+        ) -> anyhow::Result<()> {
+            self.read_attempts.fetch_add(1, Ordering::SeqCst);
+            let guard = self.data.lock().unwrap();
+            if let Some(src) = guard.get(&key) {
+                let start = offset as usize;
+                let end = (start + buf.len()).min(src.len());
+                if start < end {
+                    buf[..end - start].copy_from_slice(&src[start..end]);
+                }
+            }
+            Ok(())
+        }
+
+        async fn delete_range(&self, key: BlockKey, block_count: u64) -> anyhow::Result<()> {
+            let mut guard = self.data.lock().unwrap();
+            for block in key.1..key.1 + block_count as u32 {
+                guard.remove(&(key.0, block));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_demand_read_does_not_double_fetch_current_slice() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 4 * 1024,
+        };
+        let block_store = Arc::new(CountingBlockStore::default());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(block_store.clone(), meta.clone()));
+
+        let ino: i64 = 65;
+        let data = vec![5u8; 2048];
+        let slice_id = meta_store.next_id(SLICE_ID_KEY).await.unwrap();
+        block_store
+            .write_fresh_range((slice_id as u64, 0), 0, &data)
+            .await
+            .unwrap();
+        meta_store
+            .append_slice(
+                chunk_id_for(ino, 0).unwrap(),
+                SliceDesc {
+                    slice_id: slice_id as u64,
+                    chunk_id: chunk_id_for(ino, 0).unwrap(),
+                    offset: 0,
+                    length: data.len() as u64,
+                },
+            )
+            .await
+            .unwrap();
+
+        let inode = Inode::new(ino, data.len() as u64);
+        let reader = DataReader::new(Arc::new(ReadConfig::new(layout)), backend.clone());
+        let file_reader = reader.open_for_handle(inode, 1);
+
+        assert_eq!(file_reader.read(0, data.len()).await.unwrap(), data);
+        assert_eq!(
+            block_store.read_attempts.load(Ordering::SeqCst),
+            1,
+            "current demand reads should not background-fetch then foreground-read the same slice"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repeated_slice_read_goes_through_block_store() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 4 * 1024,
+        };
+        let block_store = Arc::new(CountingBlockStore::default());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(block_store.clone(), meta.clone()));
+
+        let ino: i64 = 66;
+        let data = vec![6u8; 2048];
+        let slice_id = meta_store.next_id(SLICE_ID_KEY).await.unwrap();
+        block_store
+            .write_fresh_range((slice_id as u64, 0), 0, &data)
+            .await
+            .unwrap();
+        meta_store
+            .append_slice(
+                chunk_id_for(ino, 0).unwrap(),
+                SliceDesc {
+                    slice_id: slice_id as u64,
+                    chunk_id: chunk_id_for(ino, 0).unwrap(),
+                    offset: 0,
+                    length: data.len() as u64,
+                },
+            )
+            .await
+            .unwrap();
+
+        let inode = Inode::new(ino, data.len() as u64);
+        let reader = DataReader::new(Arc::new(ReadConfig::new(layout)), backend.clone());
+        let file_reader = reader.open_for_handle(inode, 1);
+
+        assert_eq!(file_reader.read(0, data.len()).await.unwrap(), data);
+        let after_first = block_store.read_attempts.load(Ordering::SeqCst);
+
+        assert_eq!(file_reader.read(0, data.len()).await.unwrap(), data);
+        let after_second = block_store.read_attempts.load(Ordering::SeqCst);
+
+        assert!(
+            after_second > after_first,
+            "repeated reads must route through BlockStore/ChunksCache instead of copying SliceState.page"
+        );
+    }
+
+    fn ranges_cover(ranges: &[(u64, u64)], start: u64, end: u64) -> bool {
+        let mut ranges = ranges.to_vec();
+        ranges.sort_by_key(|range| range.0);
+        let mut cursor = start;
+        for (left, right) in ranges {
+            if right <= cursor {
+                continue;
+            }
+            if left > cursor {
+                return false;
+            }
+            cursor = cursor.max(right);
+            if cursor >= end {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn test_tail_prefetch_on_eof_read() {
+        let layout = ChunkLayout {
+            chunk_size: 256 * 1024,
+            block_size: 64 * 1024,
+        };
+        let block_store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(block_store.clone(), meta.clone()));
+
+        let ino: i64 = 55;
+        let data = vec![4u8; 128 * 1024];
+        let slice_id = meta_store.next_id(SLICE_ID_KEY).await.unwrap();
+        let uploader = DataUploader::new(layout, backend.as_ref());
+        uploader
+            .write_at_vectored(
+                slice_id as u64,
+                0u64.into(),
+                &[Bytes::copy_from_slice(&data)],
+            )
+            .await
+            .unwrap();
+        meta_store
+            .append_slice(
+                chunk_id_for(ino, 0).unwrap(),
+                SliceDesc {
+                    slice_id: slice_id as u64,
+                    chunk_id: chunk_id_for(ino, 0).unwrap(),
+                    offset: 0,
+                    length: data.len() as u64,
+                },
+            )
+            .await
+            .unwrap();
+
+        let inode = Inode::new(ino, data.len() as u64);
+        let reader = DataReader::new(Arc::new(ReadConfig::new(layout)), backend.clone());
+        let file_reader = reader.open_for_handle(inode, 1);
+
+        let read_offset = data.len() as u64 - 16 * 1024;
+        let out = file_reader.read(read_offset, 4096).await.unwrap();
+        assert_eq!(out, data[read_offset as usize..read_offset as usize + 4096]);
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ranges = {
+            let guard = file_reader.slices.lock().await;
+            guard
+                .iter()
+                .map(|slice| slice.lock().range)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            ranges_cover(&ranges, data.len() as u64 - 32 * 1024, data.len() as u64),
+            "tail prefetch should cover the last 32KB, ranges={ranges:?}"
         );
     }
 

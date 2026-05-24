@@ -16,6 +16,7 @@
 
 pub mod bandwidth;
 pub mod cache;
+pub mod cache_health;
 pub mod cache_integrity;
 pub mod compact;
 pub mod compress;

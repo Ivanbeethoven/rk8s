@@ -1779,11 +1779,8 @@ where
                         }
                         // Wait for slice notification (new data or state change).
                         let notify = slice.lock().notify.clone();
-                        let _ = tokio::time::timeout(
-                            Duration::from_millis(50),
-                            notify.notified(),
-                        )
-                        .await;
+                        let _ = tokio::time::timeout(Duration::from_millis(50), notify.notified())
+                            .await;
                     }
                     continue;
                 }

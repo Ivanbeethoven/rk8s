@@ -241,6 +241,10 @@ pub trait MetaLayer: Send + Sync {
 
     async fn get_slices(&self, chunk_id: u64) -> Result<Vec<SliceDesc>, MetaError>;
 
+    async fn invalidate_chunk_slices(&self, _ino: i64, _chunk_index: u64) -> Result<(), MetaError> {
+        Ok(())
+    }
+
     async fn append_slice(&self, chunk_id: u64, slice: SliceDesc) -> Result<(), MetaError>;
 
     async fn next_id(&self, key: &str) -> Result<i64, MetaError>;

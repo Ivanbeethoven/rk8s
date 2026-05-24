@@ -13,6 +13,14 @@
 | 5 | [05-transaction-engine.md](05-transaction-engine.md) | Redis WATCH/EXEC 两阶段锁、5 个关键事务伪代码、Session 管理 |
 | 6 | [06-slice-compaction.md](06-slice-compaction.md) | Slice 二叉树合并 (cut/buildSlice)、S3 endpoint 解析、GC |
 | 7 | [07-performance-comparison.md](07-performance-comparison.md) | SlayerFS vs JuiceFS benchmark、根因分析、优化路线图 |
+| 8 | [slayerfs-vs-juicefs-full-comparison.md](slayerfs-vs-juicefs-full-comparison.md) | **全模块逐行对比**: 读路径/写路径/缓存/事务 — 27 维度差异矩阵 |
+
+## 实施计划
+
+| 计划 | 文件 |
+|------|------|
+| 综合性能优化 | [../superpowers/plans/2026-05-23-slayerfs-perf-optimization.md](../superpowers/plans/2026-05-23-slayerfs-perf-optimization.md) |
+| **本地缓存读优化** | [../superpowers/plans/2026-05-23-read-cache-optimization.md](../superpowers/plans/2026-05-23-read-cache-optimization.md) |
 
 ## 关键源码文件
 

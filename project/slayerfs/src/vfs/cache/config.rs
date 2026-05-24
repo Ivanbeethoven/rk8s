@@ -74,7 +74,7 @@ impl Default for CacheConfig {
             cache_root: dirs::cache_dir()
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join("slayerfs"),
-            read_memory_bytes: 300 * 1024 * 1024,
+            read_memory_bytes: 4096 * 1024 * 1024,
             read_ssd_bytes: 20 * 1024 * 1024 * 1024,
             write_memory_bytes: 300 * 1024 * 1024,
             write_ssd_bytes: 20 * 1024 * 1024 * 1024,
@@ -112,7 +112,7 @@ mod tests {
         let config = CacheConfig::default();
 
         assert_eq!(config.compression, Compression::Lz4);
-        assert_eq!(config.read_memory_bytes, 300 * 1024 * 1024);
+        assert_eq!(config.read_memory_bytes, 4096 * 1024 * 1024);
         assert_eq!(config.write_memory_bytes, 300 * 1024 * 1024);
         assert_eq!(config.dirty_slice_target_size, 8 * 1024 * 1024);
         assert_eq!(config.prefetch_max_bytes, 64 * 1024 * 1024);

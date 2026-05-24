@@ -1993,6 +1993,11 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         Ok(cached)
     }
 
+    async fn invalidate_chunk_slices(&self, ino: i64, chunk_index: u64) -> Result<(), MetaError> {
+        self.inode_cache.invalidate_slices(ino, chunk_index).await;
+        Ok(())
+    }
+
     #[tracing::instrument(
         level = "trace",
         skip(self, slice),

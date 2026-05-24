@@ -881,7 +881,7 @@ if fio_json_paths:
             "## Fio",
             "",
             "| Tool | Workload | BS | Jobs | Read BW | Read IOPS | Write BW | Write IOPS | Read P99 | Write P99 | Raw |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |---: | ---: | ---: |",
         ])
 
         for fio_json_path in fio_json_paths:

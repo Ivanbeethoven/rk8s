@@ -311,7 +311,8 @@ where
                                 if fetcher.prepare_slices().await.is_err() {
                                     return;
                                 }
-                                let _ = fetcher.read_at(span.offset.into(), span.len as usize).await;
+                                let _ =
+                                    fetcher.read_at(span.offset.into(), span.len as usize).await;
                             }));
                         }
                         for t in tasks {
