@@ -516,7 +516,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         // Try cache first — blocks are immutable once committed, so a cache
         // hit is always valid regardless of read size or offset.
         if let Some(cached) = self.block_cache.get(&key_str).await {
-            tracing::info!(key = %key_str, len = cached.len(), "block_cache HIT");
+            tracing::trace!(key = %key_str, len = cached.len(), "block_cache HIT");
             tracing::Span::current().record("strategy", "cache_hit");
             let offset_usize = offset as usize;
             let end = (offset_usize + len).min(cached.len());

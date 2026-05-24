@@ -858,26 +858,11 @@ where
             );
         }
 
-        let ahead = tracing::trace_span!("read_at.check_session", offset, len = actual_len)
-            .in_scope(|| self.check_session(offset, actual_len));
-
+        // Read demand data first — do not synchronously submit readahead
+        // before the foreground read.  The GlobalPrefetcher (VFS layer)
+        // handles asynchronous readahead after each successful read.
         let ahead_start = offset + actual_len as u64;
-        let ahead = ahead.min(file_size.saturating_sub(ahead_start));
-        tracing::trace_span!(
-            "FileReader.read_at.prepare_ahead_slices",
-            offset = ahead_start,
-            ahead
-        )
-        .in_scope(|| self.prepare_ahead_slices(ahead_start, ahead, &mut pin_guard))
-        .await;
-
-        self.prepare_tail_slices(offset, actual_len, &mut pin_guard)
-            .instrument(tracing::trace_span!(
-                "FileReader.read_at.prepare_tail_slices",
-                offset,
-                len = actual_len
-            ))
-            .await;
+        let _ahead = self.check_session(offset, actual_len);
 
         let mut tail = buf;
         let result = async {
@@ -901,24 +886,65 @@ where
         result
     }
 
-    // Read one chunk span through a single DataFetcher. SliceState is updated
-    // only as metadata so later reads/readahead can reuse the prepared ranges.
+    // Read one chunk span directly into the caller buffer through DataFetcher →
+    // BlockStore, using the per-handle chunk→slice metadata cache to skip
+    // repeated meta queries within the same chunk.
     #[tracing::instrument(level = "trace", skip(self, buf), fields(index, offset, len = buf.len()))]
     async fn read_chunk_span(&self, index: u64, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
-        let data = self.read_backend_range(index, offset, buf.len()).await;
-        self.complete_demand_slices(index, offset, buf.len(), data.as_ref().err())
-            .await;
+        let chunk_id = chunk_id_for(self.inode.ino(), index)?;
+        let len = buf.len();
 
-        let data = data?;
-        tracing::trace_span!(
-            "read_chunk_span.copy_out_backend",
-            index,
-            offset,
-            bytes = buf.len()
-        )
-        .in_scope(|| {
-            buf.copy_from_slice(&data);
-        });
+        let slices = match self.chunk_slices.get(&chunk_id) {
+            Some(cached) => cached.clone(),
+            None => {
+                let mut fetcher =
+                    DataFetcher::new(self.config.layout, chunk_id, &self.backend);
+                fetcher.prepare_slices().await?;
+                let slices = fetcher.into_slices();
+                self.chunk_slices.insert(chunk_id, slices.clone());
+                slices
+            }
+        };
+
+        let mut result = async {
+            let mut fetcher =
+                DataFetcher::with_slices(self.config.layout, chunk_id, &self.backend, slices.clone());
+            let mut tmp = vec![0u8; len];
+            fetcher.read_at_into(offset.into(), &mut tmp).await?;
+            Ok::<_, anyhow::Error>(tmp)
+        }
+        .await;
+
+        for attempt in 0..MAX_SLICE_READ_RETRIES.saturating_sub(1) {
+            let should_retry = match &result {
+                Ok(_) => false,
+                Err(err) => is_transient_read_error(err),
+            };
+            if !should_retry {
+                break;
+            }
+            let _ = self
+                .backend
+                .meta()
+                .invalidate_chunk_slices(self.inode.ino(), index)
+                .await;
+            self.chunk_slices.remove(&chunk_id);
+            tokio::time::sleep(retry_delay(attempt)).await;
+            result = async {
+                let mut fetcher =
+                    DataFetcher::new(self.config.layout, chunk_id, &self.backend);
+                fetcher.prepare_slices().await?;
+                let mut tmp = vec![0u8; len];
+                fetcher.read_at_into(offset.into(), &mut tmp).await?;
+                Ok::<_, anyhow::Error>(tmp)
+            }
+            .await;
+        }
+
+        let data = result?;
+        buf.copy_from_slice(&data);
+        self.complete_demand_slices(index, offset, len, None::<&anyhow::Error>)
+            .await;
         Ok(())
     }
 
@@ -954,60 +980,6 @@ where
             }
             state.notify.notify_waiters();
         }
-    }
-
-    async fn read_backend_range(
-        &self,
-        index: u64,
-        offset: u64,
-        len: usize,
-    ) -> anyhow::Result<Vec<u8>> {
-        let chunk_id = chunk_id_for(self.inode.ino(), index)?;
-
-        // Prepare slice metadata: use per-handle cache on hit, fetch from
-        // meta (InodeCache → Redis) on first access.  Sequential reads within
-        // the same chunk hit the cache and skip the meta round-trip.
-        let slices = match self.chunk_slices.get(&chunk_id) {
-            Some(cached) => cached.clone(),
-            None => {
-                let mut fetcher = DataFetcher::new(self.config.layout, chunk_id, &self.backend);
-                fetcher.prepare_slices().await?;
-                let slices = fetcher.into_slices();
-                self.chunk_slices.insert(chunk_id, slices.clone());
-                slices
-            }
-        };
-
-        let mut result = async {
-            let mut fetcher = DataFetcher::with_slices(self.config.layout, chunk_id, &self.backend, slices.clone());
-            fetcher.read_at(offset.into(), len).await
-        }
-        .await;
-
-        for attempt in 0..MAX_SLICE_READ_RETRIES.saturating_sub(1) {
-            let should_retry = match &result {
-                Ok(_) => false,
-                Err(err) => is_transient_read_error(err),
-            };
-            if !should_retry {
-                break;
-            }
-
-            let _ = self
-                .backend
-                .meta()
-                .invalidate_chunk_slices(self.inode.ino(), index)
-                .await;
-            tokio::time::sleep(retry_delay(attempt)).await;
-            result = async {
-                let mut fetcher = DataFetcher::new(self.config.layout, chunk_id, &self.backend);
-                fetcher.prepare_slices().await?;
-                fetcher.read_at(offset.into(), len).await
-            }
-            .await;
-        }
-
-        result
     }
 
     #[tracing::instrument(level = "trace", skip(self), fields(index, start, end))]
@@ -1387,18 +1359,13 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
+        // After the synchronous demand read, no ahead slices should be created.
+        // Readahead is handled asynchronously by the GlobalPrefetcher at the VFS
+        // layer, not by FileReader::read_at.
+        let demand_end = layout.block_size as u64;
         assert!(
-            ranges
-                .iter()
-                .any(|&(start, end)| start <= layout.block_size as u64
-                    && end >= layout.block_size as u64 * 2),
-            "readahead should queue the block after the current read, ranges={ranges:?}"
-        );
-        assert!(
-            ranges
-                .iter()
-                .all(|&(start, end)| end - start <= layout.block_size as u64),
-            "readahead slices should stay block-sized so a foreground 4MiB read does not wait for later blocks, ranges={ranges:?}"
+            ranges.iter().any(|&(start, end)| start <= 0 && end >= demand_end),
+            "demand range should be in slices, ranges={ranges:?}"
         );
     }
 
@@ -1665,65 +1632,8 @@ mod tests {
         false
     }
 
-    #[tokio::test]
-    async fn test_tail_prefetch_on_eof_read() {
-        let layout = ChunkLayout {
-            chunk_size: 256 * 1024,
-            block_size: 64 * 1024,
-        };
-        let block_store = Arc::new(InMemoryBlockStore::new());
-        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let meta_store = meta_handle.store();
-        let meta = meta_handle.layer();
-        let backend = Arc::new(Backend::new(block_store.clone(), meta.clone()));
-
-        let ino: i64 = 55;
-        let data = vec![4u8; 128 * 1024];
-        let slice_id = meta_store.next_id(SLICE_ID_KEY).await.unwrap();
-        let uploader = DataUploader::new(layout, backend.as_ref());
-        uploader
-            .write_at_vectored(
-                slice_id as u64,
-                0u64.into(),
-                &[Bytes::copy_from_slice(&data)],
-            )
-            .await
-            .unwrap();
-        meta_store
-            .append_slice(
-                chunk_id_for(ino, 0).unwrap(),
-                SliceDesc {
-                    slice_id: slice_id as u64,
-                    chunk_id: chunk_id_for(ino, 0).unwrap(),
-                    offset: 0,
-                    length: data.len() as u64,
-                },
-            )
-            .await
-            .unwrap();
-
-        let inode = Inode::new(ino, data.len() as u64);
-        let reader = DataReader::new(Arc::new(ReadConfig::new(layout)), backend.clone());
-        let file_reader = reader.open_for_handle(inode, 1);
-
-        let read_offset = data.len() as u64 - 16 * 1024;
-        let out = file_reader.read(read_offset, 4096).await.unwrap();
-        assert_eq!(out, data[read_offset as usize..read_offset as usize + 4096]);
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let ranges = {
-            let guard = file_reader.slices.lock().await;
-            guard
-                .iter()
-                .map(|slice| slice.lock().range)
-                .collect::<Vec<_>>()
-        };
-
-        assert!(
-            ranges_cover(&ranges, data.len() as u64 - 32 * 1024, data.len() as u64),
-            "tail prefetch should cover the last 32KB, ranges={ranges:?}"
-        );
-    }
+    // Tail prefetch is now handled asynchronously by the GlobalPrefetcher at the
+    // VFS layer (fs/mod.rs), not by FileReader::read_at.
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_read_while_write_eventually_sees_data() {

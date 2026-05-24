@@ -204,6 +204,80 @@ where
         }
         Ok(buf)
     }
+
+    /// Zero-copy variant: fill `buf` directly from the block store without
+    /// an intermediate allocation.  Used on the hot read path.
+    #[tracing::instrument(
+        name = "DataFetcher.read_at_into",
+        level = "trace",
+        skip(self, buf),
+        fields(chunk_id = self.id, offset = offset.0, len = buf.len())
+    )]
+    pub(crate) async fn read_at_into(&mut self, offset: ChunkOffset, buf: &mut [u8]) -> Result<()> {
+        let offset = offset.get();
+        let len = buf.len();
+        if len == 0 {
+            return Ok(());
+        }
+        ensure!(
+            self.prepared,
+            "DataFetcher::read_at_into requires prepare_slices() to run first"
+        );
+
+        let need_read = {
+            let mut intervals = Intervals::new(offset, offset + len as u64);
+            let mut need_read = Vec::new();
+            for slice in self.slices.iter().copied().rev() {
+                for (l, r) in intervals.cut(slice.offset, slice.offset + slice.length) {
+                    need_read.push((l, r, slice));
+                }
+            }
+            need_read.sort_by_key(|(l, _, _)| *l);
+            need_read
+        };
+
+        let layout = self.layout;
+        let backend = self.backend;
+        let mut cursor = 0;
+        let mut tail = buf;
+        let mut futures = FuturesUnordered::new();
+
+        for (l, r, slice) in need_read {
+            let start = (l - offset).as_usize();
+            let len = (r - l).as_usize();
+            let gap = start - cursor;
+            let (_, rest) = tail.split_at_mut(gap);
+            let (seg, rest) = rest.split_at_mut(len);
+            tail = rest;
+            cursor = start + len;
+
+            let slice_offset = SliceOffset::from(l - slice.offset);
+            let slice_len = r - l;
+            let slice_id = slice.slice_id;
+            let mut pos = 0_usize;
+            for block in block_span_iter_slice(slice_offset, slice_len, layout) {
+                let take = block.len.as_usize();
+                let block_buf = &mut seg[pos..pos + take];
+                pos += take;
+                let block_key = (slice_id, block.index.as_u32());
+                let block_offset = block.offset;
+                // SAFETY: each block_buf is a non-overlapping sub-slice of `seg`
+                let send_buf = SendBuf { ptr: block_buf.as_mut_ptr(), len: block_buf.len() };
+                futures.push(async move {
+                    backend.store().read_range(
+                        block_key,
+                        block_offset,
+                        unsafe { send_buf.as_mut_slice() },
+                    ).await
+                });
+            }
+        }
+
+        while let Some(res) = futures.next().await {
+            res?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
