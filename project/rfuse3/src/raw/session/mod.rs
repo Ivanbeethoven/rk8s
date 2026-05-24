@@ -1657,11 +1657,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             congestion_threshold,
             max_write: max_write.get(),
             time_gran: DEFAULT_TIME_GRAN,
-            // Match block size so each fio 4 MiB read is one FUSE request.
-            max_read: 4 * 1024 * 1024,
             max_pages: DEFAULT_MAX_PAGES,
             map_alignment: DEFAULT_MAP_ALIGNMENT,
-            unused: [0; 7],
+            flags2: 0x1,  // FUSE_HAS_MAX_READ — tells kernel max_read is valid
+            max_read: 4 * 1024 * 1024,
+            unused: [0; 6],
         };
 
         debug!("fuse init out {:?}", init_out);
