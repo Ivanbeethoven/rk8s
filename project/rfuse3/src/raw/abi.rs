@@ -839,7 +839,8 @@ pub struct fuse_init_out {
     pub time_gran: u32,
     pub max_pages: u16,
     pub map_alignment: u16,
-    pub unused: [u32; 8],
+    pub max_read: u32,
+    pub unused: [u32; 7],
 }
 
 /*#[derive(Debug)]

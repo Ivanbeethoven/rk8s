@@ -1657,16 +1657,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             congestion_threshold,
             max_write: max_write.get(),
             time_gran: DEFAULT_TIME_GRAN,
-            // max_read = 1 MiB so the kernel doesn't split 4 MiB fio reads into
-            // dozens of small FUSE requests.  Each FUSE request carries overhead
-            // (>100 µs context switch + handler dispatch); raising this from the
-            // kernel default (128 KiB) to 1 MiB reduces per-block RPCs from ~32
-            // to ~4.  Larger values increase kernel-side memory pressure so we
-            // stay at 1 MiB rather than matching the full 4 MiB block size.
-            max_read: 1024 * 1024,
+            // Match block size so each fio 4 MiB read is one FUSE request.
+            max_read: 4 * 1024 * 1024,
             max_pages: DEFAULT_MAX_PAGES,
             map_alignment: DEFAULT_MAP_ALIGNMENT,
-            unused: [0; 8],
+            unused: [0; 7],
         };
 
         debug!("fuse init out {:?}", init_out);
