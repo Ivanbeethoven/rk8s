@@ -24,6 +24,7 @@ use io_uring::{opcode, types, IoUring};
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
+use bytes::Bytes;
 use super::CompleteIoResult;
 
 /// Number of submission queue entries in the io_uring ring.
@@ -45,9 +46,9 @@ struct ReadRequest {
 
 /// Represents a pending write request sent to the ring thread.
 struct WriteRequest {
-    data: Vec<u8>,
-    body_extend: Option<Vec<u8>>,
-    reply: oneshot::Sender<CompleteIoResult<(Vec<u8>, Option<Vec<u8>>), usize>>,
+	    data: Bytes,
+	    body_extend: Option<Bytes>,
+    reply: oneshot::Sender<CompleteIoResult<(Bytes, Option<Bytes>), usize>>,
 }
 
 /// Combined request type for the single ring thread channel.
@@ -274,23 +275,18 @@ impl FuseConnection {
     }
 
     /// Write a FUSE response to `/dev/fuse` using io_uring writev.
-    pub async fn write_vectored<
-        T: Deref<Target = [u8]> + Send + 'static,
-        U: Deref<Target = [u8]> + Send + 'static,
-    >(
+    pub async fn write_vectored(
         &self,
-        data: T,
-        body_extend_data: Option<U>,
-    ) -> CompleteIoResult<(T, Option<U>), usize> {
+        data: Bytes,
+        body_extend_data: Option<Bytes>,
+    ) -> CompleteIoResult<(Bytes, Option<Bytes>), usize> {
         let (tx, rx) = oneshot::channel();
 
-        // Copy data into owned buffers for the ring thread
-        let data_vec = data.deref().to_vec();
-        let body_vec = body_extend_data.as_ref().map(|b| b.deref().to_vec());
-
+        // Pass Bytes directly to the ring thread — zero-copy (Arc bump
+        // only).  The ring thread reads .as_ptr() at writev time.
         let req = RingRequest::Write(WriteRequest {
-            data: data_vec,
-            body_extend: body_vec,
+            data: data.clone(),
+            body_extend: body_extend_data.clone(),
             reply: tx,
         });
 

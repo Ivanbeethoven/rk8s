@@ -767,8 +767,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     ) -> IoResult<()> {
         while let Some(response) = response_receiver.next().await {
             let (mut data, mut extend_data) = match response {
-                Either::Left(data) => (data, None),
-                Either::Right((data, extend_data)) => (data, Some(extend_data)),
+                Either::Left(data) => (Bytes::from(data), None),
+                Either::Right((data, extend_data)) => (Bytes::from(data), Some(extend_data)),
             };
             let extend_len = extend_data.as_ref().map(|v| v.len()).unwrap_or(0);
             if data.len() >= FUSE_OUT_HEADER_SIZE {
@@ -776,7 +776,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 let header_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
                 if header_len != actual_len {
                     let len_bytes = (actual_len as u32).to_le_bytes();
-                    data[0..4].copy_from_slice(&len_bytes);
+                    let mut v = data.to_vec();
+                    v[0..4].copy_from_slice(&len_bytes);
+                    data = Bytes::from(v);
                     warn!(
                         header_len,
                         actual_len, "adjusted fuse reply length to match payload"
@@ -1401,7 +1403,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     .expect("won't happened");
 
                 if let Err(err) = fuse_connection
-                    .write_vectored::<_, Vec<u8>>(init_out_header_data, None)
+                    .write_vectored(Bytes::from(init_out_header_data), None)
                     .await
                     .1
                 {
@@ -1615,7 +1617,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     .expect("won't happened");
 
                 if let Err(err) = fuse_connection
-                    .write_vectored::<_, Vec<u8>>(init_out_header_data, None)
+                    .write_vectored(Bytes::from(init_out_header_data), None)
                     .await
                     .1
                 {
@@ -1682,7 +1684,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             .expect("won't happened");
 
         if let Err(err) = fuse_connection
-            .write_vectored::<_, Vec<u8>>(data, None)
+            .write_vectored(Bytes::from(data), None)
             .await
             .1
         {
