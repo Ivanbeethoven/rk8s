@@ -733,6 +733,33 @@ where
         let config = Arc::new(config);
         let state = Arc::new(VfsState::new(config, backend));
 
+        // Background cache-statistics logger: prints hit/miss counts and
+        // memory usage every 100 ms so that `slayerfs.log` serves as a
+        // built-in `juicefs stats` equivalent during benchmarks.
+        if let (Some(hits), Some(misses)) = store.cache_counters() {
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(100));
+                loop {
+                    interval.tick().await;
+                    let h = hits.load(std::sync::atomic::Ordering::Relaxed);
+                    let m = misses.load(std::sync::atomic::Ordering::Relaxed);
+                    let total = h + m;
+                    let rate = if total > 0 {
+                        (h as f64 / total as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    tracing::info!(
+                        hits = h,
+                        misses = m,
+                        total = total,
+                        hit_rate_pct = rate,
+                        "cache_stats"
+                    );
+                }
+            });
+        }
+
         Ok(Self {
             core,
             state,

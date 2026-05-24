@@ -18,7 +18,7 @@ use futures::executor::block_on;
 use hex::encode;
 use moka::{Entry, ops::compute::Op};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fs, io::SeekFrom, path::PathBuf, sync::Arc, sync::LazyLock};
+use std::{collections::HashMap, fs, io::SeekFrom, path::PathBuf, sync::Arc, sync::LazyLock, sync::atomic::AtomicU64};
 use tokio::{
     io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::{RwLock, Semaphore},
@@ -67,6 +67,12 @@ pub trait BlockStore {
     #[allow(dead_code)]
     async fn cache_block(&self, _key: BlockKey, _data: &[u8]) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Returns shared cache hit/miss counters for diagnostics (.stats file).
+    /// Default returns (None, None); ObjectBlockStore overrides.
+    fn cache_counters(&self) -> (Option<Arc<AtomicU64>>, Option<Arc<AtomicU64>>) {
+        (None, None)
     }
 }
 
@@ -713,6 +719,13 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         let key_str = Self::key_for(key);
         let _ = self.block_cache.insert(&key_str, &data.to_vec()).await;
         Ok(())
+    }
+
+    fn cache_counters(&self) -> (Option<Arc<AtomicU64>>, Option<Arc<AtomicU64>>) {
+        (
+            Some(self.block_cache.cache_hits.clone()),
+            Some(self.block_cache.cache_misses.clone()),
+        )
     }
 }
 
