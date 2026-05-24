@@ -326,7 +326,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
         // Make freshly uploaded data immediately visible in the hottest read
         // tier before returning to the caller. Disk persistence stays best-
         // effort so foreground uploads are not blocked by local cache I/O.
-        self.block_cache.insert_hot(&key, data.clone()).await;
+        self.block_cache.insert_hot(&key, bytes::Bytes::from(data.clone())).await;
 
         // Persist to disk if a write permit is available. Skipping under
         // extreme I/O pressure avoids queuing hundreds of background tasks
@@ -365,7 +365,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
         block.truncate(self.config.block_size);
 
         self.block_cache
-            .insert_opportunistic(Self::key_for(key), block)
+            .insert_opportunistic(Self::key_for(key), bytes::Bytes::from(block))
             .await;
         true
     }
@@ -414,7 +414,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             match block_data {
                 Ok(block_data) => {
                     cache
-                        .insert_opportunistic(Self::key_for(key), block_data.to_vec())
+                        .insert_opportunistic(Self::key_for(key), (*block_data).clone())
                         .await;
                 }
                 Err(err) => {
@@ -694,7 +694,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         // fast (in-memory) so we await it to ensure subsequent reads hit.
         // Disk persistence is spawned in the background by insert_opportunistic.
         self.block_cache
-            .insert_opportunistic(key_str.clone(), block_data.to_vec())
+            .insert_opportunistic(key_str.clone(), (*block_data).clone())
             .await;
 
         Ok(())

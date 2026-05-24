@@ -1514,9 +1514,9 @@ pub struct ChunksCache {
 
     /// Hot cache tier storing frequently accessed data in memory
     /// Uses Moka's high-performance concurrent cache implementation
-    hot_cache: moka::future::Cache<String, Vec<u8>>,
+    hot_cache: moka::future::Cache<String, bytes::Bytes>,
 
-    /// Approximate hot cache bytes (sum of Vec<u8> lengths)
+    /// Approximate hot cache bytes (sum of Bytes lengths)
     hot_bytes: Arc<AtomicU64>,
 
     /// Cold cache tier tracking all accessed keys for pattern analysis
@@ -1568,13 +1568,13 @@ impl ChunksCache {
         // The weigher returns the byte size of each entry (clamped to u32::MAX).
         let hot_cache_builder = moka::future::Cache::builder()
             .max_capacity(config.max_hot_bytes)
-            .weigher(|_key: &String, value: &Vec<u8>| -> u32 {
+            .weigher(|_key: &String, value: &bytes::Bytes| -> u32 {
                 // Each entry's weight is its byte size (with overhead estimate for key + metadata)
                 (value.len() as u64 + 64).min(u32::MAX as u64) as u32
             })
             .time_to_idle(Duration::from_secs(300))
             .time_to_live(Duration::from_secs(3600))
-            .eviction_listener(move |_key, value: Vec<u8>, _cause| {
+            .eviction_listener(move |_key, value: bytes::Bytes, _cause| {
                 // Saturating sub to prevent underflow from racing insert_hot/eviction
                 let _ = hot_bytes_evict.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(value.len() as u64))
@@ -1615,7 +1615,7 @@ impl ChunksCache {
         })
     }
 
-    pub async fn get(&self, key: &String) -> Option<Vec<u8>> {
+    pub async fn get(&self, key: &String) -> Option<bytes::Bytes> {
         // Check hot cache first — fastest path, no promotion tracking needed.
         if let Some(value) = self.hot_cache.get(key).await {
             self.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -1653,13 +1653,14 @@ impl ChunksCache {
 
         if self.policy.should_promote(key.clone()).await {
             debug!("Promoting key to hot cache: {}", key);
-            self.hot_cache.insert(key.clone(), value.clone()).await;
+            let b = bytes::Bytes::from(value.clone());
             self.hot_bytes
-                .fetch_add(value.len() as u64, Ordering::Relaxed);
+                .fetch_add(b.len() as u64, Ordering::Relaxed);
+            self.hot_cache.insert(key.clone(), b).await;
         }
 
         self.update_utilization_metrics();
-        Some(value)
+        Some(bytes::Bytes::from(value))
     }
 
     /// Update cache utilization metrics (using byte-based utilization)
@@ -1696,15 +1697,16 @@ impl ChunksCache {
         }
     }
 
-    pub async fn insert_hot(&self, key: &str, data: Vec<u8>) {
+    pub async fn insert_hot(&self, key: &str, data: bytes::Bytes) {
         let len = data.len() as u64;
         self.hot_cache.insert(key.to_owned(), data).await;
         self.hot_cache.run_pending_tasks().await;
         self.hot_bytes.fetch_add(len, Ordering::Relaxed);
     }
 
-    pub async fn insert_opportunistic(&self, key: String, data: Vec<u8>) {
+    pub async fn insert_opportunistic(&self, key: String, data: bytes::Bytes) {
         // Insert into hot memory cache (fast path for subsequent reads).
+        // Bytes::clone() is an Arc bump — zero-copy.
         self.insert_hot(&key, data.clone()).await;
 
         // Persist to disk so future cold starts / hot cache evictions
@@ -1796,7 +1798,7 @@ impl ChunksCache {
     }
 
     pub async fn insert(&self, key: &str, data: &Vec<u8>) -> anyhow::Result<()> {
-        self.insert_hot(key, data.clone()).await;
+        self.insert_hot(key, bytes::Bytes::from(data.clone())).await;
         if self.disk_storage.store_with_health(key, data).await? {
             self.cold_cache.insert(key.to_owned(), ()).await;
         }
