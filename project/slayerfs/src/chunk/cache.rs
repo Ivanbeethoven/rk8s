@@ -1497,6 +1497,8 @@ pub struct CacheStats {
     pub max_hot_bytes: u64,
     pub disk_bytes: u64,
     pub max_disk_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
 }
 
 /// # Memory Management
@@ -1529,6 +1531,11 @@ pub struct ChunksCache {
 
     /// Cache configuration parameters (stored for runtime adjustments)
     config: ChunksCacheConfig,
+
+    /// Read-path cache hit counter (hot cache + disk cache)
+    pub cache_hits: Arc<AtomicU64>,
+    /// Read-path cache miss counter (fell through to S3)
+    pub cache_misses: Arc<AtomicU64>,
 }
 
 impl ChunksCache {
@@ -1603,12 +1610,15 @@ impl ChunksCache {
             disk_insert_inflight: Arc::new(DashSet::new()),
             policy,
             config,
+            cache_hits: Arc::new(AtomicU64::new(0)),
+            cache_misses: Arc::new(AtomicU64::new(0)),
         })
     }
 
     pub async fn get(&self, key: &String) -> Option<Vec<u8>> {
         // Check hot cache first — fastest path, no promotion tracking needed.
         if let Some(value) = self.hot_cache.get(key).await {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
             trace!("Hot cache HIT: {} ({} bytes)", key, value.len());
             self.policy.record_cache_request(true);
             return Some(value);
@@ -1623,13 +1633,16 @@ impl ChunksCache {
         let value = match self.disk_storage.load_with_health(key).await {
             Ok(Some(value)) if !value.is_empty() => value,
             Ok(_) => {
+                self.cache_misses.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
             Err(_) => {
+                self.cache_misses.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         };
 
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
         debug!("Loaded {} bytes from disk for key: {}", value.len(), key);
 
         // Record access only for disk hits — drives promotion decisions.
@@ -1678,6 +1691,8 @@ impl ChunksCache {
             max_hot_bytes: self.config.max_hot_bytes,
             disk_bytes: self.disk_storage.bytes_used(),
             max_disk_bytes: self.config.max_disk_bytes,
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(Ordering::Relaxed),
         }
     }
 

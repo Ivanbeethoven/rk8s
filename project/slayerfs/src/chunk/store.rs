@@ -1,6 +1,7 @@
 //! Storage backends: asynchronous block-level IO traits and in-memory implementations.
 
 use crate::chunk::bandwidth::BandwidthLimiter;
+// use crate::vfs::stats::FsStats;
 use crate::chunk::compress::{Compression, compress, decompress};
 use crate::chunk::page_cache::{PageKey, ReadPageCache};
 use crate::chunk::singleflight::SingleFlight;

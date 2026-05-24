@@ -246,7 +246,8 @@ where
             let start = (l - offset).as_usize();
             let len = (r - l).as_usize();
             let gap = start - cursor;
-            let (_, rest) = tail.split_at_mut(gap);
+            let (gap_buf, rest) = tail.split_at_mut(gap);
+            gap_buf.fill(0);
             let (seg, rest) = rest.split_at_mut(len);
             tail = rest;
             cursor = start + len;
@@ -262,13 +263,15 @@ where
                 let block_key = (slice_id, block.index.as_u32());
                 let block_offset = block.offset;
                 // SAFETY: each block_buf is a non-overlapping sub-slice of `seg`
-                let send_buf = SendBuf { ptr: block_buf.as_mut_ptr(), len: block_buf.len() };
+                let send_buf = SendBuf {
+                    ptr: block_buf.as_mut_ptr(),
+                    len: block_buf.len(),
+                };
                 futures.push(async move {
-                    backend.store().read_range(
-                        block_key,
-                        block_offset,
-                        unsafe { send_buf.as_mut_slice() },
-                    ).await
+                    backend
+                        .store()
+                        .read_range(block_key, block_offset, unsafe { send_buf.as_mut_slice() })
+                        .await
                 });
             }
         }
@@ -276,6 +279,7 @@ where
         while let Some(res) = futures.next().await {
             res?;
         }
+        tail.fill(0);
         Ok(())
     }
 }
@@ -341,6 +345,57 @@ mod tests {
         );
         assert!(
             res[(layout.block_size / 2) as usize..]
+                .iter()
+                .all(|&b| b == 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reader_into_zero_fills_holes() {
+        let layout = ChunkLayout::default();
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta = create_meta_store_from_url("sqlite::memory:")
+            .await
+            .unwrap()
+            .layer();
+        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
+
+        let buf = vec![1u8; (layout.block_size / 2) as usize];
+        let slice_id = meta.next_id(SLICE_ID_KEY).await.unwrap();
+        let uploader = DataUploader::new(layout, backend.as_ref());
+        uploader
+            .write_at_vectored(
+                slice_id as u64,
+                0u64.into(),
+                &[bytes::Bytes::copy_from_slice(&buf)],
+            )
+            .await
+            .unwrap();
+        meta.append_slice(
+            7,
+            SliceDesc {
+                slice_id: slice_id as u64,
+                chunk_id: 7,
+                offset: layout.block_size as u64,
+                length: buf.len() as u64,
+            },
+        )
+        .await
+        .unwrap();
+
+        let off = layout.block_size as u64 / 2;
+        let mut out = vec![0xff; layout.block_size as usize];
+        let mut r = DataFetcher::new(layout, 7, backend.as_ref());
+        r.prepare_slices().await.unwrap();
+        r.read_at_into(off.into(), &mut out).await.unwrap();
+
+        assert!(
+            out[..(layout.block_size / 2) as usize]
+                .iter()
+                .all(|&b| b == 0)
+        );
+        assert!(
+            out[(layout.block_size / 2) as usize..]
                 .iter()
                 .all(|&b| b == 1)
         );
