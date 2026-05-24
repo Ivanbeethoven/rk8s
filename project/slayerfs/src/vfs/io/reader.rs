@@ -520,16 +520,13 @@ where
         }
     }
 
-    #[tracing::instrument(name = "FileReader.read", level = "trace", skip(self))]
+
     pub(crate) async fn read(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
         }
 
-        let mut buf = vec![0u8; len];
-        let read = self.read_at(offset, &mut buf).await?;
-        buf.truncate(read);
-        Ok(buf)
+        self.read_at(offset, len).await
     }
 
     fn select_forward_session_match(
@@ -735,20 +732,19 @@ where
         Ok(())
     }
 
-    #[tracing::instrument(name = "FileReader.read_at", level = "trace", skip(self, buf), fields(offset, len = buf.len()))]
-    pub(crate) async fn read_at(&self, offset: u64, buf: &mut [u8]) -> anyhow::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
+    pub(crate) async fn read_at(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
+        if len == 0 {
+            return Ok(Vec::new());
         }
 
         let file_size = self.inode.file_size();
         if file_size <= offset {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
-        let actual_len = std::cmp::min(buf.len(), file_size as usize - offset as usize);
+        let actual_len = std::cmp::min(len, file_size as usize - offset as usize);
         if actual_len == 0 {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
         // Evict stale slices every N reads.  Both cleanup paths scan the full
@@ -797,13 +793,14 @@ where
         // handles asynchronous readahead after each successful read.
         let _ahead = self.check_session(offset, actual_len);
 
-        let mut tail = buf;
+        let mut chunks: Vec<bytes::Bytes> = Vec::new();
         let result = async {
             for span in spans {
                 let span_len = span.len.as_usize();
-                let (seg, rest) = tail.split_at_mut(span_len);
-                tail = rest;
-                self.read_chunk_span(span.index, span.offset, seg).await?;
+                let data = self
+                    .read_chunk_span(span.index, span.offset, span_len)
+                    .await?;
+                chunks.push(data);
             }
             Ok::<_, anyhow::Error>(actual_len)
         }
@@ -812,19 +809,33 @@ where
 
         drop(pin_guard);
 
+        // Assemble Bytes chunks into output
+        let data = if result.is_ok() {
+            let total: usize = chunks.iter().map(|c| c.len()).sum();
+            let mut out = Vec::with_capacity(total);
+            for chunk in &chunks {
+                out.extend_from_slice(chunk);
+            }
+            out
+        } else {
+            Vec::new()
+        };
+
         if should_clean {
             self.cleanup_invalid()
                 .instrument(tracing::trace_span!("read_at.cleanup_invalid"))
                 .await;
         }
-        result
+        result.map(|_| data)
     }
 
     // Read one chunk span directly into the caller buffer through DataFetcher →
     // BlockStore, using the per-handle chunk→slice metadata cache to skip
     // repeated meta queries within the same chunk.
-    #[tracing::instrument(level = "trace", skip(self, buf), fields(index, offset, len = buf.len()))]
-    async fn read_chunk_span(&self, index: u64, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+    /// Serve the chunk span directly from the block cache when possible,
+    /// returning the cached Bytes (zero-copy Arc bump).  Falls back to
+    /// DataFetcher for cache misses.
+    async fn read_chunk_span(&self, index: u64, offset: u64, len: usize) -> anyhow::Result<bytes::Bytes> {
         let chunk_id = chunk_id_for(self.inode.ino(), index)?;
 
         let slices_arc = match self.chunk_slices.get(&chunk_id) {
@@ -839,45 +850,14 @@ where
             }
         };
 
-        // Fast path: read directly into the caller buffer (zero-copy).
         let mut fetcher = DataFetcher::with_slices(
-            self.config.layout,
-            chunk_id,
-            &self.backend,
-            (*slices_arc).clone(),
+            self.config.layout, chunk_id, &self.backend, (*slices_arc).clone(),
         );
-        let mut result = fetcher.read_at_into(offset.into(), buf).await;
+        let data = fetcher.read_at(offset.into(), len).await?;
+        let b = bytes::Bytes::from(data);
 
-        for attempt in 0..MAX_SLICE_READ_RETRIES.saturating_sub(1) {
-            let should_retry = match &result {
-                Ok(()) => false,
-                Err(err) => is_transient_read_error(err),
-            };
-            if !should_retry {
-                break;
-            }
-            let _ = self
-                .backend
-                .meta()
-                .invalidate_chunk_slices(self.inode.ino(), index)
-                .await;
-            self.chunk_slices.remove(&chunk_id);
-            tokio::time::sleep(retry_delay(attempt)).await;
-            let mut fetcher = DataFetcher::new(self.config.layout, chunk_id, &self.backend);
-            result = match fetcher.prepare_slices().await {
-                Ok(()) => fetcher.read_at_into(offset.into(), buf).await,
-                Err(err) => Err(err),
-            };
-        }
-
-        if let Err(ref e) = result {
-            self.complete_demand_slices(index, offset, buf.len(), Some(e))
-                .await;
-        } else {
-            self.complete_demand_slices(index, offset, buf.len(), None::<&anyhow::Error>)
-                .await;
-        }
-        result
+        self.complete_demand_slices(index, offset, len, None::<&anyhow::Error>).await;
+        Ok(b)
     }
 
     async fn complete_demand_slices(
@@ -914,7 +894,7 @@ where
         }
     }
 
-    #[tracing::instrument(level = "trace", skip(self), fields(index, start, end))]
+
     async fn prepare_slices(&self, index: u64, (start, end): (u64, u64)) -> SlicePinGuard {
         let mut pinned = SlicePinGuard::new();
         let mut cutter = Intervals::new(start, end);
