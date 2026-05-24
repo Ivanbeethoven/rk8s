@@ -827,6 +827,7 @@ pub struct fuse_init_in {
 pub const FUSE_INIT_OUT_SIZE: usize = mem::size_of::<fuse_init_out>();
 
 #[derive(Debug, Serialize)]
+#[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct fuse_init_out {
     pub major: u32,
