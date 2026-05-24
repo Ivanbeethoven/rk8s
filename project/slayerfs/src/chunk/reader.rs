@@ -55,6 +55,30 @@ where
         }
     }
 
+    /// Create a DataFetcher with pre-fetched slice metadata, skipping
+    /// the meta.get_slices() call entirely.  Used by FileReader's
+    /// per-handle chunk→slice cache for repeated reads within the same chunk.
+    pub(crate) fn with_slices(
+        layout: ChunkLayout,
+        id: u64,
+        backend: &'a Backend<B, M>,
+        slices: Vec<SliceDesc>,
+    ) -> Self {
+        Self {
+            layout,
+            id,
+            backend,
+            prepared: true,
+            slices,
+        }
+    }
+
+    /// Consume the fetcher and return the cached slice list so callers
+    /// can reuse it for subsequent reads of the same chunk.
+    pub(crate) fn into_slices(self) -> Vec<SliceDesc> {
+        self.slices
+    }
+
     pub(crate) async fn prepare_slices(&mut self) -> Result<()> {
         let chunk_id = self.id;
         let backend = self.backend;

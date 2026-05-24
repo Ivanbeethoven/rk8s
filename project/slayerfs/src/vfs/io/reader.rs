@@ -493,6 +493,10 @@ pub(crate) struct FileReader<B, M> {
     sessions: ParkingMutex<[Session; READ_SESSIONS]>,
     backend: Arc<Backend<B, M>>,
     memory_budget: Option<MemoryBudget>,
+    /// Per-chunk slice metadata cache — avoids repeated meta.get_slices()
+    /// (Redis / InodeCache) queries for sequential reads within the same
+    /// 64 MiB chunk.  Invalidated when the writer commits new slices.
+    chunk_slices: DashMap<u64, Vec<crate::chunk::SliceDesc>>,
 }
 
 impl<B, M> FileReader<B, M>
@@ -513,6 +517,7 @@ where
             sessions: ParkingMutex::new([Session::default(); READ_SESSIONS]),
             backend,
             memory_budget,
+            chunk_slices: DashMap::new(),
         }
     }
 
@@ -958,9 +963,23 @@ where
         len: usize,
     ) -> anyhow::Result<Vec<u8>> {
         let chunk_id = chunk_id_for(self.inode.ino(), index)?;
+
+        // Prepare slice metadata: use per-handle cache on hit, fetch from
+        // meta (InodeCache → Redis) on first access.  Sequential reads within
+        // the same chunk hit the cache and skip the meta round-trip.
+        let slices = match self.chunk_slices.get(&chunk_id) {
+            Some(cached) => cached.clone(),
+            None => {
+                let mut fetcher = DataFetcher::new(self.config.layout, chunk_id, &self.backend);
+                fetcher.prepare_slices().await?;
+                let slices = fetcher.into_slices();
+                self.chunk_slices.insert(chunk_id, slices.clone());
+                slices
+            }
+        };
+
         let mut result = async {
-            let mut fetcher = DataFetcher::new(self.config.layout, chunk_id, &self.backend);
-            fetcher.prepare_slices().await?;
+            let mut fetcher = DataFetcher::with_slices(self.config.layout, chunk_id, &self.backend, slices.clone());
             fetcher.read_at(offset.into(), len).await
         }
         .await;
@@ -1050,6 +1069,14 @@ where
 
         let spans = split_chunk_spans(self.config.layout, offset, len);
 
+        // Invalidate per-handle chunk→slice metadata cache for affected chunks
+        // so subsequent reads re-fetch the updated slice list from meta.
+        for span in &spans {
+            if let Ok(chunk_id) = chunk_id_for(self.inode.ino(), span.index) {
+                self.chunk_slices.remove(&chunk_id);
+            }
+        }
+
         let mut span_map = HashMap::new();
         for span in spans {
             span_map.insert(span.index, (span.offset, span.len));
@@ -1109,6 +1136,7 @@ where
     }
 
     async fn invalidate_all(&self) {
+        self.chunk_slices.clear();
         let mut guard = self.slices.lock().await;
         for slice in guard.drain(..) {
             let mut state = slice.lock();
