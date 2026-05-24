@@ -134,7 +134,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Workers<FS> {
                     // Inline FUSE_READ — cache-hit reads take <1ms so the
                     // spawn overhead (~2µs per task::spawn) is measurable
                     // at 2000+ reads/sec.  Everything else spawns a task.
-                    if item.opcode == fuse_opcode::FUSE_READ {
+                    if item.opcode == fuse_opcode::FUSE_READ as u32 {
                         process_work_item(&ctx, idx, item).await;
                     } else {
                         task::spawn(async move {
