@@ -131,9 +131,16 @@ impl<FS: Filesystem + Send + Sync + 'static> Workers<FS> {
             let handle = task::spawn(async move {
                 while let Some(item) = rx.next().await {
                     let ctx = ctx_clone.clone();
-                    task::spawn(async move {
+                    // Inline FUSE_READ — cache-hit reads take <1ms so the
+                    // spawn overhead (~2µs per task::spawn) is measurable
+                    // at 2000+ reads/sec.  Everything else spawns a task.
+                    if item.opcode == fuse_opcode::FUSE_READ {
                         process_work_item(&ctx, idx, item).await;
-                    });
+                    } else {
+                        task::spawn(async move {
+                            process_work_item(&ctx, idx, item).await;
+                        });
+                    }
                 }
                 debug!(worker=%idx, "worker exit");
             });
