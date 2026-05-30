@@ -74,6 +74,8 @@ Rejected experiment:
 | VFS read-only open attr cache | `docker/compose-xfstests/artifacts/perf-run-1780171930-10210` | `dirperf` stayed 20s and `open` regressed to 2077.3 ops/s from 2103.9 ops/s, although `metaperf` wall time was 212s | Reverted; do not cache around close-to-open freshness until focused traces prove it pays for a real workload |
 | MetaClient complete-directory negative lookup fast path | `docker/compose-xfstests/artifacts/perf-run-1780177846-14181` | `dirperf` stayed 16s and `metaperf` regressed slightly to 206s, despite the commandstats test removing Redis `HGET` for complete-cache misses | Reverted; remaining gap is not explained by complete-directory negative lookup misses |
 | VFS lazy write-handle `FileWriter` allocation | `docker/compose-xfstests/artifacts/perf-run-1780179246-24852` | `dirperf` stayed 16s, but `metaperf` regressed to 209s; `open` improved to 2922.3 ops/s while `create`, `readdir`, and `rename` regressed | Reverted; avoiding writer allocation on empty write handles did not improve the accepted wall-time baseline |
+| FUSE unlink known-child helper | `docker/compose-xfstests/artifacts/perf-run-1780182725-32445` | `dirperf` stayed 15s and `metaperf` regressed to 204s; `rename` dropped to 922.0 ops/s from 949.6 ops/s | Reverted; removing local duplicate VFS lookup/stat in FUSE unlink did not improve the accepted baseline |
+| Redis create/unlink Lua array reply parser | `docker/compose-xfstests/artifacts/perf-run-1780183967-4848` | `dirperf` stayed 15s and `metaperf` regressed to 202s; `rename` dropped to 904.5 ops/s from 949.6 ops/s | Reverted; avoiding Lua `cjson.encode` plus Rust JSON parse for tiny create/unlink responses did not improve the accepted baseline |
 
 Focused comparison:
 
@@ -516,6 +518,23 @@ Rejected because wall time regressed from the accepted 205s metadata baseline an
 docker/compose-xfstests/artifacts/perf-run-1780180872-21146
 FUSE no-lock POSIX owner cleanup suppression: dirperf 15s, metaperf 201s.
 Accepted because it improved the accepted metadata baseline from dirperf 16s/metaperf 205s, with open rising to 5664.9 ops/s and rename rising to 949.6 ops/s while create/stat/readdir stayed in the same range.
+
+docker/compose-xfstests/artifacts/perf-run-1780181989-11184
+Current-code reduced dirperf FUSE latency split after no-lock cleanup:
+  unlink 1201 calls, avg 243.9 us, total 293.0 ms
+  create 1201 calls, avg 238.9 us, total 286.9 ms
+  lookup 1212 calls, avg 111.6 us, total 135.3 ms
+  flush 1203 calls, avg 17.1 us, total 20.6 ms
+  release 1159 calls, avg 16.1 us, total 18.7 ms
+This leaves create/unlink/lookup as the only visible high-frequency dirperf costs.
+
+docker/compose-xfstests/artifacts/perf-run-1780182725-32445
+FUSE unlink known-child helper: dirperf 15s, metaperf 204s.
+Rejected because it did not move dirperf closer to JuiceFS and regressed wall time from the accepted 201s metadata baseline.
+
+docker/compose-xfstests/artifacts/perf-run-1780183967-4848
+Redis create/unlink Lua array reply parser: dirperf 15s, metaperf 202s.
+Rejected because it did not move dirperf closer to JuiceFS and regressed wall time from the accepted 201s metadata baseline; rename also dropped from 949.6 ops/s to 904.5 ops/s.
 ```
 
 - [x] **Step 2: Collapse Redis unlink into one atomic operation**
@@ -690,6 +709,8 @@ The optimization is kept because RED/GREEN Redis commandstats proved it removes 
 - [ ] **Step 9: Consider remaining Redis single-EVAL equivalents**
 
 Apply the `unlink()` lesson narrowly: move only duplicated store-side round trips into existing atomic Redis scripts where the script already has the data, then verify with ignored Redis tests and focused `dirperf metaperf`.
+
+Rejected subtest: changing only `CREATE_ENTRY_LUA` and `UNLINK_LUA` to return Redis array replies instead of JSON strings passed targeted parser/Lua/VFS tests, but `perf-run-1780183967-4848` regressed `metaperf` and rename while leaving `dirperf` unchanged. Do not retry response-format-only rewrites without evidence that JSON parse/encode dominates CPU.
 
 Expected: improve create/open/rename or directory cleanup paths without reintroducing the reverted FUSE/VFS precheck-removal regression.
 
