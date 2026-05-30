@@ -150,6 +150,14 @@ where
         self.handles.get(&fh).map(|entry| Arc::clone(entry.value()))
     }
 
+    fn mark_write_dirty(&self, fh: u64) -> bool {
+        let Some(handle) = self.handles.get(&fh) else {
+            return false;
+        };
+        handle.mark_write_dirty();
+        true
+    }
+
     fn handles_for(&self, ino: i64) -> Vec<u64> {
         self.inode_handles
             .get(&ino)
@@ -826,6 +834,10 @@ where
 
     fn file_handle_required(&self, fh: u64) -> Result<Arc<FileHandle<S, M>>, VfsError> {
         self.file_handle(fh).ok_or(VfsError::StaleNetworkFileHandle)
+    }
+
+    pub(crate) fn mark_handle_write_dirty(&self, fh: u64) -> bool {
+        self.state.handles.mark_write_dirty(fh)
     }
 
     fn file_handles_for_inode(&self, ino: i64) -> Vec<Arc<FileHandle<S, M>>> {
@@ -2522,12 +2534,21 @@ where
         if handle.flags.write {
             let _handle_guard = handle.lock_write().await;
 
-            self.state
+            let had_write = handle.take_write_dirty();
+            let flushed_pending = self
+                .state
                 .writer
                 .flush_for_close(handle.ino as u64)
                 .await
                 .map_err(VfsError::from)?;
-            self.update_mtime_ctime(handle.ino).await?;
+            if had_write || flushed_pending {
+                if let Err(err) = self.update_mtime_ctime(handle.ino).await {
+                    if had_write {
+                        handle.mark_write_dirty();
+                    }
+                    return Err(err);
+                }
+            }
         }
 
         // Prevent us from TOC-TOU (time of check to time of use) error.
@@ -2575,14 +2596,23 @@ where
         let handle = self.file_handle_required(fh)?;
 
         tracing::info!(fh, ino = handle.ino, "vfs.flush_handle_start");
-        self.state
+        let had_write = handle.take_write_dirty();
+        let flushed_pending = self
+            .state
             .writer
             .flush_required(handle.ino as u64)
             .await
             .map_err(VfsError::from)?;
         tracing::trace!(fh, ino = handle.ino, "vfs.flush_handle_done");
 
-        self.update_timestamps_on_flush(handle.ino).await?;
+        if had_write || flushed_pending {
+            if let Err(err) = self.update_mtime_ctime(handle.ino).await {
+                if had_write {
+                    handle.mark_write_dirty();
+                }
+                return Err(err);
+            }
+        }
         Ok(handle.ino)
     }
 
@@ -2828,21 +2858,6 @@ where
         let inode = self.lookup_path_to_ino(&path).await?;
         self.meta_set_plock(inode, owner, block, lock_type, range, pid)
             .await
-    }
-
-    /// Update timestamps on flush/fsync for files that may have been modified via mmap.
-    /// This is necessary because the kernel doesn't call write() for mmap writes.
-    /// We only update if the file was opened for writing.
-    pub(crate) async fn update_timestamps_on_flush(&self, ino: i64) -> Result<(), VfsError> {
-        // Check if any handle for this inode was opened for writing
-        let has_write_handle = self.state.handles.has_write_handle(ino);
-
-        if has_write_handle {
-            // File was opened for writing, update mtime/ctime to handle potential mmap writes
-            self.update_mtime_ctime(ino).await?;
-        }
-
-        Ok(())
     }
 
     /// Get file system statistics (total/available space and inodes).

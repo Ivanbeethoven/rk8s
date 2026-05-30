@@ -2570,7 +2570,7 @@ where
 
     /// Like `flush_if_exists` but propagates errors.  Used in truncate paths
     /// where a failed flush means data would be silently lost.
-    pub(crate) async fn flush_required(&self, ino: u64) -> anyhow::Result<()> {
+    pub(crate) async fn flush_required(&self, ino: u64) -> anyhow::Result<bool> {
         let writer = self.files.get(&ino).map(|entry| entry.value().clone());
         if let Some(writer) = writer
             && writer.has_pending().await
@@ -2581,8 +2581,9 @@ where
             if ms > 100 {
                 tracing::info!(ino, elapsed_ms = ms, "flush_required: slow flush");
             }
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Truncate/ftruncate runs on the kernel SETATTR path.  A 300s writeback
@@ -2618,14 +2619,15 @@ where
     /// Flush for close: uses a shorter deadline because FUSE already called
     /// flush() before close() for write handles.  This only drains residual
     /// in-flight work that was already kicked off by the preceding flush.
-    pub(crate) async fn flush_for_close(&self, ino: u64) -> anyhow::Result<()> {
+    pub(crate) async fn flush_for_close(&self, ino: u64) -> anyhow::Result<bool> {
         let writer = self.files.get(&ino).map(|entry| entry.value().clone());
         if let Some(writer) = writer
             && writer.has_pending().await
         {
             writer.flush_with_deadline(CLOSE_FLUSH_DEADLINE).await?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     pub(crate) async fn clear(&self, ino: u64) {

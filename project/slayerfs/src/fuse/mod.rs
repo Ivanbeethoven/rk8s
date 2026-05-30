@@ -595,9 +595,14 @@ where
                 write_flags,
                 "fuse.write -> write_ino (cache)"
             );
-            self.write_cached_ino(ino as i64, offset, data, _req.unique)
+            let written = self
+                .write_cached_ino(ino as i64, offset, data, _req.unique)
                 .await
-                .map_err(Into::<Errno>::into)? as u32
+                .map_err(Into::<Errno>::into)?;
+            if fh != 0 && written > 0 {
+                self.mark_handle_write_dirty(fh);
+            }
+            written as u32
         } else if fh != 0 {
             debug!(
                 ino,

@@ -2395,6 +2395,91 @@ async fn test_vfs_deleted_inode_timestamp_setattr_stays_local() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn test_vfs_close_without_write_skips_timestamp_metadata_update() {
+    let store = Arc::new(new_test_store().await);
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+    client.initialize().await.unwrap();
+
+    let fs = VFS::with_meta_layer_with_default_background(
+        ChunkLayout::default(),
+        Arc::new(InMemoryBlockStore::new()),
+        client,
+    )
+    .unwrap();
+    let root = fs.root_ino();
+    let ino = fs
+        .create_file_at(root, "empty_close.txt", true)
+        .await
+        .unwrap();
+    let attr = fs.stat_ino(ino).await.unwrap();
+    let fh = fs
+        .open_with_cached_attr(ino, attr, false, true, false)
+        .await
+        .unwrap();
+
+    reset_redis_commandstats(&store).await;
+    fs.close(fh).await.unwrap();
+
+    assert_eq!(
+        redis_command_calls(&store, "set").await,
+        0,
+        "closing a write-opened handle with no writes should avoid timestamp metadata SET"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_vfs_flush_without_write_skips_timestamp_metadata_update() {
+    let store = Arc::new(new_test_store().await);
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+    client.initialize().await.unwrap();
+
+    let fs = VFS::with_meta_layer_with_default_background(
+        ChunkLayout::default(),
+        Arc::new(InMemoryBlockStore::new()),
+        client,
+    )
+    .unwrap();
+    let root = fs.root_ino();
+    let ino = fs
+        .create_file_at(root, "empty_flush.txt", true)
+        .await
+        .unwrap();
+    let attr = fs.stat_ino(ino).await.unwrap();
+    let fh = fs
+        .open_with_cached_attr(ino, attr, false, true, false)
+        .await
+        .unwrap();
+
+    reset_redis_commandstats(&store).await;
+    fs.flush(fh).await.unwrap();
+
+    assert_eq!(
+        redis_command_calls(&store, "set").await,
+        0,
+        "flushing a write-opened handle with no writes should avoid timestamp metadata SET"
+    );
+    fs.close(fh).await.unwrap();
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_symlink_lookup_path_flow() {
     let store = new_test_store().await;
     let root = store.root_ino();

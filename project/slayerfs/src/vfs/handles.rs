@@ -8,6 +8,7 @@ use crate::vfs::io::{FileReader, FileWriter};
 use anyhow::anyhow;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 fn current_time_secs() -> i64 {
@@ -16,7 +17,6 @@ fn current_time_secs() -> i64 {
         .unwrap_or_default()
         .as_secs() as i64
 }
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::pin;
 use tokio::sync::Notify;
@@ -193,6 +193,7 @@ where
     pub(crate) ino: i64,
     pub(crate) opened_at: Instant,
     pub(crate) flags: HandleFlags,
+    write_dirty: AtomicBool,
     gate: Arc<HandleGate>,
     state: StdMutex<FileHandleState<B, M>>,
 }
@@ -211,6 +212,7 @@ where
             ino,
             opened_at: Instant::now(),
             flags,
+            write_dirty: AtomicBool::new(false),
             gate: Arc::new(HandleGate::new()),
             state: StdMutex::new(FileHandleState {
                 attr,
@@ -298,6 +300,14 @@ where
         self.state.lock().unwrap().last_offset = offset;
     }
 
+    pub(crate) fn mark_write_dirty(&self) {
+        self.write_dirty.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn take_write_dirty(&self) -> bool {
+        self.write_dirty.swap(false, Ordering::AcqRel)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn last_offset(&self) -> u64 {
         self.state.lock().unwrap().last_offset
@@ -352,6 +362,9 @@ where
         };
         let written = writer.write_at(offset, data).await?;
         self.update_offset(offset + written as u64);
+        if written > 0 {
+            self.mark_write_dirty();
+        }
         Ok(written)
     }
 
