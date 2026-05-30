@@ -279,6 +279,7 @@ where
     writer: Arc<DataWriter<S, M>>,
     modified: ModifiedTracker,
     append_locks: DashMap<i64, Arc<Mutex<()>>>,
+    posix_lock_owners: DashMap<(i64, i64), ()>,
     pub(crate) stats: Arc<crate::vfs::stats::FsStats>,
 }
 
@@ -385,6 +386,7 @@ where
             writer,
             modified: ModifiedTracker::new(),
             append_locks: DashMap::new(),
+            posix_lock_owners: DashMap::new(),
             stats: Arc::new(crate::vfs::stats::FsStats::new()),
         }
     }
@@ -2784,6 +2786,24 @@ where
     ) -> Result<(), VfsError> {
         self.meta_set_plock(inode, owner, block, lock_type, range, pid)
             .await
+    }
+
+    pub(crate) fn remember_posix_lock_owner(
+        &self,
+        inode: i64,
+        owner: i64,
+        lock_type: FileLockType,
+    ) {
+        if lock_type != FileLockType::UnLock {
+            self.state.posix_lock_owners.insert((inode, owner), ());
+        }
+    }
+
+    pub(crate) fn take_posix_lock_owner(&self, inode: i64, owner: i64) -> bool {
+        self.state
+            .posix_lock_owners
+            .remove(&(inode, owner))
+            .is_some()
     }
 
     /// Set xattr for a given inode.

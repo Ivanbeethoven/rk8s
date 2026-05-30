@@ -181,6 +181,9 @@ where
     M: MetaLayer + Send + Sync + 'static,
 {
     async fn unlock_owner_locks(&self, ino: u64, lock_owner: u64) {
+        if !self.take_posix_lock_owner(ino as i64, lock_owner as i64) {
+            return;
+        }
         let _ = self
             .set_plock_ino(
                 ino as i64,
@@ -1811,7 +1814,10 @@ where
             .set_plock_ino(inode as i64, lock_owner as i64, block, fl_type, range, pid)
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.remember_posix_lock_owner(inode as i64, lock_owner as i64, fl_type);
+                Ok(())
+            }
             Err(e) => Err(Errno::from(e)),
         }
     }

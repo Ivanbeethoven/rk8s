@@ -157,6 +157,10 @@ async fn redis_command_calls(store: &RedisMetaStore, command: &str) -> u64 {
         .unwrap_or(0)
 }
 
+async fn redis_script_calls(store: &RedisMetaStore) -> u64 {
+    redis_command_calls(store, "eval").await + redis_command_calls(store, "evalsha").await
+}
+
 /// Create a new test store with pre-configured session ID
 async fn new_test_store_with_session(session_id: Uuid) -> RedisMetaStore {
     let store = new_test_store().await;
@@ -2474,6 +2478,136 @@ async fn test_vfs_flush_without_write_skips_timestamp_metadata_update() {
         0,
         "flushing a write-opened handle with no writes should avoid timestamp metadata SET"
     );
+    fs.close(fh).await.unwrap();
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_fuse_flush_without_posix_locks_skips_unlock_metadata() {
+    let store = Arc::new(new_test_store().await);
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+    client.initialize().await.unwrap();
+
+    let fs = VFS::with_meta_layer_with_default_background(
+        ChunkLayout::default(),
+        Arc::new(InMemoryBlockStore::new()),
+        client,
+    )
+    .unwrap();
+    let root = fs.root_ino();
+    let ino = fs
+        .create_file_at(root, "fuse_flush_no_lock.txt", true)
+        .await
+        .unwrap();
+    let fh = fs.open_fresh_ino(ino, false, true, false).await.unwrap();
+
+    reset_redis_commandstats(&store).await;
+    <VFS<InMemoryBlockStore, MetaClient<RedisMetaStore>> as rfuse3::raw::Filesystem>::flush(
+        &fs,
+        rfuse3::raw::Request {
+            unique: 1,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        },
+        ino as u64,
+        fh,
+        0xabc,
+    )
+    .await
+    .unwrap();
+
+    let script_calls = redis_script_calls(&store).await;
+    assert!(
+        script_calls <= 1,
+        "FUSE flush without any known POSIX locks should skip redundant Redis lock-cleanup scripts; observed {script_calls}"
+    );
+    fs.close(fh).await.unwrap();
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_fuse_flush_releases_known_posix_lock_owner() {
+    let store = Arc::new(new_test_store().await);
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+    client.initialize().await.unwrap();
+
+    let fs = VFS::with_meta_layer_with_default_background(
+        ChunkLayout::default(),
+        Arc::new(InMemoryBlockStore::new()),
+        client,
+    )
+    .unwrap();
+    let root = fs.root_ino();
+    let ino = fs
+        .create_file_at(root, "fuse_flush_lock.txt", true)
+        .await
+        .unwrap();
+    let fh = fs.open_fresh_ino(ino, true, true, false).await.unwrap();
+    let owner = 0_u64;
+    let range = FileLockRange { start: 0, end: 1 };
+    store
+        .set_plock(ino, owner as i64, false, FileLockType::Write, range, 1234)
+        .await
+        .unwrap();
+    fs.remember_posix_lock_owner(ino, owner as i64, FileLockType::Write);
+
+    let conflict = fs
+        .get_plock_ino(
+            ino,
+            &FileLockQuery {
+                owner: owner as i64,
+                lock_type: FileLockType::Write,
+                range,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(conflict.lock_type, FileLockType::Write);
+
+    <VFS<InMemoryBlockStore, MetaClient<RedisMetaStore>> as rfuse3::raw::Filesystem>::flush(
+        &fs,
+        rfuse3::raw::Request {
+            unique: 2,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        },
+        ino as u64,
+        fh,
+        owner,
+    )
+    .await
+    .unwrap();
+
+    let after_flush = fs
+        .get_plock_ino(
+            ino,
+            &FileLockQuery {
+                owner: owner as i64,
+                lock_type: FileLockType::Write,
+                range,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_flush.lock_type, FileLockType::UnLock);
     fs.close(fh).await.unwrap();
 }
 
