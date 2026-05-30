@@ -1113,6 +1113,30 @@ async fn test_create_entry_lua_already_exists() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn test_unlink_last_reference_updates_parent_and_deleted_child_atomically() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let ino = store
+        .create_file(root, "atomic_unlink.txt".to_string())
+        .await
+        .unwrap();
+
+    store.unlink(root, "atomic_unlink.txt").await.unwrap();
+
+    let parent = store.get_node(root).await.unwrap().unwrap();
+    let deleted = store.get_node(ino).await.unwrap().unwrap();
+    assert!(deleted.deleted);
+    assert_eq!(deleted.attr.nlink, 0);
+    assert_eq!(
+        parent.attr.mtime, deleted.attr.ctime,
+        "last unlink should update parent and deleted child with one atomic timestamp"
+    );
+    assert_eq!(parent.attr.ctime, deleted.attr.ctime);
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_create_entry_lua_parent_not_found() {
     let store = new_test_store().await;
 

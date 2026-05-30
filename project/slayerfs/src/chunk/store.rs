@@ -325,13 +325,11 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
         format!("chunks/{chunk_id}/{block_index}")
     }
 
-    async fn populate_write_cache_after_upload(&self, key: String, data: Vec<u8>) {
+    async fn populate_write_cache_after_upload(&self, key: String, data: Bytes) {
         // Make freshly uploaded data immediately visible in the hottest read
         // tier before returning to the caller. Disk persistence stays best-
         // effort so foreground uploads are not blocked by local cache I/O.
-        self.block_cache
-            .insert_hot(&key, bytes::Bytes::from(data.clone()))
-            .await;
+        self.block_cache.insert_hot(&key, data.clone()).await;
 
         // Persist to disk if a write permit is available. Skipping under
         // extreme I/O pressure avoids queuing hundreds of background tasks
@@ -453,12 +451,17 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         parts.extend(chunks);
 
         // Assemble full block (uncompressed) for cache population.
-        let full_block: Vec<u8> = parts.iter().flat_map(|b| b.iter().copied()).collect();
+        let full_block = Bytes::from(
+            parts
+                .iter()
+                .flat_map(|b| b.iter().copied())
+                .collect::<Vec<_>>(),
+        );
 
         // Compress for S3 upload if configured (Cow avoids copy when incompressible)
         let compressed = compress(&full_block, self.config.compression);
         let upload_bytes = match compressed {
-            std::borrow::Cow::Borrowed(_) => Bytes::from(full_block.clone()),
+            std::borrow::Cow::Borrowed(_) => full_block.clone(),
             std::borrow::Cow::Owned(v) => Bytes::from(v),
         };
         // Rate limit upload bandwidth
@@ -493,12 +496,17 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         parts.push(Bytes::copy_from_slice(data));
 
         // Assemble full block (uncompressed) for cache.
-        let full_block: Vec<u8> = parts.iter().flat_map(|b| b.iter().copied()).collect();
+        let full_block = Bytes::from(
+            parts
+                .iter()
+                .flat_map(|b| b.iter().copied())
+                .collect::<Vec<_>>(),
+        );
 
         // Compress for S3 upload (Cow avoids copy when incompressible)
         let compressed = compress(&full_block, self.config.compression);
         let upload_bytes = match compressed {
-            std::borrow::Cow::Borrowed(_) => Bytes::from(full_block.clone()),
+            std::borrow::Cow::Borrowed(_) => full_block.clone(),
             std::borrow::Cow::Owned(v) => Bytes::from(v),
         };
         // Rate limit upload bandwidth
@@ -1099,9 +1107,14 @@ mod tests {
             compression: Compression::Lz4,
             ..Default::default()
         };
+        let cache_dir = tempfile::tempdir()?;
         let store = ObjectBlockStore::new_with_configs_async(
             ObjectClient::new(backend.clone()),
-            ChunksCacheConfig::default(),
+            ChunksCacheConfig::with_budgets(
+                16 * 1024 * 1024,
+                16 * 1024 * 1024,
+                cache_dir.path().to_path_buf(),
+            ),
             config,
         )
         .await?;

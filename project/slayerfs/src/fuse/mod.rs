@@ -299,10 +299,20 @@ where
         gid: u32,
         mode: Option<u32>,
     ) -> Option<VfsFileAttr> {
+        let sanitized_mode = mode.map(sanitize_special_mode_bits);
+        if let Some(current) = self.stat_ino(ino).await {
+            let mode_matches = sanitized_mode
+                .map(|mode| current.mode & 0o777 == mode)
+                .unwrap_or(true);
+            if current.uid == uid && current.gid == gid && mode_matches {
+                return Some(current);
+            }
+        }
+
         let req = SetAttrRequest {
             uid: Some(uid),
             gid: Some(gid),
-            mode: mode.map(sanitize_special_mode_bits),
+            mode: sanitized_mode,
             ..Default::default()
         };
         if attr_request_is_empty(&req) {
@@ -1039,37 +1049,18 @@ where
             "fuse.mknod"
         );
         let name = name.to_string_lossy();
-
-        // Validate parent
-        let Some(pattr) = self.stat_ino(parent as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
-        if !matches!(pattr.kind, VfsFileType::Dir) {
-            return Err(libc::ENOTDIR.into());
-        }
-
-        // Check for conflicts
-        if let Some(_child) = self.child_of(parent as i64, name.as_ref()).await {
-            return Err(libc::EEXIST.into());
-        }
-
-        // Extract file type from mode
         let file_type = mode & libc::S_IFMT;
 
         let ino = match file_type {
             // Linux accepts mknod(path, 0, 0) as a regular file with mode 000.
-            0 | libc::S_IFREG => {
-                // Regular file
-                self.create_file_at(parent as i64, &name, false)
-                    .await
-                    .map_err(Errno::from)?
-            }
-            libc::S_IFDIR => {
-                // Directory
-                self.mkdir_at(parent as i64, &name)
-                    .await
-                    .map_err(Errno::from)?
-            }
+            0 | libc::S_IFREG => self
+                .create_file_at(parent as i64, &name, true)
+                .await
+                .map_err(Errno::from)?,
+            libc::S_IFDIR => self
+                .mkdir_at_new(parent as i64, &name)
+                .await
+                .map_err(Errno::from)?,
             libc::S_IFIFO | libc::S_IFSOCK | libc::S_IFCHR | libc::S_IFBLK => {
                 return Err(libc::ENOSYS.into());
             }
@@ -1112,19 +1103,8 @@ where
             "fuse.mkdir"
         );
         let name = name.to_string_lossy();
-        // Parent must be a directory
-        let Some(pattr) = self.stat_ino(parent as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
-        if !matches!(pattr.kind, VfsFileType::Dir) {
-            return Err(libc::ENOTDIR.into());
-        }
-        // Check for conflicts
-        if let Some(_child) = self.child_of(parent as i64, name.as_ref()).await {
-            return Err(libc::EEXIST.into());
-        }
         let _ino = self
-            .mkdir_at(parent as i64, &name)
+            .mkdir_at_new(parent as i64, &name)
             .await
             .map_err(Errno::from)?;
         // Strip setuid/setgid/sticky, then apply the caller's umask.
@@ -1161,14 +1141,8 @@ where
             "fuse.create"
         );
         let name = name.to_string_lossy();
-        // Validate parent
-        let Some(pattr) = self.stat_ino(parent as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
-        if !matches!(pattr.kind, VfsFileType::Dir) {
-            return Err(libc::ENOTDIR.into());
-        }
-        let ino = match self.create_file_at(parent as i64, &name, false).await {
+        let create_new = (flags & libc::O_EXCL as u32) != 0;
+        let ino = match self.create_file_at(parent as i64, &name, create_new).await {
             Ok(ino) => {
                 debug!(
                     ino,
@@ -1179,7 +1153,7 @@ where
                 );
                 ino
             }
-            Err(VfsError::AlreadyExists { .. }) => {
+            Err(VfsError::AlreadyExists { .. }) if !create_new => {
                 debug!(name = %name, "fuse.create EEXIST, falling back to lookup");
                 self.child_of(parent as i64, &name).await.ok_or_else(|| {
                     debug!(name = %name, "fuse.create fallback lookup also failed");
@@ -1204,7 +1178,7 @@ where
         let write = accmode != (libc::O_RDONLY as u32);
         let append = (flags & libc::O_APPEND as u32) != 0;
         let fh = self
-            .open(ino, vattr.clone(), read, write, append)
+            .open_with_cached_attr(ino, vattr.clone(), read, write, append)
             .await
             .map_err(Into::<Errno>::into)?;
         Ok(ReplyCreated {

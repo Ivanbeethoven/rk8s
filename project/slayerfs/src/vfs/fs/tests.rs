@@ -320,6 +320,14 @@ mod rename_tests {
 mod basic_tests {
     use super::*;
 
+    async fn new_basic_fs() -> VFS<InMemoryBlockStore, impl MetaLayer> {
+        let layout = ChunkLayout::default();
+        let store = InMemoryBlockStore::new();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        VFS::new(layout, store, meta_store).await.unwrap()
+    }
+
     #[tokio::test]
     async fn test_fs_unlink_rmdir_rename_truncate() {
         let layout = ChunkLayout::default();
@@ -356,6 +364,63 @@ mod basic_tests {
         // dir empty then rmdir
         fs.rmdir("/a/b").await.unwrap();
         assert!(!fs.exists("/a/b").await);
+    }
+
+    #[tokio::test]
+    async fn test_optimistic_create_fallback_preserves_existing_semantics() {
+        let fs = new_basic_fs().await;
+        let root = fs.root_ino();
+
+        let file_ino = fs.create_file_at(root, "file", false).await.unwrap();
+        assert_eq!(
+            fs.create_file_at(root, "file", false).await.unwrap(),
+            file_ino
+        );
+        assert!(matches!(
+            fs.create_file_at(root, "file", true).await,
+            Err(crate::vfs::error::VfsError::AlreadyExists { .. })
+        ));
+
+        let dir_ino = fs.mkdir_at(root, "dir").await.unwrap();
+        assert_eq!(fs.mkdir_at(root, "dir").await.unwrap(), dir_ino);
+        assert!(matches!(
+            fs.create_file_at(root, "dir", false).await,
+            Err(crate::vfs::error::VfsError::IsADirectory { .. })
+        ));
+        assert!(matches!(
+            fs.mkdir_at(root, "file").await,
+            Err(crate::vfs::error::VfsError::AlreadyExists { .. })
+        ));
+        assert!(matches!(
+            fs.create_file_at(file_ino, "child", false).await,
+            Err(crate::vfs::error::VfsError::NotADirectory { .. })
+        ));
+        assert!(matches!(
+            fs.mkdir_at(file_ino, "child").await,
+            Err(crate::vfs::error::VfsError::NotADirectory { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_mkdir_at_create_new_reports_existing_entries() {
+        let fs = new_basic_fs().await;
+        let root = fs.root_ino();
+
+        let file_ino = fs.create_file_at(root, "file", false).await.unwrap();
+        let _dir_ino = fs.mkdir_at(root, "dir").await.unwrap();
+
+        assert!(matches!(
+            fs.mkdir_at_new(root, "dir").await,
+            Err(crate::vfs::error::VfsError::AlreadyExists { .. })
+        ));
+        assert!(matches!(
+            fs.mkdir_at_new(root, "file").await,
+            Err(crate::vfs::error::VfsError::AlreadyExists { .. })
+        ));
+        assert!(matches!(
+            fs.mkdir_at_new(file_ino, "child").await,
+            Err(crate::vfs::error::VfsError::NotADirectory { .. })
+        ));
     }
 
     // Removed incomplete test: test_fs_truncate_prunes_chunks_and_zero_fills

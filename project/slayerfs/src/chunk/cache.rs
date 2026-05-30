@@ -20,6 +20,8 @@ use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{debug, error, info, trace, warn};
 
 static DISK_CACHE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const DISK_CACHE_READ_CONCURRENCY: usize = 16;
+const DISK_CACHE_WRITE_CONCURRENCY: usize = 16;
 
 /// Configuration for the intelligent dual-layer cache system.
 ///
@@ -259,8 +261,8 @@ impl DiskStorage {
             health: Arc::new(DiskHealth::new()),
             bytes_used: Arc::new(AtomicU64::new(initial_bytes)),
             max_bytes,
-            read_sem: Arc::new(Semaphore::new(16)),
-            write_sem: Arc::new(Semaphore::new(128)),
+            read_sem: Arc::new(Semaphore::new(DISK_CACHE_READ_CONCURRENCY)),
+            write_sem: Arc::new(Semaphore::new(DISK_CACHE_WRITE_CONCURRENCY)),
         })
     }
 
@@ -1721,10 +1723,22 @@ impl ChunksCache {
         // Bytes::clone() is an Arc bump — zero-copy.
         self.insert_hot(&key, data.clone()).await;
 
-        // Persist to disk so future cold starts / hot cache evictions
-        // avoid S3.  Try the non-blocking fast path first; if the write
-        // semaphore is saturated, block with a generous timeout so the
-        // disk cache is reliably populated under concurrent reads.
+        // Persist to disk so future cold starts / hot cache evictions avoid
+        // S3, but keep this genuinely opportunistic. If local cache I/O is
+        // saturated, skip the disk write instead of queuing more background
+        // work that can compete with foreground reads and writes.
+        if self.cold_cache.get(&key).await.is_some() {
+            return;
+        }
+
+        let Some(permit) = self.disk_storage.try_io_permit(&key) else {
+            tracing::debug!(
+                key = %key,
+                "disk cache insert skipped: write_sem saturated"
+            );
+            return;
+        };
+
         if !self.disk_insert_inflight.insert(key.clone()) {
             return;
         }
@@ -1733,7 +1747,6 @@ impl ChunksCache {
         let cold_cache = self.cold_cache.clone();
         let inflight = self.disk_insert_inflight.clone();
         let cached_key = key.clone();
-
         tokio::spawn(async move {
             // Ensure inflight is always cleared when this task exits.
             struct ClearInFlight {
@@ -1754,37 +1767,8 @@ impl ChunksCache {
                 return;
             }
 
-            // Fast path: try to grab a write permit without blocking.
-            let permit = if let Some(p) = disk_storage.try_io_permit(&cached_key) {
-                Some(p)
-            } else {
-                // Slow path: block up to 5 s for a permit.  Under sustained
-                // concurrent reads every write_sem slot may be occupied;
-                // waiting briefly ensures the disk cache is eventually
-                // populated instead of silently skipped.
-                match tokio::time::timeout(
-                    Duration::from_millis(500),
-                    disk_storage.write_sem.clone().acquire_owned(),
-                )
-                .await
-                {
-                    Ok(Ok(p)) => Some(p),
-                    _ => {
-                        tracing::debug!(
-                            key = %cached_key,
-                            "disk cache insert skipped: write_sem saturated"
-                        );
-                        return;
-                    }
-                }
-            };
-
             let res = disk_storage
-                .store_with_permit_health(
-                    &cached_key,
-                    data,
-                    permit.unwrap_or_else(|| unreachable!()),
-                )
+                .store_with_permit_health(&cached_key, data, permit)
                 .await;
 
             match res {
@@ -1837,11 +1821,11 @@ impl ChunksCache {
 
     /// Store data to disk cache, awaiting a write permit if necessary.
     /// Used by background write-cache population tasks.
-    pub async fn store_to_disk(&self, key: &str, data: Vec<u8>) -> anyhow::Result<()> {
+    pub async fn store_to_disk(&self, key: &str, data: bytes::Bytes) -> anyhow::Result<()> {
         let permit = self.disk_storage.write_sem.clone().acquire_owned().await?;
         if self
             .disk_storage
-            .store_with_permit_health(key, bytes::Bytes::from(data), permit)
+            .store_with_permit_health(key, data, permit)
             .await?
         {
             self.cold_cache.insert(key.to_owned(), ()).await;
@@ -1854,12 +1838,12 @@ impl ChunksCache {
     pub async fn store_to_disk_with_permit(
         &self,
         key: &str,
-        data: Vec<u8>,
+        data: bytes::Bytes,
         permit: OwnedSemaphorePermit,
     ) -> anyhow::Result<()> {
         if self
             .disk_storage
-            .store_with_permit_health(key, bytes::Bytes::from(data), permit)
+            .store_with_permit_health(key, data, permit)
             .await?
         {
             self.cold_cache.insert(key.to_owned(), ()).await;
@@ -2073,7 +2057,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrent_insert_opportunistic_dedup() {
+    async fn test_insert_opportunistic_persists_when_write_permit_available() {
+        let temp_dir = tempdir().unwrap();
+        let cache = ChunksCache::new_with_config(ChunksCacheConfig::with_budgets(
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            temp_dir.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+
+        let key = "available-opportunistic-key".to_string();
+        for _ in 0..16 {
+            cache
+                .insert_opportunistic(key.clone(), vec![7u8; 128 * 1024].into())
+                .await;
+        }
+
+        for _ in 0..50 {
+            if cache.disk_insert_inflight.is_empty() && cache.is_disk_cached(&key).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(cache.disk_insert_inflight.is_empty());
+        assert!(cache.is_disk_cached(&key).await);
+    }
+
+    #[tokio::test]
+    async fn test_insert_opportunistic_skips_disk_when_write_permits_saturated() {
         let temp_dir = tempdir().unwrap();
         let cache = ChunksCache::new_with_config(ChunksCacheConfig::with_budgets(
             16 * 1024 * 1024,
@@ -2084,42 +2097,59 @@ mod tests {
         .unwrap();
 
         let mut permits = Vec::new();
-        for _ in 0..128 {
-            permits.push(
-                cache
-                    .disk_storage
-                    .write_sem
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .unwrap(),
-            );
+        while let Ok(permit) = cache.disk_storage.write_sem.clone().try_acquire_owned() {
+            permits.push(permit);
         }
+        assert!(
+            !permits.is_empty(),
+            "test must saturate at least one disk cache write permit"
+        );
 
-        let key = "dedup-key".to_string();
-        for _ in 0..16 {
-            cache
-                .insert_opportunistic(key.clone(), vec![7u8; 128 * 1024].into())
-                .await;
-        }
+        let key = "saturated-opportunistic-key".to_string();
+        cache
+            .insert_opportunistic(key.clone(), vec![9u8; 128 * 1024].into())
+            .await;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            cache.disk_insert_inflight.len(),
-            1,
-            "only one disk insert should be in flight per key"
+        assert!(
+            cache.disk_insert_inflight.is_empty(),
+            "opportunistic disk cache writes should not queue behind saturated local I/O"
+        );
+        assert!(
+            !cache.is_disk_cached(&key).await,
+            "disk cache insert should be skipped while write permits are saturated"
+        );
+        assert!(
+            cache.get(&key).await.is_some(),
+            "hot cache insert should still happen before the opportunistic disk skip"
         );
 
         drop(permits);
-        for _ in 0..50 {
-            if cache.disk_insert_inflight.is_empty() && cache.is_disk_cached(&key).await {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+    }
 
-        assert!(cache.disk_insert_inflight.is_empty());
-        assert!(cache.is_disk_cached(&key).await);
+    #[tokio::test]
+    async fn test_store_to_disk_with_permit_accepts_bytes() {
+        let temp_dir = tempdir().unwrap();
+        let cache = ChunksCache::new_with_config(ChunksCacheConfig::with_budgets(
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            temp_dir.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+
+        let key = "bytes-store-key";
+        let data = bytes::Bytes::from_static(b"store bytes without vec roundtrip");
+        let permit = cache
+            .try_disk_store_permit(key)
+            .expect("disk cache write permit should be available");
+
+        cache
+            .store_to_disk_with_permit(key, data.clone(), permit)
+            .await
+            .unwrap();
+
+        assert_eq!(cache.get(&key.to_string()).await, Some(data));
     }
 
     #[test]

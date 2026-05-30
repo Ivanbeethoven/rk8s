@@ -527,28 +527,34 @@ const LINK_LUA: &str = r#"
 
 // Lua script for atomically decrementing nlink and updating link_parents
 const UNLINK_LUA: &str = r#"
-    local node_key = KEYS[1]
-    local lp_key = KEYS[2]
-    local dir_key = KEYS[3]
+    local dir_key = KEYS[1]
+    local parent_node_key = KEYS[2]
+    local deleted_set_key = KEYS[3]
     local parent_ino = ARGV[1]
     local name = ARGV[2]
     local timestamp = tonumber(ARGV[3])
-    local expected_ino = tonumber(ARGV[4])
+    local node_prefix = ARGV[4]
+    local link_parent_prefix = ARGV[5]
 
-    -- Validate dentry still points to expected inode
     local dentry_ino = redis.call('HGET', dir_key, name)
-    if not dentry_ino or tonumber(dentry_ino) ~= expected_ino then
-        return cjson.encode({ok=false, error="not_found"})
+    if not dentry_ino then
+        return cjson.encode({ok=false, error="not_found", ino=parent_ino})
     end
+    local child_ino = tonumber(dentry_ino)
+    local node_key = node_prefix .. dentry_ino
+    local lp_key = link_parent_prefix .. dentry_ino
 
     -- Validate node exists before making any mutations
     local node_json = redis.call('GET', node_key)
     if not node_json then
-        return cjson.encode({ok=false, error="node_not_found"})
+        return cjson.encode({ok=false, error="node_not_found", ino=child_ino})
     end
     local ok, node = pcall(cjson.decode, node_json)
     if not ok or not node or not node.attr then
         return cjson.encode({ok=false, error="corrupt_node"})
+    end
+    if node.kind == "Dir" then
+        return cjson.encode({ok=false, error="is_directory", ino=child_ino})
     end
 
     -- Remove from directory
@@ -581,11 +587,26 @@ const UNLINK_LUA: &str = r#"
         end
     end
 
+    local deleted = node.attr.nlink == 0
+    if deleted then
+        node.deleted = true
+        redis.call('HSET', deleted_set_key, tostring(node.ino), 1)
+    end
+
     -- Save node
     redis.call('SET', node_key, cjson.encode(node))
 
-    local deleted = node.attr.nlink == 0
-    return cjson.encode({ok=true, nlink=node.attr.nlink, deleted=deleted})
+    local parent_json = redis.call('GET', parent_node_key)
+    if parent_json then
+        local parent_ok, parent_node = pcall(cjson.decode, parent_json)
+        if parent_ok and parent_node and parent_node.attr and parent_node.kind == "Dir" then
+            parent_node.attr.mtime = timestamp
+            parent_node.attr.ctime = timestamp
+            redis.call('SET', parent_node_key, cjson.encode(parent_node))
+        end
+    end
+
+    return cjson.encode({ok=true, ino=child_ino})
 "#;
 
 // Lua script for atomically removing directory entry and updating parent nlink
@@ -1135,10 +1156,6 @@ struct LuaResponse {
     #[allow(dead_code)]
     #[serde(default)]
     updated: Option<bool>,
-    #[serde(default)]
-    nlink: Option<u32>,
-    #[serde(default)]
-    deleted: Option<bool>,
     #[allow(dead_code)]
     #[serde(default)]
     count: Option<usize>,
@@ -1636,7 +1653,7 @@ impl RedisMetaStore {
         kind: FileType,
     ) -> Result<i64, MetaError> {
         // Step 1: Get parent node for setgid check
-        let parent_node = self
+        let mut parent_node = self
             .get_node(parent)
             .await?
             .ok_or(MetaError::ParentNotFound(parent))?;
@@ -1703,7 +1720,41 @@ impl RedisMetaStore {
                 let new_ino = response
                     .ino
                     .ok_or_else(|| MetaError::Internal("missing ino in response".into()))?;
-                self.invalidate_nodes(&[parent, new_ino]).await;
+
+                let final_gid = if parent_has_setgid == 1 {
+                    parent_gid
+                } else {
+                    0
+                };
+                let nlink = if kind == FileType::Dir { 2 } else { 1 };
+                let node_kind = NodeKind::from(kind);
+                let new_node = StoredNode {
+                    ino: new_ino,
+                    parent,
+                    name,
+                    kind: node_kind,
+                    attr: StoredAttr {
+                        size: 0,
+                        mode: default_mode,
+                        uid: 0,
+                        gid: final_gid,
+                        atime: now,
+                        mtime: now,
+                        ctime: now,
+                        nlink,
+                    },
+                    symlink_target: None,
+                    deleted: false,
+                };
+
+                if kind == FileType::Dir {
+                    parent_node.attr.nlink = parent_node.attr.nlink.saturating_add(1);
+                }
+                parent_node.attr.mtime = now;
+                parent_node.attr.ctime = now;
+
+                self.node_cache.insert(parent, Some(parent_node)).await;
+                self.node_cache.insert(new_ino, Some(new_node)).await;
                 Ok(new_ino)
             }
             None => Err(MetaError::Internal("unexpected Lua response".into())),
@@ -1713,18 +1764,6 @@ impl RedisMetaStore {
         let mut conn = self.conn.clone();
         let redis_key = Self::counter_key(key)?;
         conn.incr(redis_key, 1).await.map_err(redis_err)
-    }
-
-    async fn mark_deleted(&self, ino: i64, node: &mut StoredNode) -> Result<(), MetaError> {
-        let mut conn = self.conn.clone();
-        node.deleted = true;
-        node.attr.nlink = 0;
-        node.attr.ctime = current_time();
-        self.save_node(node).await?;
-        let field = ino.to_string();
-        conn.hset(self.deleted_set_key(), field, 1)
-            .await
-            .map_err(redis_err)
     }
 
     fn plock_key(&self, inode: i64) -> String {
@@ -2249,34 +2288,21 @@ impl MetaStore for RedisMetaStore {
 
     #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn unlink(&self, parent: i64, name: &str) -> Result<(), MetaError> {
-        let Some(child) = self.lookup(parent, name).await? else {
-            return Err(MetaError::NotFound(parent));
-        };
-
-        let node = self
-            .get_node(child)
-            .await?
-            .ok_or(MetaError::NotFound(child))?;
-        if !matches!(node.kind, NodeKind::File | NodeKind::Symlink) {
-            return Err(MetaError::NotSupported(format!(
-                "{child} is not unlinkable"
-            )));
-        }
-
-        let node_key = self.node_key(child);
-        let lp_key = Self::link_parent_key(child);
         let dir_key = self.dir_key(parent);
+        let parent_node_key = self.node_key(parent);
+        let deleted_set_key = self.deleted_set_key();
         let now = current_time();
 
         let script = redis::Script::new(UNLINK_LUA);
         let result: String = script
-            .key(&node_key)
-            .key(&lp_key)
             .key(&dir_key)
+            .key(&parent_node_key)
+            .key(deleted_set_key)
             .arg(parent)
             .arg(name)
             .arg(now)
-            .arg(child)
+            .arg(NODE_KEY_PREFIX)
+            .arg(LINK_PARENT_KEY_PREFIX)
             .invoke_async(&mut self.conn.clone())
             .await
             .map_err(redis_err)?;
@@ -2286,47 +2312,18 @@ impl MetaStore for RedisMetaStore {
 
         match response.error.as_deref() {
             Some("not_found") => Err(MetaError::NotFound(parent)),
-            Some("node_not_found") => Err(MetaError::NotFound(child)),
+            Some("node_not_found") => Err(MetaError::NotFound(response.ino.unwrap_or(parent))),
+            Some("is_directory") => Err(MetaError::NotSupported(format!(
+                "{} is not unlinkable",
+                response.ino.unwrap_or(parent)
+            ))),
             Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
             Some(other) => Err(MetaError::Internal(format!("Lua error: {other}"))),
             None if response.ok => {
-                let nlink = response.nlink.unwrap_or(0);
-                let deleted = response.deleted.unwrap_or(false);
-
-                if deleted {
-                    let mut node_mut = self
-                        .get_node(child)
-                        .await?
-                        .ok_or(MetaError::NotFound(child))?;
-                    self.mark_deleted(child, &mut node_mut).await?;
-                } else if nlink <= 1 {
-                    let mut link_parents = self.load_link_parents(child).await?;
-                    link_parents.retain(|(p, n)| !(*p == parent && n.as_str() == name));
-
-                    if let Some(remaining) = link_parents.into_iter().next() {
-                        let mut node_mut = node;
-                        node_mut.parent = remaining.0;
-                        node_mut.name = remaining.1;
-                        node_mut.attr.nlink = nlink;
-                        node_mut.attr.ctime = now;
-
-                        let key = Self::link_parent_key(child);
-                        let data = serde_json::to_vec(&node_mut)
-                            .map_err(|e| MetaError::Internal(e.to_string()))?;
-
-                        let mut conn = self.conn.clone();
-                        let _: () = redis::pipe()
-                            .atomic()
-                            .del(key)
-                            .set(self.node_key(node_mut.ino), data)
-                            .query_async(&mut conn)
-                            .await
-                            .map_err(redis_err)?;
-                    }
-                }
-
+                let child = response
+                    .ino
+                    .ok_or_else(|| MetaError::Internal("missing ino in unlink response".into()))?;
                 self.invalidate_nodes(&[parent, child]).await;
-                self.bump_dir_times(parent, now).await?;
                 Ok(())
             }
             None => Err(MetaError::Internal("unexpected Lua response".into())),

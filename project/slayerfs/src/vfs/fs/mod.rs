@@ -1124,35 +1124,63 @@ where
 
     /// Create a directory using a parent inode and entry name directly.
     #[tracing::instrument(level = "debug", skip(self), fields(parent_ino, name))]
-    pub(crate) async fn mkdir_at(&self, parent_ino: i64, name: &str) -> Result<i64, VfsError> {
+    async fn mkdir_at_inner(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        existing_dir_ok: bool,
+    ) -> Result<i64, VfsError> {
         if name.is_empty() || name.contains('/') || name.contains('\0') {
             return Err(VfsError::InvalidFilename);
         }
 
-        let parent_attr = self
-            .meta_stat_required(parent_ino, PathHint::none())
-            .await?;
-        if parent_attr.kind != FileType::Dir {
-            return Err(VfsError::NotADirectory {
-                path: PathHint::none(),
-            });
-        }
+        match self.meta_mkdir(parent_ino, name.to_string()).await {
+            Ok(ino) => {
+                self.state.modified.touch(parent_ino).await;
+                self.state.modified.touch(ino).await;
+                Ok(ino)
+            }
+            Err(VfsError::AlreadyExists { .. }) => {
+                if !existing_dir_ok {
+                    return Err(VfsError::AlreadyExists {
+                        path: PathHint::none(),
+                    });
+                }
 
-        if let Some(existing) = self.meta_lookup(parent_ino, name).await? {
-            let attr = self.meta_stat_required(existing, PathHint::none()).await?;
-            return if attr.kind == FileType::Dir {
-                Ok(existing)
-            } else {
-                Err(VfsError::AlreadyExists {
-                    path: PathHint::none(),
-                })
-            };
+                let Some(existing) = self.meta_lookup(parent_ino, name).await? else {
+                    return Err(VfsError::AlreadyExists {
+                        path: PathHint::none(),
+                    });
+                };
+                let attr = self.meta_stat_required(existing, PathHint::none()).await?;
+                if attr.kind == FileType::Dir {
+                    Ok(existing)
+                } else {
+                    Err(VfsError::AlreadyExists {
+                        path: PathHint::none(),
+                    })
+                }
+            }
+            Err(VfsError::NotFound { path }) => {
+                if let Some(parent_attr) = self.meta_stat(parent_ino).await?
+                    && parent_attr.kind != FileType::Dir
+                {
+                    return Err(VfsError::NotADirectory {
+                        path: PathHint::none(),
+                    });
+                }
+                Err(VfsError::NotFound { path })
+            }
+            Err(err) => Err(err),
         }
+    }
 
-        let ino = self.meta_mkdir(parent_ino, name.to_string()).await?;
-        self.state.modified.touch(parent_ino).await;
-        self.state.modified.touch(ino).await;
-        Ok(ino)
+    pub(crate) async fn mkdir_at(&self, parent_ino: i64, name: &str) -> Result<i64, VfsError> {
+        self.mkdir_at_inner(parent_ino, name, true).await
+    }
+
+    pub(crate) async fn mkdir_at_new(&self, parent_ino: i64, name: &str) -> Result<i64, VfsError> {
+        self.mkdir_at_inner(parent_ino, name, false).await
     }
 
     /// Create or open a regular file using a parent inode and entry name directly.
@@ -1167,34 +1195,44 @@ where
             return Err(VfsError::InvalidFilename);
         }
 
-        let parent_attr = self
-            .meta_stat_required(parent_ino, PathHint::none())
-            .await?;
-        if parent_attr.kind != FileType::Dir {
-            return Err(VfsError::NotADirectory {
-                path: PathHint::none(),
-            });
-        }
-
-        if let Some(existing) = self.meta_lookup(parent_ino, name).await? {
-            let attr = self.meta_stat_required(existing, PathHint::none()).await?;
-            if attr.kind == FileType::Dir {
-                return Err(VfsError::IsADirectory {
-                    path: PathHint::none(),
-                });
+        match self.meta_create_file(parent_ino, name.to_string()).await {
+            Ok(ino) => {
+                self.state.modified.touch(parent_ino).await;
+                self.state.modified.touch(ino).await;
+                Ok(ino)
             }
-            if create_new {
-                return Err(VfsError::AlreadyExists {
-                    path: PathHint::none(),
-                });
+            Err(VfsError::AlreadyExists { .. }) => {
+                if create_new {
+                    return Err(VfsError::AlreadyExists {
+                        path: PathHint::none(),
+                    });
+                }
+                let existing = self.meta_lookup(parent_ino, name).await?.ok_or_else(|| {
+                    VfsError::AlreadyExists {
+                        path: PathHint::none(),
+                    }
+                })?;
+                let attr = self.meta_stat_required(existing, PathHint::none()).await?;
+                if attr.kind == FileType::Dir {
+                    Err(VfsError::IsADirectory {
+                        path: PathHint::none(),
+                    })
+                } else {
+                    Ok(existing)
+                }
             }
-            return Ok(existing);
+            Err(VfsError::NotFound { path }) => {
+                if let Some(parent_attr) = self.meta_stat(parent_ino).await?
+                    && parent_attr.kind != FileType::Dir
+                {
+                    return Err(VfsError::NotADirectory {
+                        path: PathHint::none(),
+                    });
+                }
+                Err(VfsError::NotFound { path })
+            }
+            Err(err) => Err(err),
         }
-
-        let ino = self.meta_create_file(parent_ino, name.to_string()).await?;
-        self.state.modified.touch(parent_ino).await;
-        self.state.modified.touch(ino).await;
-        Ok(ino)
     }
 
     /// Create a symbolic link using a parent inode and entry name directly.
@@ -2298,17 +2336,44 @@ where
         write: bool,
         append: bool,
     ) -> Result<u64, VfsError> {
+        self.open_with_attr_refresh(ino, attr, read, write, append, true)
+            .await
+    }
+
+    pub(crate) async fn open_with_cached_attr(
+        &self,
+        ino: i64,
+        attr: FileAttr,
+        read: bool,
+        write: bool,
+        append: bool,
+    ) -> Result<u64, VfsError> {
+        self.open_with_attr_refresh(ino, attr, read, write, append, false)
+            .await
+    }
+
+    async fn open_with_attr_refresh(
+        &self,
+        ino: i64,
+        attr: FileAttr,
+        read: bool,
+        write: bool,
+        append: bool,
+        refresh_attr: bool,
+    ) -> Result<u64, VfsError> {
         let mut latest_attr = attr;
 
         // Retrieve the latest attr for close-to-open semantics.
-        match self.meta_stat_fresh(ino).await {
-            Ok(Some(fresh)) => {
-                latest_attr = fresh;
-            }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!("open: stat_fresh failed for ino {}: {}", ino, err);
-                return Err(VfsError::StaleNetworkFileHandle);
+        if refresh_attr {
+            match self.meta_stat_fresh(ino).await {
+                Ok(Some(fresh)) => {
+                    latest_attr = fresh;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!("open: stat_fresh failed for ino {}: {}", ino, err);
+                    return Err(VfsError::StaleNetworkFileHandle);
+                }
             }
         }
 
