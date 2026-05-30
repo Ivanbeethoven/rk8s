@@ -2000,9 +2000,8 @@ where
 
         let handle = self.file_handle_required(fh)?;
         // With writeback cache enabled, the kernel may issue reads on O_WRONLY
-        // handles to fill partial pages before writing them back.  The handle
-        // always has a reader attached (opened for all write handles), so we
-        // only reject reads when neither read nor write flags are set.
+        // handles to fill partial pages before writing them back, so we only
+        // reject reads when neither read nor write flags are set.
         if !handle.flags.read && !handle.flags.write {
             return Err(VfsError::PermissionDenied {
                 path: PathHint::none(),
@@ -2042,6 +2041,8 @@ where
         // subsequent read will see the correct data, so this is an acceptable
         // trade-off versus the 35+ ms read latency incurred by the
         // synchronous flush.
+        let inode = self.ensure_inode_registered(handle.ino).await?;
+        handle.ensure_reader_with(|| self.state.reader.open_for_handle(inode, fh));
         let mut data = handle.read(offset, len).await.map_err(VfsError::from)?;
         self.state
             .writer
@@ -2421,9 +2422,6 @@ where
             self.state
                 .handles
                 .allocate(ino, latest_attr, HandleFlags::new(read, write, append));
-
-        let reader = self.state.reader.open_for_handle(inode.clone(), handle.fh);
-        handle.reader(reader);
         if write {
             let writer = self.state.writer.ensure_file(inode.clone());
             handle.writer(writer);

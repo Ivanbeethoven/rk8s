@@ -1,11 +1,13 @@
-use crate::meta::MetaStore;
+use crate::meta::client::MetaClient;
 use crate::meta::config::Config;
 use crate::meta::config::{
-    CacheConfig, ClientOptions, CompactConfig, DatabaseConfig, DatabaseType,
+    CacheCapacity, CacheConfig, CacheTtl, ClientOptions, CompactConfig, DatabaseConfig,
+    DatabaseType,
 };
 use crate::meta::file_lock::{FileLockQuery, FileLockRange, FileLockType};
 use crate::meta::store::{LockName, MetaError, SetAttrFlags, SetAttrRequest};
 use crate::meta::stores::RedisMetaStore;
+use crate::meta::{MetaLayer, MetaStore};
 use redis::AsyncCommands;
 use serial_test::serial;
 use std::sync::Arc;
@@ -2234,6 +2236,68 @@ async fn test_create_entry_uses_lua_parent_lookup_without_rust_prelookup() {
         "create_file should let Lua fetch the parent once; observed {get_calls} Redis GET calls"
     );
     assert_eq!(store.lookup(root, "hot.txt").await.unwrap(), Some(ino));
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_meta_client_create_file_avoids_parent_stat_after_lua_create() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+
+    store.node_cache.invalidate(&root).await;
+    reset_redis_commandstats(&store).await;
+
+    let ino = client
+        .create_file(root, "client_hot.txt".to_string())
+        .await
+        .unwrap();
+
+    let get_calls = redis_command_calls(&store, "get").await;
+    assert!(
+        get_calls <= 1,
+        "MetaClient create_file should not stat the parent after Lua already loaded it; observed {get_calls} Redis GET calls"
+    );
+    assert_eq!(
+        client.lookup(root, "client_hot.txt").await.unwrap(),
+        Some(ino)
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_meta_client_mkdir_avoids_parent_stat_after_lua_create() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+
+    store.node_cache.invalidate(&root).await;
+    reset_redis_commandstats(&store).await;
+
+    let ino = client.mkdir(root, "client_dir".to_string()).await.unwrap();
+
+    let get_calls = redis_command_calls(&store, "get").await;
+    assert!(
+        get_calls <= 1,
+        "MetaClient mkdir should not stat the parent after Lua already loaded it; observed {get_calls} Redis GET calls"
+    );
+    assert_eq!(client.lookup(root, "client_dir").await.unwrap(), Some(ino));
 }
 
 #[serial]

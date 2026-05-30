@@ -446,6 +446,44 @@ mod basic_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn test_open_defers_reader_until_first_read() {
+        let fs = new_basic_fs().await;
+        let root = fs.root_ino();
+        let data = b"lazy-reader-open";
+
+        let file_ino = fs.create_file_at(root, "lazy", false).await.unwrap();
+        let write_fh = fs
+            .open_fresh_ino(file_ino, false, true, false)
+            .await
+            .unwrap();
+        fs.write(write_fh, 0, data).await.unwrap();
+        fs.close(write_fh).await.unwrap();
+
+        let read_fh = fs
+            .open_fresh_ino(file_ino, true, false, false)
+            .await
+            .unwrap();
+        assert!(
+            fs.state
+                .reader
+                .reader_for_handle(file_ino as u64, read_fh)
+                .is_none(),
+            "open should not allocate a FileReader before the handle reads data"
+        );
+
+        let out = fs.read(read_fh, 0, data.len()).await.unwrap();
+        assert_eq!(out, data);
+        assert!(
+            fs.state
+                .reader
+                .reader_for_handle(file_ino as u64, read_fh)
+                .is_some(),
+            "first committed read should lazily attach the FileReader"
+        );
+        fs.close(read_fh).await.unwrap();
+    }
+
     // Removed incomplete test: test_fs_truncate_prunes_chunks_and_zero_fills
     // TODO: Implement proper truncate testing when chunk pruning is fully implemented
 

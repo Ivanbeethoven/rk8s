@@ -1178,11 +1178,21 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn stat_fresh(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
         let inode = self.check_root(ino);
-        self.inode_cache.invalidate_inode(inode).await;
 
         let attr = self.store.stat(inode).await?;
-        if let Some(ref a) = attr {
-            self.inode_cache.insert_node(inode, a.clone(), None).await;
+        match &attr {
+            Some(a) => {
+                if !self
+                    .inode_cache
+                    .refresh_cached_node_for_fresh_stat(inode, a.clone())
+                    .await
+                {
+                    self.inode_cache.insert_node(inode, a.clone(), None).await;
+                }
+            }
+            None => {
+                self.inode_cache.invalidate_inode(inode).await;
+            }
         }
         Ok(attr)
     }
@@ -1319,11 +1329,6 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
 
         debug!("MetaClient: mkdir created inode {}, updating cache", ino);
 
-        // Ensure parent node is in cache
-        self.inode_cache
-            .ensure_node_in_cache(parent, &self.store, None)
-            .await?;
-
         // Cache the new directory node
         if let Ok(Some(attr)) = self.store.stat(ino).await {
             self.inode_cache.insert_node(ino, attr, Some(parent)).await;
@@ -1376,11 +1381,6 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
             "MetaClient: create_file created inode {}, updating cache",
             ino
         );
-
-        // Ensure parent node is in cache
-        self.inode_cache
-            .ensure_node_in_cache(parent, &self.store, None)
-            .await?;
 
         if let Ok(Some(attr)) = self.store.stat(ino).await {
             let cache_parent = (attr.nlink <= 1).then_some(parent);
@@ -2293,6 +2293,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(test_slices, from_cached);
+    }
+
+    #[tokio::test]
+    async fn test_stat_fresh_refreshes_cached_file_entry_in_place() {
+        let client = create_test_client().await;
+
+        let ino = client
+            .create_file(1, "fresh.txt".to_string())
+            .await
+            .unwrap();
+        let attr = client.stat(ino).await.unwrap().unwrap();
+        let cached_before = client.inode_cache.get_node(ino).await.unwrap();
+
+        let chunk_id = chunk_id_for(ino, 1).unwrap();
+        let (slice_ino, chunk_index) = extract_ino_and_chunk_index(chunk_id);
+        assert_eq!(slice_ino, ino);
+        let cached_slices = [SliceDesc {
+            slice_id: 1,
+            chunk_id,
+            offset: 0,
+            length: 128,
+        }];
+        client
+            .inode_cache
+            .cache_slices_if_absent(ino, chunk_index, &cached_slices)
+            .await;
+        assert!(
+            client
+                .inode_cache
+                .get_slices(ino, chunk_index)
+                .await
+                .is_some()
+        );
+
+        client
+            .store
+            .set_file_size(ino, attr.size + 4096)
+            .await
+            .unwrap();
+
+        let fresh = client.stat_fresh(ino).await.unwrap().unwrap();
+        let cached_after = client.inode_cache.get_node(ino).await.unwrap();
+
+        assert_eq!(fresh.size, attr.size + 4096);
+        assert!(
+            Arc::ptr_eq(&cached_before, &cached_after),
+            "fresh stat should update cached file metadata without reallocating the inode entry"
+        );
+        assert!(
+            client
+                .inode_cache
+                .get_slices(ino, chunk_index)
+                .await
+                .is_none(),
+            "fresh stat must drop potentially stale cached slice metadata"
+        );
     }
 
     #[tokio::test]

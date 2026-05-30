@@ -227,6 +227,16 @@ where
         guard.reader = Some(reader);
     }
 
+    pub(crate) fn ensure_reader_with<F>(&self, make_reader: F)
+    where
+        F: FnOnce() -> Arc<FileReader<B, M>>,
+    {
+        let mut guard = self.state.lock().unwrap();
+        if guard.reader.is_none() {
+            guard.reader = Some(make_reader());
+        }
+    }
+
     pub(crate) fn writer(&self, writer: Arc<FileWriter<B, M>>) {
         let mut guard = self.state.lock().unwrap();
         guard.writer = Some(writer);

@@ -138,6 +138,23 @@ impl InodeCache {
         }
     }
 
+    pub(crate) async fn refresh_cached_node_for_fresh_stat(
+        &self,
+        ino: i64,
+        attr: FileAttr,
+    ) -> bool {
+        let Some(node) = self.ttl_manager.get(&ino).await else {
+            return false;
+        };
+
+        *node.attr.write().await = attr;
+        *node.parent.write().await = None;
+        *node.children.write().await = ChildrenState::NotLoaded;
+        node.children_generation.fetch_add(1, Ordering::AcqRel);
+        node.slices.clear();
+        true
+    }
+
     pub(crate) async fn invalidate_inode(&self, ino: i64) {
         self.ttl_manager.invalidate(&ino).await;
         self.entries.remove(&ino);
