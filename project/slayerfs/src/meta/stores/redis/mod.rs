@@ -688,8 +688,6 @@ const CREATE_ENTRY_LUA: &str = r#"
     local default_mode = tonumber(ARGV[5])
     local uid = tonumber(ARGV[6])
     local gid = tonumber(ARGV[7])
-    local parent_gid = tonumber(ARGV[8])
-    local parent_has_setgid = tonumber(ARGV[9])
 
     -- Get parent node
     local parent_json = redis.call('GET', parent_node_key)
@@ -719,8 +717,8 @@ const CREATE_ENTRY_LUA: &str = r#"
 
     local final_gid = gid
     local final_mode = default_mode
-    if parent_has_setgid == 1 then
-        final_gid = parent_gid
+    if bit.band(parent_node.attr.mode, 1024) ~= 0 then
+        final_gid = parent_node.attr.gid
     end
 
     -- Determine nlink based on kind
@@ -764,7 +762,7 @@ const CREATE_ENTRY_LUA: &str = r#"
     parent_node.attr.ctime = timestamp
     redis.call('SET', parent_node_key, cjson.encode(parent_node))
 
-    return cjson.encode({ok=true, ino=new_ino})
+    return cjson.encode({ok=true, ino=new_ino, gid=final_gid})
 "#;
 
 // Lua script for atomically renaming file or directory with POSIX overwrite semantics.
@@ -1171,6 +1169,8 @@ struct LuaResponse {
     count: Option<usize>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    gid: Option<u32>,
     #[serde(default)]
     attr: Option<serde_json::Value>,
     #[serde(default)]
@@ -1664,21 +1664,10 @@ impl RedisMetaStore {
         name: String,
         kind: FileType,
     ) -> Result<i64, MetaError> {
-        // Step 1: Get parent node for setgid check
-        let mut parent_node = self
-            .get_node(parent)
-            .await?
-            .ok_or(MetaError::ParentNotFound(parent))?;
-        if parent_node.kind != NodeKind::Dir {
-            return Err(MetaError::NotDirectory(parent));
-        }
-
-        // Step 2: Construct Redis keys
         let parent_dir_key = self.dir_key(parent);
         let parent_node_key = self.node_key(parent);
         let counter_key = COUNTER_INODE_KEY;
 
-        // Step 3: Prepare ARGV parameters
         let kind_str = match kind {
             FileType::File => "File",
             FileType::Dir => "Dir",
@@ -1692,14 +1681,7 @@ impl RedisMetaStore {
             0o100644
         };
         let now = current_time();
-        let parent_gid = parent_node.attr.gid;
-        let parent_has_setgid = if (parent_node.attr.mode & 0o2000) != 0 {
-            1
-        } else {
-            0
-        };
 
-        // Step 4: Invoke Lua script atomically
         let script = redis::Script::new(CREATE_ENTRY_LUA);
         let result: String = script
             .key(&parent_dir_key) // KEYS[1]
@@ -1712,13 +1694,10 @@ impl RedisMetaStore {
             .arg(default_mode) // ARGV[5]
             .arg(0u32) // ARGV[6] - uid (default 0)
             .arg(0u32) // ARGV[7] - gid (default 0)
-            .arg(parent_gid) // ARGV[8]
-            .arg(parent_has_setgid) // ARGV[9]
             .invoke_async(&mut self.conn.clone())
             .await
             .map_err(redis_err)?;
 
-        // Step 5: Parse response and map errors
         let response: LuaResponse = serde_json::from_str(&result)
             .map_err(|e| MetaError::Internal(format!("Lua response parse error: {e}")))?;
 
@@ -1732,12 +1711,10 @@ impl RedisMetaStore {
                 let new_ino = response
                     .ino
                     .ok_or_else(|| MetaError::Internal("missing ino in response".into()))?;
+                let final_gid = response
+                    .gid
+                    .ok_or_else(|| MetaError::Internal("missing gid in create response".into()))?;
 
-                let final_gid = if parent_has_setgid == 1 {
-                    parent_gid
-                } else {
-                    0
-                };
                 let nlink = if kind == FileType::Dir { 2 } else { 1 };
                 let node_kind = NodeKind::from(kind);
                 let new_node = StoredNode {
@@ -1759,13 +1736,14 @@ impl RedisMetaStore {
                     deleted: false,
                 };
 
-                if kind == FileType::Dir {
-                    parent_node.attr.nlink = parent_node.attr.nlink.saturating_add(1);
+                if let Some(Some(mut parent_node)) = self.node_cache.get(&parent).await {
+                    if kind == FileType::Dir {
+                        parent_node.attr.nlink = parent_node.attr.nlink.saturating_add(1);
+                    }
+                    parent_node.attr.mtime = now;
+                    parent_node.attr.ctime = now;
+                    self.node_cache.insert(parent, Some(parent_node)).await;
                 }
-                parent_node.attr.mtime = now;
-                parent_node.attr.ctime = now;
-
-                self.node_cache.insert(parent, Some(parent_node)).await;
                 self.node_cache.insert(new_ino, Some(new_node)).await;
                 Ok(new_ino)
             }

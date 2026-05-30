@@ -2196,7 +2196,7 @@ async fn test_get_node_cache_expires_after_ttl() {
 #[serial]
 #[tokio::test]
 #[ignore]
-async fn test_create_entry_invalidates_parent_node_cache() {
+async fn test_create_entry_updates_parent_node_cache() {
     let store = new_test_store().await;
     let root = store.root_ino();
 
@@ -2205,10 +2205,35 @@ async fn test_create_entry_invalidates_parent_node_cache() {
 
     store.mkdir(root, "cache_dir".to_string()).await.unwrap();
 
-    assert!(store.node_cache.get(&root).await.is_none());
-
-    let root_after = store.get_node(root).await.unwrap().unwrap();
+    let root_after = store
+        .node_cache
+        .get(&root)
+        .await
+        .expect("parent cache should stay warm after create")
+        .expect("parent node should be cached");
     assert_eq!(root_after.attr.nlink, root_before.attr.nlink + 1);
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_create_entry_uses_lua_parent_lookup_without_rust_prelookup() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    store.node_cache.invalidate(&root).await;
+    reset_redis_commandstats(&store).await;
+    let ino = store
+        .create_file(root, "hot.txt".to_string())
+        .await
+        .unwrap();
+
+    let get_calls = redis_command_calls(&store, "get").await;
+    assert!(
+        get_calls <= 1,
+        "create_file should let Lua fetch the parent once; observed {get_calls} Redis GET calls"
+    );
+    assert_eq!(store.lookup(root, "hot.txt").await.unwrap(), Some(ino));
 }
 
 #[serial]
