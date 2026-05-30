@@ -8,6 +8,8 @@ use crate::meta::file_lock::{FileLockQuery, FileLockRange, FileLockType};
 use crate::meta::store::{LockName, MetaError, SetAttrFlags, SetAttrRequest};
 use crate::meta::stores::RedisMetaStore;
 use crate::meta::{MetaLayer, MetaStore};
+use crate::vfs::fs::VFS;
+use crate::{chunk::layout::ChunkLayout, chunk::store::InMemoryBlockStore};
 use redis::AsyncCommands;
 use serial_test::serial;
 use std::sync::Arc;
@@ -2330,6 +2332,63 @@ async fn test_meta_client_stat_fresh_uses_warm_store_node_cache() {
     assert_eq!(
         get_calls, 0,
         "hot stat_fresh should reuse RedisMetaStore node_cache instead of issuing Redis GET calls"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_vfs_deleted_inode_timestamp_setattr_stays_local() {
+    let store = Arc::new(new_test_store().await);
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+    client.initialize().await.unwrap();
+
+    let fs = VFS::with_meta_layer_with_default_background(
+        ChunkLayout::default(),
+        Arc::new(InMemoryBlockStore::new()),
+        client,
+    )
+    .unwrap();
+    let root = fs.root_ino();
+    let ino = fs
+        .create_file_at(root, "deleted_setattr.txt", true)
+        .await
+        .unwrap();
+    fs.unlink_at(root, "deleted_setattr.txt").await.unwrap();
+
+    reset_redis_commandstats(&store).await;
+    let attr = fs
+        .set_attr(
+            ino,
+            &SetAttrRequest {
+                mtime: Some(123),
+                ctime: Some(456),
+                ..Default::default()
+            },
+            SetAttrFlags::empty(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(attr.nlink, 0);
+    assert_eq!(attr.mtime, 123);
+    assert_eq!(attr.ctime, 456);
+    assert_eq!(
+        redis_command_calls(&store, "get").await,
+        0,
+        "timestamp-only setattr for a just-deleted inode should avoid Redis GET"
+    );
+    assert_eq!(
+        redis_command_calls(&store, "set").await,
+        0,
+        "timestamp-only setattr for a just-deleted inode should avoid Redis SET"
     );
 }
 

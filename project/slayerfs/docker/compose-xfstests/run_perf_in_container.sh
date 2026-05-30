@@ -34,6 +34,15 @@ env_or_default() {
     fi
 }
 
+truthy_env() {
+    local value
+    value="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+    case "$value" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 raise_nofile_limit() {
     if ulimit -n "$nofile_limit" >/dev/null 2>&1; then
         info "nofile limit: $(ulimit -n)"
@@ -250,12 +259,19 @@ prepare_artifacts() {
     mkdir -p "$artifact_dir/results" "$artifact_dir/tools"
     touch "$artifact_dir/perf.log" "$artifact_dir/perf-summary.tsv" "$artifact_dir/report.md" >/dev/null 2>&1 || true
     printf 'tool\tstatus\tseconds\tlog\n' >"$artifact_dir/perf-summary.tsv"
+    if truthy_env "${PERF_FUSE_OPS_LOG:-0}" || truthy_env "${SLAYERFS_FUSE_OP_LOG:-0}"; then
+        export SLAYERFS_FUSE_OP_LOG=1
+        export SLAYERFS_FUSE_LOG_FILE="$artifact_dir/slayerfs_fuse_ops.log"
+    fi
 }
 
 copy_artifacts() {
     mkdir -p "$artifact_dir"
     if [[ -f "$log_file" && "$log_file" != "$artifact_dir/slayerfs.log" ]]; then
         cp -f "$log_file" "$artifact_dir/slayerfs.log" || true
+    fi
+    if [[ -n "${SLAYERFS_FUSE_LOG_FILE:-}" && -f "${SLAYERFS_FUSE_LOG_FILE}" && "${SLAYERFS_FUSE_LOG_FILE}" != "$artifact_dir/slayerfs_fuse_ops.log" ]]; then
+        cp -f "${SLAYERFS_FUSE_LOG_FILE}" "$artifact_dir/slayerfs_fuse_ops.log" || true
     fi
     if [[ -f "$config_path" ]]; then
         cp -f "$config_path" "$artifact_dir/backend.yml" || true

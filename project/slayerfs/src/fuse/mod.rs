@@ -1811,11 +1811,18 @@ where
         }
     }
 
-    // Forget (kernel reference drop); no inode ref tracking yet so no-op
-    async fn forget(&self, _req: Request, _inode: u64, _nlookup: u64) {}
+    // Forget (kernel reference drop); no inode ref tracking yet, but use it to
+    // release short-lived attrs kept for post-unlink kernel timestamp updates.
+    async fn forget(&self, _req: Request, inode: u64, _nlookup: u64) {
+        self.forget_recently_unlinked_attr(inode as i64);
+    }
 
-    // Batch forget; no-op
-    async fn batch_forget(&self, _req: Request, _inodes: &[(u64, u64)]) {}
+    // Batch forget; same cleanup as single forget.
+    async fn batch_forget(&self, _req: Request, inodes: &[(u64, u64)]) {
+        for (inode, _) in inodes {
+            self.forget_recently_unlinked_attr(*inode as i64);
+        }
+    }
 
     // Interrupt an in-flight request (no tracking), so no-op
     async fn interrupt(&self, _req: Request, _unique: u64) -> FuseResult<()> {

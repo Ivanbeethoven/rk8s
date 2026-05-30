@@ -83,6 +83,9 @@ struct VfsBackgroundTasks {
     gc_handle: tokio::task::JoinHandle<()>,
 }
 
+const RECENTLY_UNLINKED_ATTR_TTL: Duration = Duration::from_secs(5);
+const RECENTLY_UNLINKED_ATTR_CLEANUP_THRESHOLD: usize = 4096;
+
 use crate::vfs::Inode;
 use crate::vfs::backend::Backend;
 use crate::vfs::cache::config::CacheConfig;
@@ -263,6 +266,7 @@ where
 {
     handles: HandleRegistry<S, M>,
     inodes: DashMap<i64, Arc<Inode>>,
+    recently_unlinked: DashMap<i64, (FileAttr, Instant)>,
     reader: Arc<DataReader<S, M>>,
     writer: Arc<DataWriter<S, M>>,
     modified: ModifiedTracker,
@@ -368,6 +372,7 @@ where
         Self {
             handles: HandleRegistry::new(),
             inodes: DashMap::new(),
+            recently_unlinked: DashMap::new(),
             reader,
             writer,
             modified: ModifiedTracker::new(),
@@ -1286,6 +1291,7 @@ where
         }
 
         self.meta_unlink(parent_ino, name).await?;
+        self.remember_recently_unlinked_attr(ino, attr);
         self.state.modified.touch(parent_ino).await;
         self.state.modified.touch(ino).await;
         Ok(())
@@ -1876,6 +1882,22 @@ where
         req: &SetAttrRequest,
         flags: SetAttrFlags,
     ) -> Result<FileAttr, VfsError> {
+        if Self::deleted_inode_timestamp_only_setattr(req, &flags) {
+            let remove_after = self.state.handles.has_no_handle(ino);
+            if let Some(mut entry) = self.state.recently_unlinked.get_mut(&ino) {
+                let mut attr = entry.0.clone();
+                Self::apply_timestamp_setattr_locally(&mut attr, req, &flags)?;
+                attr.nlink = 0;
+                *entry = (attr.clone(), Instant::now());
+                self.state.handles.update_attr_for_inode(ino, &attr);
+                drop(entry);
+                if remove_after {
+                    self.state.recently_unlinked.remove(&ino);
+                }
+                return Ok(attr);
+            }
+        }
+
         // Hold handle write guards across the ENTIRE truncate + meta_set_attr
         // sequence so that no concurrent write_ino / FUSE_WRITE_CACHE can modify
         // the inode between the truncate and the attribute read-back.  Dropping
@@ -1950,6 +1972,51 @@ where
 
         // _guards dropped here — after meta_set_attr has read the correct state
         Ok(attr)
+    }
+
+    fn deleted_inode_timestamp_only_setattr(req: &SetAttrRequest, flags: &SetAttrFlags) -> bool {
+        let timestamp_flags = (SetAttrFlags::SET_ATIME_NOW | SetAttrFlags::SET_MTIME_NOW).bits();
+        req.mode.is_none()
+            && req.uid.is_none()
+            && req.gid.is_none()
+            && req.size.is_none()
+            && req.flags.is_none()
+            && (flags.bits() & !timestamp_flags) == 0
+    }
+
+    fn apply_timestamp_setattr_locally(
+        attr: &mut FileAttr,
+        req: &SetAttrRequest,
+        flags: &SetAttrFlags,
+    ) -> Result<(), VfsError> {
+        let mut changed = false;
+        let mut now = None;
+
+        if flags.contains(SetAttrFlags::SET_ATIME_NOW) {
+            let ts = *now.get_or_insert(Self::current_timestamp_nanos()?);
+            attr.atime = ts;
+            changed = true;
+        } else if let Some(atime) = req.atime {
+            attr.atime = atime;
+            changed = true;
+        }
+
+        if flags.contains(SetAttrFlags::SET_MTIME_NOW) {
+            let ts = *now.get_or_insert(Self::current_timestamp_nanos()?);
+            attr.mtime = ts;
+            changed = true;
+        } else if let Some(mtime) = req.mtime {
+            attr.mtime = mtime;
+            changed = true;
+        }
+
+        if let Some(ctime) = req.ctime {
+            attr.ctime = ctime;
+        } else if changed {
+            attr.ctime = *now.get_or_insert(Self::current_timestamp_nanos()?);
+        }
+
+        Ok(())
     }
 
     /// Change the permission bits of an inode (chmod).
@@ -2633,6 +2700,27 @@ where
 
     pub(crate) fn handle_attr_by_ino(&self, ino: i64) -> Option<FileAttr> {
         self.state.handles.attr_for_inode(ino)
+    }
+
+    pub(crate) fn forget_recently_unlinked_attr(&self, ino: i64) {
+        self.state.recently_unlinked.remove(&ino);
+    }
+
+    fn remember_recently_unlinked_attr(&self, ino: i64, mut attr: FileAttr) {
+        if self.state.recently_unlinked.len() >= RECENTLY_UNLINKED_ATTR_CLEANUP_THRESHOLD {
+            self.cleanup_recently_unlinked_attrs();
+        }
+        attr.nlink = 0;
+        self.state
+            .recently_unlinked
+            .insert(ino, (attr, Instant::now()));
+    }
+
+    fn cleanup_recently_unlinked_attrs(&self) {
+        let now = Instant::now();
+        self.state.recently_unlinked.retain(|_, (_, inserted_at)| {
+            now.duration_since(*inserted_at) <= RECENTLY_UNLINKED_ATTR_TTL
+        });
     }
 
     /// Check whether a file has been modified since a given point in time.
