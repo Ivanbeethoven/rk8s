@@ -67,6 +67,7 @@ Rejected experiment:
 | FUSE unlink/rmdir and VFS rmdir precheck removal | `docker/compose-xfstests/artifacts/perf-run-1780157265-27175` | `dirperf` was 25s, worse than the prior focused 24s result | Reverted; do not reintroduce without new evidence |
 | Redis `lookup_with_attr` helper for open/create follow-up attrs | `docker/compose-xfstests/artifacts/perf-run-1780158557-8433` | `dirperf` was 25s, worse than the prior focused result; `metaperf` improved only slightly to 210s | Reverted; avoid broad metadata API expansion until operation traces prove the exact call pattern |
 | Redis `rmdir()` Rust-side prelookup removal | `docker/compose-xfstests/artifacts/perf-run-1780163094-25634` | `dirperf` stayed 21s and `metaperf` regressed to 236s | Reverted; the safe rmdir Lua operation remains, but the prelookup removal did not earn its keep |
+| VFS read-only open attr cache | `docker/compose-xfstests/artifacts/perf-run-1780171930-10210` | `dirperf` stayed 20s and `open` regressed to 2077.3 ops/s from 2103.9 ops/s, although `metaperf` wall time was 212s | Reverted; do not cache around close-to-open freshness until focused traces prove it pays for a real workload |
 
 Focused comparison:
 
@@ -141,6 +142,8 @@ Focused continuation artifacts:
 | `perf-run-1780168064-1374` | MetaClient `stat_fresh()` in-place cache refresh only | 21s | 211s | `open` improved to 2062.6 ops/s, but `dirperf` regressed from best |
 | `perf-run-1780168941-8386` | In-place fresh stat plus lazy `FileReader` allocation | 21s | 214s | `open` improved to 2083.6 ops/s, but wall time did not improve |
 | `perf-run-1780169879-22264` | Add MetaClient create/mkdir parent-stat removal | 20s | 213s | `open` improved to 2103.9 ops/s and `dirperf` matched best; still far from JuiceFS |
+| `perf-run-1780170763-16114` | Open-only diagnostic with Redis commandstats kept for inspection | n/a | n/a | Open-only `metaperf` reported 2132.4 ops/s; Redis counters included setup/background traffic, so use as diagnostic only |
+| `perf-run-1780171930-10210` | Rejected VFS read-only open attr cache experiment | 20s | 212s | `open` regressed to 2077.3 ops/s and `dirperf` did not improve; reverted instead of keeping speculative local caching |
 
 Latest continuation verification:
 
@@ -158,6 +161,7 @@ Latest continuation verification:
 | `cargo test -p slayerfs meta::client::tests::test_stat_fresh_refreshes_cached_file_entry_in_place -- --nocapture` | Red/green verified; passed for lib and bin test targets |
 | `cargo test -p slayerfs vfs::fs::tests::basic_tests::test_open_defers_reader_until_first_read -- --nocapture` | Red/green verified; passed for lib and bin test targets |
 | `cargo test -p slayerfs test_meta_client_ -- --ignored --nocapture` | Red/green verified: create_file and mkdir avoid the extra parent Redis `GET`; passed for lib and bin test targets |
+| `cargo test -p slayerfs meta::stores::redis::tests::test_meta_client_stat_fresh_uses_warm_store_node_cache -- --ignored --nocapture` | Added diagnostic coverage showing hot `stat_fresh()` reuses the Redis store node cache instead of issuing Redis `GET` calls |
 | `cargo test -p slayerfs vfs::fs::tests::basic_tests -- --nocapture` | Passed: 9 basic VFS tests for lib and bin test targets |
 | `cargo test -p slayerfs --test gc_test -- --nocapture` | Passed after an earlier full-suite-only `test_gc_respects_min_age` flake |
 | `timeout 20m cargo test -p slayerfs --lib --bins --tests -- --format terse` | Passed on rerun: lib target 290 passed/139 ignored, bin target 282 passed/139 ignored, integration tests passed with expected ignored external-service tests |
@@ -447,6 +451,21 @@ dirperf around or below 35s
 Run a focused FUSE operation trace or perf profile around `dirperf` and `metaperf`.
 
 Expected: identify whether create/open/rename are still paying extra lookup/stat/setattr Redis round trips compared with JuiceFS.
+
+Latest diagnostic notes:
+
+```text
+docker/compose-xfstests/artifacts/perf-run-1780170763-16114
+open-only metaperf: 2132.4 ops/s
+Redis commandstats were not clean enough to isolate the timed phase because setup/background work was included.
+
+cargo test -p slayerfs meta::stores::redis::tests::test_meta_client_stat_fresh_uses_warm_store_node_cache -- --ignored --nocapture
+hot stat_fresh() diagnostic: Redis GET calls stay at 0 after cache warmup.
+
+docker/compose-xfstests/artifacts/perf-run-1780171930-10210
+VFS read-only open attr cache: dirperf 20s, metaperf 212s, open 2077.3 ops/s.
+Rejected because the target open operation regressed and dirperf did not move closer to JuiceFS 13s.
+```
 
 - [x] **Step 2: Collapse Redis unlink into one atomic operation**
 

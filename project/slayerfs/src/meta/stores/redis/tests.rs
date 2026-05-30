@@ -2303,6 +2303,39 @@ async fn test_meta_client_mkdir_avoids_parent_stat_after_lua_create() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn test_meta_client_stat_fresh_uses_warm_store_node_cache() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+
+    let ino = client
+        .create_file(root, "fresh_hot.txt".to_string())
+        .await
+        .unwrap();
+    client.stat_fresh(ino).await.unwrap().unwrap();
+
+    reset_redis_commandstats(&store).await;
+    for _ in 0..10 {
+        client.stat_fresh(ino).await.unwrap().unwrap();
+    }
+
+    let get_calls = redis_command_calls(&store, "get").await;
+    assert_eq!(
+        get_calls, 0,
+        "hot stat_fresh should reuse RedisMetaStore node_cache instead of issuing Redis GET calls"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_symlink_lookup_path_flow() {
     let store = new_test_store().await;
     let root = store.root_ino();
