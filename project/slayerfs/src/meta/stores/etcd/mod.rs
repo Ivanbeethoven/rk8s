@@ -663,7 +663,7 @@ impl EtcdMetaStore {
             let last_key = page.last().map(|(key, _)| key.clone());
 
             for (_, record) in page {
-                if record.status != status || record.created_at >= cutoff_time {
+                if record.status != status || record.created_at > cutoff_time {
                     continue;
                 }
                 selected.push(record);

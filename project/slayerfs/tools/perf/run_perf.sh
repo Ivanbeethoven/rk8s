@@ -11,6 +11,10 @@
 #   ./run_perf.sh --compress lz4  # Enable LZ4 compression
 #   ./run_perf.sh --compress zstd # Enable Zstd compression
 #
+# For detailed libc frames, install matching system debuginfo first:
+#   Ubuntu/Debian: apt-get install libc6-dbg
+# Without it, libc frames may show up as [libc.so.6] or raw addresses.
+#
 # Results are saved to: tools/perf/results/<timestamp>/
 #   ├── config.yaml       # Mount config used
 #   ├── flame/            # Flame graphs (.svg) and folded stacks
@@ -122,6 +126,7 @@ if [ -x "$BINARY" ]; then
     if ! file "$BINARY" | grep -q "with debug_info"; then
         warn "binary lacks debug info — flame graphs may have unresolved symbols"
     fi
+    perf buildid-cache --add "$BINARY" >/dev/null 2>&1 || true
 fi
 
 # ---- Setup ----
@@ -255,6 +260,63 @@ run_perf_script() {
     perf script -i "$perf_data" -F comm,pid,tid,cpu,time,event,ip,sym,dso 2>/dev/null > "$output" || true
 }
 
+find_libc_path() {
+    local path
+    for path in /usr/lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libc.so.6; do
+        if [ -f "$path" ]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    if command -v ldconfig >/dev/null 2>&1; then
+        ldconfig -p 2>/dev/null | awk '/libc\.so\.6/ { print $NF; exit }'
+    fi
+}
+
+libc_debug_file() {
+    local libc_path="$1"
+    local build_id=""
+    if [ -n "$libc_path" ] && command -v readelf >/dev/null 2>&1; then
+        build_id="$(readelf -n "$libc_path" 2>/dev/null | awk '/Build ID:/ { print $3; exit }')"
+    fi
+    if [ -n "$build_id" ]; then
+        echo "/usr/lib/debug/.build-id/${build_id:0:2}/${build_id:2}.debug"
+    fi
+}
+
+check_libc_debuginfo() {
+    local libc_path
+    local debug_file
+    libc_path="$(find_libc_path || true)"
+    debug_file="$(libc_debug_file "$libc_path" || true)"
+
+    if [ -n "$debug_file" ] && [ -f "$debug_file" ]; then
+        info "  libc debuginfo: $debug_file"
+    else
+        warn "  libc debuginfo not found; libc frames may stay as [libc.so.6]/0xaddr"
+        warn "  install libc6-dbg or set DEBUGINFOD_URLS=https://debuginfod.ubuntu.com before running perf"
+    fi
+}
+
+generate_libc_report() {
+    local perf_data="$1"
+    local output="$2"
+    local err_file="${output}.err"
+
+    perf report -i "$perf_data" --stdio --dsos libc.so.6 \
+        --sort dso,symbol --percent-limit 0.5 \
+        > "$output" 2> "$err_file" || true
+
+    if [ -s "$err_file" ]; then
+        {
+            echo ""
+            echo "---- perf report stderr ----"
+            cat "$err_file"
+        } >> "$output"
+    fi
+    rm -f "$err_file"
+}
+
 # =========================================================================
 # ON-CPU FLAME GRAPH
 # =========================================================================
@@ -278,9 +340,10 @@ if [ "$SKIP_ONCPU" -eq 0 ]; then
 
     if [ -f "$FLAME_DIR/oncpu-perf.data" ]; then
         info "generating on-CPU flame graph..."
+        check_libc_debuginfo
         run_perf_script "$FLAME_DIR/oncpu-perf.data" "$FLAME_DIR/oncpu-raw.txt"
 
-        inferno-collapse-perf < "$FLAME_DIR/oncpu-raw.txt" \
+        inferno-collapse-perf --addrs < "$FLAME_DIR/oncpu-raw.txt" \
             > "$FLAME_DIR/oncpu.folded" 2>/dev/null || true
 
         grep "slayerfs" "$FLAME_DIR/oncpu.folded" > "$FLAME_DIR/oncpu-slayerfs.folded" 2>/dev/null || true
@@ -296,6 +359,10 @@ if [ "$SKIP_ONCPU" -eq 0 ]; then
         else
             warn "  no slayerfs samples captured — is the workload too short?"
         fi
+
+        info "  generating libc symbol report..."
+        generate_libc_report "$FLAME_DIR/oncpu-perf.data" "$FLAME_DIR/libc-report.txt"
+        info "  libc report: $FLAME_DIR/libc-report.txt"
 
         # Clean up intermediate file
         rm -f "$FLAME_DIR/oncpu-raw.txt"

@@ -740,6 +740,7 @@ where
                 let mut interval = tokio::time::interval(Duration::from_millis(100));
                 let mut prev_reads: u64 = 0;
                 let mut prev_bytes: u64 = 0;
+                let mut prev_lat_us: u64 = 0;
                 loop {
                     interval.tick().await;
                     let h = hits.load(std::sync::atomic::Ordering::Relaxed);
@@ -750,18 +751,31 @@ where
                     } else {
                         0.0
                     };
-                    let reads = fuse_stats.fuse_read_ops.load(std::sync::atomic::Ordering::Relaxed);
-                    let bytes = fuse_stats.fuse_read_bytes.load(std::sync::atomic::Ordering::Relaxed);
-                    let lat_us = fuse_stats.fuse_read_lat_us.load(std::sync::atomic::Ordering::Relaxed);
+                    let reads = fuse_stats
+                        .fuse_read_ops
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let bytes = fuse_stats
+                        .fuse_read_bytes
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let lat_us = fuse_stats
+                        .fuse_read_lat_us
+                        .load(std::sync::atomic::Ordering::Relaxed);
                     let reads_delta = reads.saturating_sub(prev_reads);
                     let bytes_delta = bytes.saturating_sub(prev_bytes);
-                    let avg_sz = if reads_delta > 0 { bytes_delta / reads_delta } else { 0 };
-                    let avg_lat = if reads_delta > 0 { lat_us.saturating_sub(
-                        fuse_stats.fuse_read_lat_us.load(std::sync::atomic::Ordering::Relaxed) - lat_us
-                    ) / reads_delta } else { 0 };
-                    let _ = avg_lat; // placeholder: correct per-delta lat requires prev_lat
+                    let lat_delta = lat_us.saturating_sub(prev_lat_us);
+                    let avg_sz = if reads_delta > 0 {
+                        bytes_delta / reads_delta
+                    } else {
+                        0
+                    };
+                    let avg_lat_us = if reads_delta > 0 {
+                        lat_delta / reads_delta
+                    } else {
+                        0
+                    };
                     prev_reads = reads;
                     prev_bytes = bytes;
+                    prev_lat_us = lat_us;
                     tracing::info!(
                         hits = h,
                         misses = m,
@@ -770,6 +784,7 @@ where
                         fuse_reads = reads,
                         fuse_rd_bytes = bytes,
                         avg_read_sz = avg_sz,
+                        avg_read_lat_us = avg_lat_us,
                         "stats"
                     );
                 }
@@ -1640,7 +1655,7 @@ where
                 }
                 // Directory replacing file/symlink
                 (FileType::Dir, FileType::File) | (FileType::Dir, FileType::Symlink) => {
-                    return Err(VfsError::IsADirectory {
+                    return Err(VfsError::NotADirectory {
                         path: PathHint::some(new.as_str()),
                     });
                 }

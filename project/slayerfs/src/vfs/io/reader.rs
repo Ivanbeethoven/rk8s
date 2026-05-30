@@ -520,7 +520,6 @@ where
         }
     }
 
-
     pub(crate) async fn read(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
@@ -835,29 +834,65 @@ where
     /// Serve the chunk span directly from the block cache when possible,
     /// returning the cached Bytes (zero-copy Arc bump).  Falls back to
     /// DataFetcher for cache misses.
-    async fn read_chunk_span(&self, index: u64, offset: u64, len: usize) -> anyhow::Result<bytes::Bytes> {
+    async fn read_chunk_span(
+        &self,
+        index: u64,
+        offset: u64,
+        len: usize,
+    ) -> anyhow::Result<bytes::Bytes> {
         let chunk_id = chunk_id_for(self.inode.ino(), index)?;
 
-        let slices_arc = match self.chunk_slices.get(&chunk_id) {
-            Some(cached) => cached.clone(),
-            None => {
-                let mut fetcher = DataFetcher::new(self.config.layout, chunk_id, &self.backend);
-                fetcher.prepare_slices().await?;
-                let slices = fetcher.into_slices();
-                let arc = Arc::new(slices);
-                self.chunk_slices.insert(chunk_id, arc.clone());
-                arc
+        for attempt in 0..MAX_SLICE_READ_RETRIES {
+            let result = async {
+                let slices_arc = match self.chunk_slices.get(&chunk_id) {
+                    Some(cached) => cached.clone(),
+                    None => {
+                        let mut fetcher =
+                            DataFetcher::new(self.config.layout, chunk_id, &self.backend);
+                        fetcher.prepare_slices().await?;
+                        let slices = fetcher.into_slices();
+                        let arc = Arc::new(slices);
+                        self.chunk_slices.insert(chunk_id, arc.clone());
+                        arc
+                    }
+                };
+
+                let mut fetcher = DataFetcher::with_slices(
+                    self.config.layout,
+                    chunk_id,
+                    &self.backend,
+                    (*slices_arc).clone(),
+                );
+                fetcher.read_at(offset.into(), len).await
             }
-        };
+            .await;
 
-        let mut fetcher = DataFetcher::with_slices(
-            self.config.layout, chunk_id, &self.backend, (*slices_arc).clone(),
-        );
-        let data = fetcher.read_at(offset.into(), len).await?;
-        let b = bytes::Bytes::from(data);
+            match result {
+                Ok(data) => {
+                    self.complete_demand_slices(index, offset, len, None::<&anyhow::Error>)
+                        .await;
+                    return Ok(bytes::Bytes::from(data));
+                }
+                Err(err)
+                    if attempt + 1 < MAX_SLICE_READ_RETRIES && is_transient_read_error(&err) =>
+                {
+                    self.chunk_slices.remove(&chunk_id);
+                    let _ = self
+                        .backend
+                        .meta()
+                        .invalidate_chunk_slices(self.inode.ino(), index)
+                        .await;
+                    tokio::time::sleep(retry_delay(attempt)).await;
+                }
+                Err(err) => {
+                    self.complete_demand_slices(index, offset, len, Some(&err))
+                        .await;
+                    return Err(err);
+                }
+            }
+        }
 
-        self.complete_demand_slices(index, offset, len, None::<&anyhow::Error>).await;
-        Ok(b)
+        unreachable!("read_chunk_span retry loop should return before exhausting attempts")
     }
 
     async fn complete_demand_slices(
@@ -893,7 +928,6 @@ where
             state.notify.notify_waiters();
         }
     }
-
 
     async fn prepare_slices(&self, index: u64, (start, end): (u64, u64)) -> SlicePinGuard {
         let mut pinned = SlicePinGuard::new();

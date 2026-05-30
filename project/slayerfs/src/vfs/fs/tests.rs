@@ -1640,8 +1640,10 @@ mod permission_tests {
 mod truncate_flush_tests {
     use super::*;
     use crate::chunk::store::InMemoryBlockStore;
-    use crate::meta::factory::create_meta_store_from_url;
+    use crate::meta::factory::MetaStoreFactory;
     use crate::meta::store::{SetAttrFlags, SetAttrRequest};
+    use crate::meta::stores::DatabaseMetaStore;
+    use crate::vfs::cache::config::CacheConfig as VfsCacheConfig;
     use crate::vfs::fs::VFS;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1654,12 +1656,52 @@ mod truncate_flush_tests {
             .unwrap_or_else(|_| panic!("truncate_flush op timed out: {label}"))
     }
 
+    fn test_layout() -> ChunkLayout {
+        ChunkLayout {
+            chunk_size: 64 * 1024,
+            block_size: 16 * 1024,
+        }
+    }
+
+    fn test_cache_config() -> VfsCacheConfig {
+        VfsCacheConfig {
+            dirty_slice_target_size: 8 * 1024,
+            dirty_slice_max_age_ms: 5,
+            write_memory_bytes: 16 * 1024 * 1024,
+            read_memory_bytes: 16 * 1024 * 1024,
+            prefetch_max_bytes: 256 * 1024,
+            ..VfsCacheConfig::default()
+        }
+    }
+
     async fn new_vfs() -> VFS<InMemoryBlockStore, impl MetaLayer> {
-        let layout = ChunkLayout::default();
-        let store = InMemoryBlockStore::new();
-        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let meta_store = meta_handle.store();
-        VFS::new(layout, store, meta_store).await.unwrap()
+        let layout = test_layout();
+        let store = Arc::new(InMemoryBlockStore::new());
+        let meta_config = crate::meta::config::Config {
+            database: crate::meta::config::DatabaseConfig {
+                db_config: crate::meta::config::DatabaseType::Sqlite {
+                    url: "sqlite::memory:".to_string(),
+                },
+            },
+            cache: crate::meta::config::CacheConfig::default(),
+            client: crate::meta::config::ClientOptions {
+                no_background_jobs: true,
+                ..Default::default()
+            },
+            compact: crate::meta::config::CompactConfig::default(),
+        };
+        let meta_handle = MetaStoreFactory::<DatabaseMetaStore>::create_from_config(meta_config)
+            .await
+            .unwrap();
+
+        VFS::with_meta_layer_with_cache_config(
+            layout,
+            store,
+            meta_handle.layer(),
+            crate::meta::config::CompactConfig::default(),
+            test_cache_config(),
+        )
+        .unwrap()
     }
 
     /// Write data to create pending dirty slices in the writer,
@@ -1676,7 +1718,7 @@ mod truncate_flush_tests {
 
         // Write enough data to exceed freeze_min_bytes so the writer has
         // pending dirty slices that need flushing on truncate.
-        let chunk_size = ChunkLayout::default().chunk_size as usize;
+        let chunk_size = test_layout().chunk_size as usize;
         let data = vec![0xABu8; chunk_size * 2];
         op_timeout("write", fs.write_ino(ino, 0, &data))
             .await
@@ -1704,7 +1746,7 @@ mod truncate_flush_tests {
             .await
             .unwrap();
 
-        let block = ChunkLayout::default().block_size as u64;
+        let block = test_layout().block_size as u64;
 
         for cycle in 0..8 {
             let offset = (cycle as u64 % 4) * block;
@@ -1761,7 +1803,7 @@ mod truncate_flush_tests {
     /// Concurrent writes and truncates on the same inode from multiple
     /// tasks — stresses the mutation lock handoff between write_ino and
     /// truncate_inode.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[tokio::test]
     async fn test_concurrent_write_and_truncate() {
         let fs = Arc::new(new_vfs().await);
         let root = fs.root_ino();
@@ -1810,7 +1852,7 @@ mod truncate_flush_tests {
             .unwrap();
 
         // Write dirty data.
-        let chunk = ChunkLayout::default().chunk_size as usize;
+        let chunk = test_layout().chunk_size as usize;
         let data = vec![0xEFu8; chunk * 2];
         op_timeout("write", fs.write_ino(ino, 0, &data))
             .await
@@ -1843,7 +1885,7 @@ mod truncate_flush_tests {
             .await
             .unwrap();
 
-        let block = ChunkLayout::default().block_size as usize;
+        let block = test_layout().block_size as usize;
 
         // Use write_cached_ino (mimics FUSE_WRITE_CACHE) to create dirty
         // slices without an explicit flush — just like the kernel does.
@@ -1885,7 +1927,7 @@ mod truncate_flush_tests {
             .unwrap();
 
         // Write multiple blocks of data to create dirty slices.
-        let block = ChunkLayout::default().block_size as u64;
+        let block = test_layout().block_size as u64;
         for i in 0..16 {
             let data = vec![(i as u8).wrapping_add(0xA0); block as usize * 2];
             op_timeout("write", fs.write_ino(ino, i * block * 2, &data))

@@ -63,13 +63,19 @@ mod tests {
         // Release the lock
         drop(guard);
 
-        // Wait a bit for the lock to be released
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Now it should succeed again
-        let guard3: Option<ChunkLockGuard<DatabaseMetaStore>> =
-            lock_manager.try_lock(chunk_id, 5, false).await;
+        // Drop releases asynchronously; poll instead of relying on a fixed scheduler delay.
+        let mut guard3: Option<ChunkLockGuard<DatabaseMetaStore>> = None;
+        for _ in 0..40 {
+            guard3 = lock_manager.try_lock(chunk_id, 5, false).await;
+            if guard3.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(guard3.is_some(), "Lock should be available after release");
+        if let Some(mut guard3) = guard3 {
+            guard3.unlock().await;
+        }
     }
 
     #[tokio::test]

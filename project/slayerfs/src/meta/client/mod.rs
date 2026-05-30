@@ -1748,7 +1748,9 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
                 // File/symlink replacing directory - not allowed
                 (Some(FileType::File), FileType::Dir)
                 | (Some(FileType::Symlink), FileType::Dir) => {
-                    return Err(MetaError::NotDirectory(dest_ino));
+                    return Err(MetaError::Io(std::io::Error::from(
+                        std::io::ErrorKind::IsADirectory,
+                    )));
                 }
                 // File/symlink replacing file/symlink - allowed
                 _ => {}

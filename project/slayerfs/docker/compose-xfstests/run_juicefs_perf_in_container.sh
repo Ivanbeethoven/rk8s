@@ -245,11 +245,50 @@ if not jobs:
 read = jobs[0].get('read', {})
 write = jobs[0].get('write', {})
 opts = jobs[0].get('job options', {})
-print(f\"${label}: {opts.get('rw','?')} bs={opts.get('bs','?')} numjobs={opts.get('numjobs','?')} runtime={opts.get('runtime','?')}s\")
+print(f\"${label}: {opts.get('rw','?')} bs={opts.get('bs','?')} size={opts.get('size','?')} numjobs={opts.get('numjobs','?')} runtime={opts.get('runtime','?')}s\")
 print(f\"  read:  bw={read.get('bw','?')} KiB/s  iops={read.get('iops','?'):.1f}  lat_avg={read.get('clat_ns',{}).get('mean',0)/1e6:.2f}ms  lat_p99={read.get('clat_ns',{}).get('percentile',{}).get('99.000000',0)/1e6:.2f}ms\")
 print(f\"  write: bw={write.get('bw','?')} KiB/s  iops={write.get('iops','?'):.1f}  lat_avg={write.get('clat_ns',{}).get('mean',0)/1e6:.2f}ms  lat_p99={write.get('clat_ns',{}).get('percentile',{}).get('99.000000',0)/1e6:.2f}ms\")
 " >> "$log_path" 2>/dev/null || true
     fi
+}
+
+run_fio_custom() {
+    local work_dir="$mount_dir/.perf-fio"
+    local json_path="$artifact_dir/results/fio.json"
+    local -a args=()
+
+    if ! command -v fio >/dev/null 2>&1; then
+        err "找不到 fio"
+        exit 1
+    fi
+
+    rm -rf "$work_dir"
+    mkdir -p "$work_dir"
+
+    if [[ -n "${PERF_FIO_ARGS:-}" ]]; then
+        read -r -a args <<<"${PERF_FIO_ARGS}"
+    else
+        args=(
+            --name="${PERF_FIO_NAME:-slayerfs-randrw}"
+            --directory="$work_dir"
+            --rw="${PERF_FIO_RW:-randrw}"
+            --rwmixread="${PERF_FIO_RWMIXREAD:-70}"
+            --bs="${PERF_FIO_BS:-4m}"
+            --size="${PERF_FIO_SIZE:-256m}"
+            --numjobs="${PERF_FIO_NUMJOBS:-4}"
+            --ioengine="${PERF_FIO_IOENGINE:-io_uring}"
+            --iodepth="${PERF_FIO_IODEPTH:-1}"
+            --direct="${PERF_FIO_DIRECT:-0}"
+            --runtime="${PERF_FIO_RUNTIME:-60}"
+            --time_based
+            --group_reporting
+            --eta=never
+        )
+    fi
+
+    args+=(--output-format=json --output="$json_path")
+    run_logged_tool fio fio "${args[@]}"
+    append_fio_log_summary "$json_path" "$artifact_dir/tools/fio.log" "fio"
 }
 
 run_fio_profile() {

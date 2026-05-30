@@ -19,6 +19,8 @@ use tokio::fs;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{debug, error, info, trace, warn};
 
+static DISK_CACHE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Configuration for the intelligent dual-layer cache system.
 ///
 /// This cache implements an adaptive promotion strategy that combines:
@@ -294,7 +296,8 @@ impl DiskStorage {
 
     pub async fn store(&self, key: &str, data: impl AsRef<[u8]>) -> anyhow::Result<()> {
         let permit = self.write_sem.clone().acquire_owned().await?;
-        self.store_with_permit(key, data, permit).await
+        self.store_with_permit(key, bytes::Bytes::copy_from_slice(data.as_ref()), permit)
+            .await
     }
 
     pub async fn store_with_health(
@@ -322,7 +325,7 @@ impl DiskStorage {
     async fn store_with_permit_health(
         &self,
         key: &str,
-        data: impl AsRef<[u8]>,
+        data: bytes::Bytes,
         permit: OwnedSemaphorePermit,
     ) -> anyhow::Result<bool> {
         if self.health.is_bypassed() {
@@ -345,16 +348,15 @@ impl DiskStorage {
     async fn store_with_permit(
         &self,
         key: &str,
-        data: impl AsRef<[u8]>,
+        data: bytes::Bytes,
         _permit: OwnedSemaphorePermit,
     ) -> anyhow::Result<()> {
         let filename = Self::key_to_filename(key);
         let filepath = self.base_dir.join(&filename);
-        let data_bytes = data.as_ref();
 
         // Compute CRC32C framing without copying the data block
-        let (header, checksums) = super::cache_integrity::compute_framing(data_bytes);
-        let total_len = (header.len() + data_bytes.len() + checksums.len()) as u64;
+        let (header, checksums) = super::cache_integrity::compute_framing(&data);
+        let total_len = (header.len() + data.len() + checksums.len()) as u64;
 
         // Atomically reserve space and trigger eviction if over budget.
         // fetch_add is atomic — no race between multiple concurrent store() calls.
@@ -372,20 +374,31 @@ impl DiskStorage {
             self.bytes_used.fetch_sub(meta.len(), Ordering::Relaxed);
         }
 
-        // Write [header][data][checksums] using a single assembled buffer.
-        // For 4MB blocks, the header is 8 bytes and checksums are 512 bytes —
-        // the copy cost is negligible vs the disk I/O latency.
-        use tokio::io::AsyncWriteExt;
-        let write_result = async {
-            let mut file = tokio::fs::File::create(&filepath).await?;
-            file.write_all(&header).await?;
-            file.write_all(data_bytes).await?;
-            file.write_all(&checksums).await?;
+        // Write to a private temp file first, then atomically publish it with
+        // rename. Readers either see the previous complete file or the new
+        // complete file, never a partially-written cache entry.
+        let tmp_id = DISK_CACHE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = self.base_dir.join(format!(".{}.{}.tmp", filename, tmp_id));
+        let tmp_path_for_write = tmp_path.clone();
+        let write_result = match tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+
+            let mut file = std::fs::File::create(&tmp_path_for_write)?;
+            file.write_all(&header)?;
+            file.write_all(&data)?;
+            file.write_all(&checksums)?;
+            drop(file);
+            std::fs::rename(&tmp_path_for_write, &filepath)?;
             Ok::<(), anyhow::Error>(())
-        }
-        .await;
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => Err(err.into()),
+        };
 
         if let Err(e) = write_result {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
             // Roll back the pre-reserved bytes on write failure
             self.bytes_used.fetch_sub(total_len, Ordering::Relaxed);
             return Err(e);
@@ -1654,8 +1667,7 @@ impl ChunksCache {
         if self.policy.should_promote(key.clone()).await {
             debug!("Promoting key to hot cache: {}", key);
             let b = bytes::Bytes::from(value.clone());
-            self.hot_bytes
-                .fetch_add(b.len() as u64, Ordering::Relaxed);
+            self.hot_bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
             self.hot_cache.insert(key.clone(), b).await;
         }
 
@@ -1826,7 +1838,12 @@ impl ChunksCache {
     /// Store data to disk cache, awaiting a write permit if necessary.
     /// Used by background write-cache population tasks.
     pub async fn store_to_disk(&self, key: &str, data: Vec<u8>) -> anyhow::Result<()> {
-        if self.disk_storage.store_with_health(key, &data).await? {
+        let permit = self.disk_storage.write_sem.clone().acquire_owned().await?;
+        if self
+            .disk_storage
+            .store_with_permit_health(key, bytes::Bytes::from(data), permit)
+            .await?
+        {
             self.cold_cache.insert(key.to_owned(), ()).await;
         }
         Ok(())
@@ -1842,7 +1859,7 @@ impl ChunksCache {
     ) -> anyhow::Result<()> {
         if self
             .disk_storage
-            .store_with_permit_health(key, data, permit)
+            .store_with_permit_health(key, bytes::Bytes::from(data), permit)
             .await?
         {
             self.cold_cache.insert(key.to_owned(), ()).await;
@@ -2082,7 +2099,7 @@ mod tests {
         let key = "dedup-key".to_string();
         for _ in 0..16 {
             cache
-                .insert_opportunistic(key.clone(), vec![7u8; 128 * 1024])
+                .insert_opportunistic(key.clone(), vec![7u8; 128 * 1024].into())
                 .await;
         }
 

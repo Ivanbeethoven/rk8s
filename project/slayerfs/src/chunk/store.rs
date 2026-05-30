@@ -18,7 +18,10 @@ use futures::executor::block_on;
 use hex::encode;
 use moka::{Entry, ops::compute::Op};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fs, io::SeekFrom, path::PathBuf, sync::Arc, sync::LazyLock, sync::atomic::AtomicU64};
+use std::{
+    collections::HashMap, fs, io::SeekFrom, path::PathBuf, sync::Arc, sync::LazyLock,
+    sync::atomic::AtomicU64,
+};
 use tokio::{
     io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::{RwLock, Semaphore},
@@ -326,7 +329,9 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
         // Make freshly uploaded data immediately visible in the hottest read
         // tier before returning to the caller. Disk persistence stays best-
         // effort so foreground uploads are not blocked by local cache I/O.
-        self.block_cache.insert_hot(&key, bytes::Bytes::from(data.clone())).await;
+        self.block_cache
+            .insert_hot(&key, bytes::Bytes::from(data.clone()))
+            .await;
 
         // Persist to disk if a write permit is available. Skipping under
         // extreme I/O pressure avoids queuing hundreds of background tasks
@@ -1198,7 +1203,7 @@ mod tests {
         );
         assert_eq!(
             store.block_cache.get(&"chunks/123/0".to_string()).await,
-            Some(data)
+            Some(data.into())
         );
 
         Ok(())

@@ -1,8 +1,10 @@
 //! Comprehensive integration tests for rename functionality
 
+use serial_test::serial;
 use slayerfs::{ChunkLayout, InMemoryBlockStore, RenameFlags, VFS, create_meta_store_from_url};
 
 #[tokio::test]
+#[serial(rename_integration)]
 async fn test_rename_same_path_is_noop() {
     let layout = ChunkLayout::default();
     let store = InMemoryBlockStore::new();
@@ -22,6 +24,7 @@ async fn test_rename_same_path_is_noop() {
 }
 
 #[tokio::test]
+#[serial(rename_integration)]
 async fn test_rename_directory_over_non_empty_directory_fails() {
     let layout = ChunkLayout::default();
     let store = InMemoryBlockStore::new();
@@ -41,6 +44,7 @@ async fn test_rename_directory_over_non_empty_directory_fails() {
 }
 
 #[tokio::test]
+#[serial(rename_integration)]
 async fn test_rename_directory_over_file_fails_with_not_directory() {
     let layout = ChunkLayout::default();
     let store = InMemoryBlockStore::new();
@@ -59,6 +63,7 @@ async fn test_rename_directory_over_file_fails_with_not_directory() {
 }
 
 #[tokio::test]
+#[serial(rename_integration)]
 async fn test_rename_file_over_directory_fails_with_is_directory() {
     let layout = ChunkLayout::default();
     let store = InMemoryBlockStore::new();
@@ -77,6 +82,7 @@ async fn test_rename_file_over_directory_fails_with_is_directory() {
 }
 
 #[tokio::test]
+#[serial(rename_integration)]
 async fn test_rename_comprehensive_scenarios() {
     let layout = ChunkLayout::default();
     let store = InMemoryBlockStore::new();
@@ -247,6 +253,7 @@ async fn test_rename_comprehensive_scenarios() {
 }
 
 #[tokio::test]
+#[serial(rename_integration)]
 async fn test_rename_batch_operations() {
     let layout = ChunkLayout::default();
     let store = InMemoryBlockStore::new();

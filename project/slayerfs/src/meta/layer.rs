@@ -135,7 +135,9 @@ pub trait MetaLayer: Send + Sync {
                 }
                 // File/symlink replacing directory - not allowed
                 (FileType::File, FileType::Dir) | (FileType::Symlink, FileType::Dir) => {
-                    return Err(MetaError::NotDirectory(dest_ino));
+                    return Err(MetaError::Io(std::io::Error::from(
+                        std::io::ErrorKind::IsADirectory,
+                    )));
                 }
                 // File/symlink replacing file/symlink - allowed
                 _ => {}

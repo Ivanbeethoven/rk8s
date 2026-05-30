@@ -3224,16 +3224,16 @@ impl MetaStore for RedisMetaStore {
 
     #[tracing::instrument(
         level = "trace",
-        skip(self, new_slices, old_slices_to_delay, _expected_slices),
+        skip(self, new_slices, old_slices_to_delay, expected_slices),
         fields(chunk_id)
     )]
-    // Versioned slice replacement: verify chunk version matches expectations before swapping slices.
+    // Versioned slice replacement: verify chunk state matches expectations before swapping slices.
     async fn replace_slices_for_compact_with_version(
         &self,
         chunk_id: u64,
         new_slices: &[SliceDesc],
         old_slices_to_delay: &[u8],
-        _expected_slices: &[SliceDesc],
+        expected_slices: &[SliceDesc],
     ) -> Result<(), MetaError> {
         if !old_slices_to_delay.is_empty() && !old_slices_to_delay.len().is_multiple_of(20) {
             tracing::warn!(
@@ -3258,7 +3258,7 @@ impl MetaStore for RedisMetaStore {
             let mut conn = self.conn.clone();
 
             // Read version and current slices in one round-trip.
-            let (version, _raw): (Option<i64>, Vec<Vec<u8>>) = redis::pipe()
+            let (version, raw): (Option<i64>, Vec<Vec<u8>>) = redis::pipe()
                 .cmd("GET")
                 .arg(&version_key)
                 .cmd("LRANGE")
@@ -3271,6 +3271,55 @@ impl MetaStore for RedisMetaStore {
 
             let current_version = version.unwrap_or(0);
             let new_version = current_version + 1;
+
+            let mut current_slices = Vec::with_capacity(raw.len());
+            for entry in &raw {
+                current_slices.push(crate::meta::serialization::deserialize_meta::<SliceDesc>(
+                    entry,
+                )?);
+            }
+
+            if current_slices.len() != expected_slices.len() {
+                tracing::debug!(
+                    chunk_id = chunk_id,
+                    expected_count = expected_slices.len(),
+                    actual_count = current_slices.len(),
+                    "Concurrent modification detected: slice count mismatch"
+                );
+                return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
+            }
+
+            let current_map: HashMap<u64, (u64, u64)> = current_slices
+                .iter()
+                .map(|s| (s.slice_id, (s.offset, s.length)))
+                .collect();
+
+            for expected in expected_slices {
+                match current_map.get(&expected.slice_id) {
+                    Some((offset, length)) => {
+                        if *offset != expected.offset || *length != expected.length {
+                            tracing::debug!(
+                                chunk_id = chunk_id,
+                                slice_id = expected.slice_id,
+                                expected_offset = expected.offset,
+                                expected_length = expected.length,
+                                actual_offset = offset,
+                                actual_length = length,
+                                "Concurrent modification detected: slice content changed"
+                            );
+                            return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
+                        }
+                    }
+                    None => {
+                        tracing::debug!(
+                            chunk_id = chunk_id,
+                            slice_id = expected.slice_id,
+                            "Concurrent modification detected: slice missing"
+                        );
+                        return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
+                    }
+                }
+            }
 
             // Serialize new slices for the CAS.
             let mut final_data: Vec<Vec<u8>> = Vec::with_capacity(new_slices.len());

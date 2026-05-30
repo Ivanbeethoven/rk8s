@@ -30,9 +30,9 @@ use log::info;
 use sea_orm::ActiveValue::{self, Set, Unchanged};
 use sea_orm::prelude::Uuid;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
-    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema,
-    TransactionTrait, sea_query,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectOptions, ConnectionTrait, Database,
+    DatabaseConnection, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Schema, TransactionTrait, sea_query,
 };
 use sea_query::Index;
 use std::collections::HashMap;
@@ -1052,7 +1052,7 @@ impl DatabaseMetaStore {
 
         // Include meta_deleted so failed block deletion can be retried in later GC cycles.
         let delayed_slices: Vec<delayed_slice::Model> = DelayedSlice::find()
-            .filter(delayed_slice::Column::CreatedAt.lt(cutoff_time))
+            .filter(delayed_slice::Column::CreatedAt.lte(cutoff_time))
             .filter(
                 delayed_slice::Column::Status
                     .is_in(vec!["pending".to_string(), "meta_deleted".to_string()]),
@@ -1799,15 +1799,15 @@ impl MetaStore for DatabaseMetaStore {
     ) -> Result<(), MetaError> {
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
 
-        // Verify new parent exists
-        if AccessMeta::find_by_id(new_parent)
+        // Verify new parent exists and is a directory.
+        let new_parent_meta = AccessMeta::find_by_id(new_parent)
             .one(&txn)
             .await
             .map_err(MetaError::Database)?
-            .is_none()
-        {
+            .ok_or(MetaError::ParentNotFound(new_parent))?;
+        if !new_parent_meta.permission().is_directory() {
             txn.rollback().await.map_err(MetaError::Database)?;
-            return Err(MetaError::ParentNotFound(new_parent));
+            return Err(MetaError::NotDirectory(new_parent));
         }
 
         // Find the entry to rename
@@ -1823,24 +1823,6 @@ impl MetaStore for DatabaseMetaStore {
                     old_name, old_parent
                 ))
             })?;
-
-        // Check if target already exists in new location
-        let existing = ContentMeta::find()
-            .filter(content_meta::Column::ParentInode.eq(new_parent))
-            .filter(content_meta::Column::EntryName.eq(&new_name))
-            .one(&txn)
-            .await
-            .map_err(MetaError::Database)?;
-
-        if existing.is_some() {
-            txn.rollback().await.map_err(MetaError::Database)?;
-            return Err(MetaError::AlreadyExists {
-                parent: new_parent,
-                name: new_name,
-            });
-        }
-
-        let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
         // Get metadata to check nlink and type
         // Try FileMeta first (for files), then AccessMeta (for directories)
@@ -1862,6 +1844,129 @@ impl MetaStore for DatabaseMetaStore {
         } else {
             return Err(MetaError::NotFound(target_entry.inode));
         };
+
+        // Check if target already exists in new location
+        let existing = ContentMeta::find()
+            .filter(content_meta::Column::ParentInode.eq(new_parent))
+            .filter(content_meta::Column::EntryName.eq(&new_name))
+            .one(&txn)
+            .await
+            .map_err(MetaError::Database)?;
+
+        if let Some(existing) = existing {
+            if existing.inode == target_entry.inode {
+                txn.rollback().await.map_err(MetaError::Database)?;
+                return Ok(());
+            }
+
+            match (&target_entry.entry_type, &existing.entry_type) {
+                (EntryType::Directory, EntryType::Directory) => {
+                    let child_count = ContentMeta::find()
+                        .filter(content_meta::Column::ParentInode.eq(existing.inode))
+                        .count(&txn)
+                        .await
+                        .map_err(MetaError::Database)?;
+                    if child_count > 0 {
+                        txn.rollback().await.map_err(MetaError::Database)?;
+                        return Err(MetaError::DirectoryNotEmpty(existing.inode));
+                    }
+
+                    AccessMeta::delete_by_id(existing.inode)
+                        .exec(&txn)
+                        .await
+                        .map_err(MetaError::Database)?;
+                    XattrMeta::delete_many()
+                        .filter(xattr_meta::Column::Inode.eq(existing.inode))
+                        .exec(&txn)
+                        .await
+                        .map_err(MetaError::Database)?;
+                }
+                (EntryType::Directory, EntryType::File | EntryType::Symlink) => {
+                    txn.rollback().await.map_err(MetaError::Database)?;
+                    return Err(MetaError::Io(std::io::Error::from(
+                        std::io::ErrorKind::NotADirectory,
+                    )));
+                }
+                (EntryType::File | EntryType::Symlink, EntryType::Directory) => {
+                    txn.rollback().await.map_err(MetaError::Database)?;
+                    return Err(MetaError::Io(std::io::Error::from(
+                        std::io::ErrorKind::IsADirectory,
+                    )));
+                }
+                (EntryType::File | EntryType::Symlink, EntryType::File | EntryType::Symlink) => {
+                    let mut replaced_file: file_meta::ActiveModel =
+                        FileMeta::find_by_id(existing.inode)
+                            .one(&txn)
+                            .await
+                            .map_err(MetaError::Database)?
+                            .ok_or(MetaError::NotFound(existing.inode))?
+                            .into();
+
+                    let current_nlink = match &replaced_file.nlink {
+                        Set(n) | Unchanged(n) => *n,
+                        _ => 1,
+                    };
+
+                    if current_nlink > 1 {
+                        LinkParentMeta::delete_many()
+                            .filter(link_parent_meta::Column::Inode.eq(existing.inode))
+                            .filter(link_parent_meta::Column::ParentInode.eq(new_parent))
+                            .filter(link_parent_meta::Column::EntryName.eq(&new_name))
+                            .exec(&txn)
+                            .await
+                            .map_err(MetaError::Database)?;
+
+                        replaced_file.nlink = Set(current_nlink - 1);
+                        replaced_file.deleted = Set(false);
+
+                        if current_nlink == 2 {
+                            let remaining_entry = ContentMeta::find()
+                                .filter(content_meta::Column::Inode.eq(existing.inode))
+                                .filter(
+                                    Condition::any()
+                                        .add(content_meta::Column::ParentInode.ne(new_parent))
+                                        .add(content_meta::Column::EntryName.ne(&new_name)),
+                                )
+                                .one(&txn)
+                                .await
+                                .map_err(MetaError::Database)?
+                                .ok_or(MetaError::Internal(format!(
+                                    "No remaining ContentMeta found for inode {}",
+                                    existing.inode
+                                )))?;
+                            replaced_file.parent = Set(remaining_entry.parent_inode);
+
+                            LinkParentMeta::delete_many()
+                                .filter(link_parent_meta::Column::Inode.eq(existing.inode))
+                                .exec(&txn)
+                                .await
+                                .map_err(MetaError::Database)?;
+                        }
+                    } else {
+                        replaced_file.deleted = Set(true);
+                        replaced_file.nlink = Set(0);
+                        replaced_file.parent = Set(0);
+                    }
+
+                    let now = Self::now_nanos();
+                    replaced_file.modify_time = Set(now);
+                    replaced_file.create_time = Set(now);
+                    replaced_file
+                        .update(&txn)
+                        .await
+                        .map_err(MetaError::Database)?;
+                }
+            }
+
+            ContentMeta::delete_many()
+                .filter(content_meta::Column::ParentInode.eq(new_parent))
+                .filter(content_meta::Column::EntryName.eq(&new_name))
+                .exec(&txn)
+                .await
+                .map_err(MetaError::Database)?;
+        }
+
+        let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
         // Delete old content_meta entry
         ContentMeta::delete_many()
