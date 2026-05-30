@@ -2352,6 +2352,36 @@ where
             .await
     }
 
+    pub(crate) async fn open_fresh_ino(
+        &self,
+        ino: i64,
+        read: bool,
+        write: bool,
+        append: bool,
+    ) -> Result<u64, VfsError> {
+        let attr = match self.meta_stat_fresh(ino).await {
+            Ok(Some(attr)) => attr,
+            Ok(None) => {
+                return Err(VfsError::NotFound {
+                    path: PathHint::none(),
+                });
+            }
+            Err(err) => {
+                tracing::warn!("open: stat_fresh failed for ino {}: {}", ino, err);
+                return Err(VfsError::StaleNetworkFileHandle);
+            }
+        };
+
+        if attr.kind == FileType::Dir {
+            return Err(VfsError::IsADirectory {
+                path: PathHint::none(),
+            });
+        }
+
+        self.open_with_attr_refresh(ino, attr, read, write, append, false)
+            .await
+    }
+
     async fn open_with_attr_refresh(
         &self,
         ino: i64,

@@ -129,6 +129,30 @@ async fn new_test_store() -> RedisMetaStore {
         .expect("Failed to create test database store")
 }
 
+async fn reset_redis_commandstats(store: &RedisMetaStore) {
+    let _: () = redis::cmd("CONFIG")
+        .arg("RESETSTAT")
+        .query_async(&mut store.conn.clone())
+        .await
+        .expect("failed to reset Redis command stats");
+}
+
+async fn redis_command_calls(store: &RedisMetaStore, command: &str) -> u64 {
+    let info: String = redis::cmd("INFO")
+        .arg("commandstats")
+        .query_async(&mut store.conn.clone())
+        .await
+        .expect("failed to read Redis command stats");
+    let needle = format!("cmdstat_{}:", command.to_ascii_lowercase());
+    info.lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix(&needle)?;
+            let calls = rest.strip_prefix("calls=")?.split(',').next()?;
+            calls.parse::<u64>().ok()
+        })
+        .unwrap_or(0)
+}
+
 /// Create a new test store with pre-configured session ID
 async fn new_test_store_with_session(session_id: Uuid) -> RedisMetaStore {
     let store = new_test_store().await;
@@ -1254,30 +1278,32 @@ async fn test_rename_lua_source_not_found() {
 #[serial]
 #[tokio::test]
 #[ignore]
-async fn test_rename_lua_target_exists() {
+async fn test_rename_lua_existing_file_target_is_replaced() {
     let store = new_test_store().await;
     let root = store.root_ino();
 
-    store
+    let src_ino = store
         .create_file(root, "file1.txt".to_string())
         .await
         .unwrap();
-    store
+    let dst_ino = store
         .create_file(root, "file2.txt".to_string())
         .await
         .unwrap();
 
-    let result = store
+    store
         .rename(root, "file1.txt", root, "file2.txt".to_string())
-        .await;
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        MetaError::AlreadyExists { parent, name } => {
-            assert_eq!(parent, root);
-            assert_eq!(name, "file2.txt");
-        }
-        other => panic!("expected AlreadyExists error, got {:?}", other),
-    }
+        .await
+        .unwrap();
+
+    assert_eq!(store.lookup(root, "file1.txt").await.unwrap(), None);
+    assert_eq!(
+        store.lookup(root, "file2.txt").await.unwrap(),
+        Some(src_ino)
+    );
+    let replaced = store.get_node(dst_ino).await.unwrap().unwrap();
+    assert!(replaced.deleted);
+    assert_eq!(replaced.attr.nlink, 0);
 }
 
 #[serial]
@@ -1506,6 +1532,32 @@ async fn test_rename_lua_same_name() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn test_rename_uses_lua_dentry_lookup_without_rust_prelookups() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let src_ino = store
+        .create_file(root, "src.txt".to_string())
+        .await
+        .unwrap();
+
+    reset_redis_commandstats(&store).await;
+    store
+        .rename(root, "src.txt", root, "dst.txt".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(store.lookup(root, "dst.txt").await.unwrap(), Some(src_ino));
+    let hget_calls = redis_command_calls(&store, "hget").await;
+    assert!(
+        hget_calls <= 3,
+        "rename should avoid Rust-side dentry prelookups; observed {hget_calls} Redis HGET calls"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_rename_lua_hardlink() {
     let store = new_test_store().await;
     let root = store.root_ino();
@@ -1544,6 +1596,41 @@ async fn test_rename_lua_hardlink() {
     assert!(link_parents_after.contains(&(root, "renamed.txt".to_string())));
     assert!(link_parents_after.contains(&(root, "link.txt".to_string())));
     assert!(!link_parents_after.contains(&(root, "file.txt".to_string())));
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_rename_lua_hardlink_same_inode_target_is_noop() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let file_ino = store
+        .create_file(root, "file.txt".to_string())
+        .await
+        .unwrap();
+    store.link(file_ino, root, "link.txt").await.unwrap();
+
+    store
+        .rename(root, "file.txt", root, "link.txt".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.lookup(root, "file.txt").await.unwrap(),
+        Some(file_ino)
+    );
+    assert_eq!(
+        store.lookup(root, "link.txt").await.unwrap(),
+        Some(file_ino)
+    );
+
+    let node_after = store.get_node(file_ino).await.unwrap().unwrap();
+    assert_eq!(node_after.attr.nlink, 2);
+    let link_parents_after = store.load_link_parents(file_ino).await.unwrap();
+    assert_eq!(link_parents_after.len(), 2);
+    assert!(link_parents_after.contains(&(root, "file.txt".to_string())));
+    assert!(link_parents_after.contains(&(root, "link.txt".to_string())));
 }
 
 #[serial]

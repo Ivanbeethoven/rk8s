@@ -423,6 +423,29 @@ mod basic_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn test_open_fresh_by_ino_checks_current_attr_once() {
+        let fs = new_basic_fs().await;
+        let root = fs.root_ino();
+
+        let file_ino = fs.create_file_at(root, "file", false).await.unwrap();
+        let fh = fs
+            .open_fresh_ino(file_ino, true, false, false)
+            .await
+            .unwrap();
+        fs.close(fh).await.unwrap();
+
+        let dir_ino = fs.mkdir_at(root, "dir").await.unwrap();
+        assert!(matches!(
+            fs.open_fresh_ino(dir_ino, true, false, false).await,
+            Err(crate::vfs::error::VfsError::IsADirectory { .. })
+        ));
+        assert!(matches!(
+            fs.open_fresh_ino(999_999, true, false, false).await,
+            Err(crate::vfs::error::VfsError::NotFound { .. })
+        ));
+    }
+
     // Removed incomplete test: test_fs_truncate_prunes_chunks_and_zero_fills
     // TODO: Implement proper truncate testing when chunk pruning is fully implemented
 

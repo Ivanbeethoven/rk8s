@@ -427,15 +427,6 @@ where
             return Ok(ReplyOpen { fh: 0, flags: 0 });
         }
 
-        debug!(ino, flags, "fuse.open");
-        // Verify the inode exists and is a file
-        let Some(attr) = self.stat_ino(ino as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
-        if matches!(attr.kind, VfsFileType::Dir) {
-            return Err(libc::EISDIR.into());
-        }
-
         let accmode = flags & (libc::O_ACCMODE as u32);
         let read = accmode != (libc::O_WRONLY as u32);
         let write = accmode != (libc::O_RDONLY as u32);
@@ -450,7 +441,7 @@ where
             "fuse.open"
         );
         let fh = self
-            .open(ino as i64, attr.clone(), read, write, append)
+            .open_fresh_ino(ino as i64, read, write, append)
             .await
             .map_err(Into::<Errno>::into)?;
 

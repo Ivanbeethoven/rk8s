@@ -767,31 +767,31 @@ const CREATE_ENTRY_LUA: &str = r#"
     return cjson.encode({ok=true, ino=new_ino})
 "#;
 
-// Lua script for atomically renaming file or directory (no overwrite)
+// Lua script for atomically renaming file or directory with POSIX overwrite semantics.
 const RENAME_LUA: &str = r#"
     local cjson = cjson
 
     local old_parent_dir_key = KEYS[1]
     local new_parent_dir_key = KEYS[2]
-    local child_node_key = KEYS[3]
-    local old_parent_node_key = KEYS[4]
-    local new_parent_node_key = KEYS[5]
-    local link_parents_key = KEYS[6]
+    local old_parent_node_key = KEYS[3]
+    local new_parent_node_key = KEYS[4]
+    local deleted_set_key = KEYS[5]
     local old_name = ARGV[1]
     local new_name = ARGV[2]
     local old_parent_ino = tonumber(ARGV[3])
     local new_parent_ino = tonumber(ARGV[4])
     local timestamp = tonumber(ARGV[5])
-    local expected_ino = tonumber(ARGV[6])
+    local node_prefix = ARGV[6]
+    local link_parent_prefix = ARGV[7]
 
-    -- Check source dentry exists and matches expected inode
+    -- Check source dentry exists.
     local dentry_ino = redis.call('HGET', old_parent_dir_key, old_name)
     if not dentry_ino then
         return cjson.encode({ok=false, error="not_found", ino=old_parent_ino})
     end
-    if tonumber(dentry_ino) ~= expected_ino then
-        return cjson.encode({ok=false, error="not_found", ino=old_parent_ino})
-    end
+    local child_ino = tonumber(dentry_ino)
+    local child_node_key = node_prefix .. dentry_ino
+    local link_parents_key = link_parent_prefix .. dentry_ino
 
     -- Check new_parent exists and is directory
     local new_parent_json = redis.call('GET', new_parent_node_key)
@@ -819,9 +819,14 @@ const RENAME_LUA: &str = r#"
     -- Atomically handle existing destination (POSIX rename semantics: destination is
     -- replaced atomically; no window for concurrent renames to observe a partial state).
     local new_parent_nlink_adj = 0
+    local replaced_ino = nil
     local dest_ino_str = redis.call('HGET', new_parent_dir_key, new_name)
     if dest_ino_str then
-        local dest_node_key = 'i' .. dest_ino_str
+        if dest_ino_str == dentry_ino then
+            return cjson.encode({ok=true, ino=child_ino})
+        end
+        replaced_ino = tonumber(dest_ino_str)
+        local dest_node_key = node_prefix .. dest_ino_str
         local dest_node_json = redis.call('GET', dest_node_key)
         if not dest_node_json then
             return cjson.encode({ok=false, error="corrupt_node"})
@@ -858,9 +863,14 @@ const RENAME_LUA: &str = r#"
             dest_node.attr.nlink = dest_node.attr.nlink - 1
             redis.call('HDEL', new_parent_dir_key, new_name)
             if dest_node.attr.nlink <= 0 then
-                redis.call('DEL', dest_node_key)
-                redis.call('DEL', 'lp:' .. dest_ino_str)
+                dest_node.attr.nlink = 0
+                dest_node.attr.ctime = timestamp
+                dest_node.deleted = true
+                redis.call('SET', dest_node_key, cjson.encode(dest_node))
+                redis.call('HSET', deleted_set_key, dest_ino_str, 1)
+                redis.call('DEL', link_parent_prefix .. dest_ino_str)
             else
+                dest_node.attr.ctime = timestamp
                 redis.call('SET', dest_node_key, cjson.encode(dest_node))
             end
         end
@@ -897,7 +907,7 @@ const RENAME_LUA: &str = r#"
         end
 
         if not found then
-            return cjson.encode({ok=false, error="link_parent_not_found"})
+            return cjson.encode({ok=false, error="link_parent_not_found", ino=child_ino})
         end
 
         -- Replace link_parents set atomically
@@ -945,7 +955,7 @@ const RENAME_LUA: &str = r#"
     new_parent_node.attr.ctime = timestamp
     redis.call('SET', new_parent_node_key, cjson.encode(new_parent_node))
 
-    return cjson.encode({ok=true})
+    return cjson.encode({ok=true, ino=child_ino, replaced_ino=replaced_ino})
 "#;
 
 const RENAME_EXCHANGE_LUA: &str = r#"
@@ -1163,6 +1173,8 @@ struct LuaResponse {
     error: Option<String>,
     #[serde(default)]
     attr: Option<serde_json::Value>,
+    #[serde(default)]
+    replaced_ino: Option<i64>,
     #[serde(default)]
     msg: Option<String>, // For Internal error details
 }
@@ -2347,41 +2359,31 @@ impl MetaStore for RedisMetaStore {
             return Ok(());
         }
 
-        // Step 1: Lookup source dentry to get child ino (preserves NotFound(old_parent) error)
-        let Some(child) = self.lookup(old_parent, old_name).await? else {
-            return Err(MetaError::NotFound(old_parent));
-        };
-        let replaced_ino = self.lookup(new_parent, &new_name).await?;
-
-        // Step 2: Construct Redis keys
         let old_parent_dir_key = self.dir_key(old_parent);
         let new_parent_dir_key = self.dir_key(new_parent);
-        let child_node_key = self.node_key(child);
         let old_parent_node_key = self.node_key(old_parent);
         let new_parent_node_key = self.node_key(new_parent);
-        let link_parents_key = Self::link_parent_key(child);
+        let deleted_set_key = self.deleted_set_key();
         let now = current_time();
 
-        // Step 3: Invoke Lua script atomically
         let script = redis::Script::new(RENAME_LUA);
         let result: String = script
             .key(&old_parent_dir_key) // KEYS[1]
             .key(&new_parent_dir_key) // KEYS[2]
-            .key(&child_node_key) // KEYS[3]
-            .key(&old_parent_node_key) // KEYS[4]
-            .key(&new_parent_node_key) // KEYS[5]
-            .key(&link_parents_key) // KEYS[6]
+            .key(&old_parent_node_key) // KEYS[3]
+            .key(&new_parent_node_key) // KEYS[4]
+            .key(deleted_set_key) // KEYS[5]
             .arg(old_name) // ARGV[1]
             .arg(&new_name) // ARGV[2]
             .arg(old_parent) // ARGV[3]
             .arg(new_parent) // ARGV[4]
             .arg(now) // ARGV[5]
-            .arg(child) // ARGV[6] - expected inode
+            .arg(NODE_KEY_PREFIX) // ARGV[6]
+            .arg(LINK_PARENT_KEY_PREFIX) // ARGV[7]
             .invoke_async(&mut self.conn.clone())
             .await
             .map_err(redis_err)?;
 
-        // Step 4: Parse response and map errors
         let response: LuaResponse = serde_json::from_str(&result)
             .map_err(|e| MetaError::Internal(format!("Lua response parse error: {e}")))?;
 
@@ -2398,15 +2400,19 @@ impl MetaStore for RedisMetaStore {
             Some("target_not_directory") => Err(MetaError::Io(std::io::Error::from(
                 std::io::ErrorKind::NotADirectory,
             ))),
-            Some("node_not_found") => Err(MetaError::NotFound(child)),
+            Some("node_not_found") => Err(MetaError::NotFound(response.ino.unwrap_or(old_parent))),
             Some("corrupt_node") => Err(MetaError::Internal("corrupt node data".into())),
             Some("link_parent_not_found") => Err(MetaError::Internal(format!(
-                "expected link parent binding {old_parent}/{old_name} for inode {child}"
+                "expected link parent binding {old_parent}/{old_name} for inode {}",
+                response.ino.unwrap_or(old_parent)
             ))),
             Some(other) => Err(MetaError::Internal(format!("Lua error: {other}"))),
             None if response.ok => {
+                let child = response
+                    .ino
+                    .ok_or_else(|| MetaError::Internal("missing ino in rename response".into()))?;
                 let mut invalidated = vec![old_parent, new_parent, child];
-                if let Some(replaced_ino) = replaced_ino {
+                if let Some(replaced_ino) = response.replaced_ino {
                     invalidated.push(replaced_ino);
                 }
                 self.invalidate_nodes(&invalidated).await;

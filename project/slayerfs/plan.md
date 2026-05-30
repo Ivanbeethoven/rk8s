@@ -47,6 +47,8 @@ Implemented changes:
 | FUSE setattr | `apply_new_entry_attrs()` skips no-op `set_attr` when uid/gid/mode already match | Avoid needless metadata writes on create-heavy workloads |
 | Redis metadata | `create_entry()` updates the local node cache for parent and new inode after successful Lua create | Avoid immediate follow-up Redis reads from the same client |
 | Redis metadata | `unlink()` now performs dentry lookup, node lookup, type check, nlink update, deleted marker insertion, hardlink parent restoration, and parent timestamp bump inside one Lua operation | Remove duplicate Redis round trips on successful unlink while preserving directory rejection and hardlink semantics |
+| Redis metadata | `rename()` lets Lua perform source/destination dentry lookup and return invalidation inodes; overwritten file targets are tombstoned and queued for cleanup | Remove two Rust-side Redis dentry lookups on successful rename while preserving POSIX overwrite semantics and GC visibility |
+| FUSE/VFS open | `open_fresh_ino()` performs the required fresh stat once and FUSE `open()` no longer does an extra cached stat before opening | Preserve close-to-open freshness while removing a duplicate metadata lookup on normal open |
 
 Environment note:
 
@@ -60,6 +62,7 @@ Rejected experiment:
 | --- | --- | --- | --- |
 | FUSE unlink/rmdir and VFS rmdir precheck removal | `docker/compose-xfstests/artifacts/perf-run-1780157265-27175` | `dirperf` was 25s, worse than the prior focused 24s result | Reverted; do not reintroduce without new evidence |
 | Redis `lookup_with_attr` helper for open/create follow-up attrs | `docker/compose-xfstests/artifacts/perf-run-1780158557-8433` | `dirperf` was 25s, worse than the prior focused result; `metaperf` improved only slightly to 210s | Reverted; avoid broad metadata API expansion until operation traces prove the exact call pattern |
+| Redis `rmdir()` Rust-side prelookup removal | `docker/compose-xfstests/artifacts/perf-run-1780163094-25634` | `dirperf` stayed 21s and `metaperf` regressed to 236s | Reverted; the safe rmdir Lua operation remains, but the prelookup removal did not earn its keep |
 
 Focused comparison:
 
@@ -67,35 +70,35 @@ Focused comparison:
 | --- | --- | ---: | --- | ---: | --- |
 | `fio-randrw` read BW | `perf-run-1780152993-885` | 115.41 MiB/s | `juicefs-perf-run-1780153510-28102` | 66.00 MiB/s | SlayerFS faster |
 | `fio-randrw` write BW | `perf-run-1780152993-885` | 53.15 MiB/s | `juicefs-perf-run-1780153510-28102` | 29.29 MiB/s | SlayerFS faster |
-| `dirperf` wall time | `perf-run-1780160758-17955` | 21s | `juicefs-perf-run-1780153510-28102` | 13s | Improved, still not close |
-| `metaperf` wall time | `perf-run-1780160758-17955` | 212s | `juicefs-perf-run-1780153510-28102` | 222s | Close on wall time |
+| `dirperf` wall time | `perf-run-1780164106-6479` | 21s | `juicefs-perf-run-1780153510-28102` | 13s | Improved, still not close |
+| `metaperf` wall time | `perf-run-1780164106-6479` | 207s | `juicefs-perf-run-1780153510-28102` | 222s | Better on wall time |
 
 Important caveat: `metaperf` wall time is close, but individual metadata ops still lag JuiceFS on create/open/rename. The next bottleneck is metadata hot-path round trips rather than disk-cache throughput.
 
 Latest focused metadata detail:
 
-| Operation | SlayerFS `perf-run-1780160758-17955` | JuiceFS `juicefs-perf-run-1780153510-28102` | Gap |
+| Operation | SlayerFS `perf-run-1780164106-6479` | JuiceFS `juicefs-perf-run-1780153510-28102` | Gap |
 | --- | ---: | ---: | --- |
-| create | 182.7 ops/s | 285.1 ops/s | SlayerFS slower |
-| open | 1937.5 ops/s | 6049.8 ops/s | SlayerFS much slower |
-| stat | 1,115,124 ops/s | 1,101,680 ops/s | Similar |
-| readdir | 28,261.3 ops/s | 37,075.7 ops/s | SlayerFS slower |
-| rename | 840.5 ops/s | 1438.3 ops/s | SlayerFS slower |
+| create | 169.9 ops/s | 285.1 ops/s | SlayerFS slower |
+| open | 1984.6 ops/s | 6049.8 ops/s | SlayerFS much slower |
+| stat | 1,116,264 ops/s | 1,101,680 ops/s | Similar |
+| readdir | 29,383.9 ops/s | 37,075.7 ops/s | SlayerFS slower |
+| rename | 903.0 ops/s | 1438.3 ops/s | SlayerFS slower |
 
 Latest focused `dirperf` shape:
 
 ```text
-docker/compose-xfstests/artifacts/perf-run-1780160758-17955
-100 1.707
-200 1.706
-300 1.733
-400 1.888
-500 2.102
-600 1.916
-700 1.927
-800 1.960
-900 1.961
-1000 1.945
+docker/compose-xfstests/artifacts/perf-run-1780164106-6479
+100 2.109
+200 1.727
+300 1.669
+400 1.735
+500 1.801
+600 1.911
+700 1.912
+800 2.253
+900 2.068
+1000 2.032
 ```
 
 Latest pre-commit verification:
@@ -107,6 +110,37 @@ Latest pre-commit verification:
 | `cargo test -p slayerfs meta::stores::redis::tests::test_hardlink_state_machine_full_transition -- --ignored --nocapture` | Passed for lib and bin test targets |
 | `cargo test -p slayerfs vfs::fs::tests::basic_tests -- --nocapture` | 7 passed for lib target and 7 passed for bin test target |
 | `cargo test -p slayerfs --lib --bins --tests` | Passed: lib target 287 passed/134 ignored, bin test target 279 passed/134 ignored, integration tests passed with expected ignored external-service tests |
+| `git diff --check` | Passed |
+
+Latest post-commit metadata continuation:
+
+| Change | Evidence | Decision |
+| --- | --- | --- |
+| Redis rename Lua-side dentry lookup | New ignored commandstats test failed before the patch with 5 Redis `HGET` calls, then passed after the patch with only Lua-side dentry lookups plus the test verification lookup | Keep |
+| Redis rename overwrite tombstone and same-inode hardlink no-op | `test_rename_lua_existing_file_target_is_replaced`, `test_rename_lua_overwrite_file`, and `test_rename_lua_hardlink_same_inode_target_is_noop` pass | Keep |
+| Redis rmdir Lua-side dentry lookup | Commandstats test passed after patch, but focused Docker perf did not improve `dirperf` and worsened `metaperf` | Reverted |
+| FUSE/VFS open duplicate stat removal | `test_open_fresh_by_ino_checks_current_attr_once` passes and focused Docker perf improved `metaperf` to 207s without changing `dirperf` | Keep |
+
+Focused continuation artifacts:
+
+| Artifact | Code state | `dirperf` | `metaperf` | Metadata note |
+| --- | --- | ---: | ---: | --- |
+| `perf-run-1780162288-9988` | Redis rename optimization only | 21s | 213s | `rename` improved to 935.6 ops/s from 840.5 ops/s |
+| `perf-run-1780163094-25634` | Redis rename plus rejected rmdir prelookup removal | 21s | 236s | Rejected because wall time regressed |
+| `perf-run-1780164106-6479` | Redis rename plus FUSE/VFS open fresh-stat de-duplication | 21s | 207s | `open` improved to 1984.6 ops/s; current best metadata wall time, still far from JuiceFS `dirperf` |
+
+Latest continuation verification:
+
+| Command | Result |
+| --- | --- |
+| `cargo test -p slayerfs meta::stores::redis::tests::test_rename_uses_lua_dentry_lookup_without_rust_prelookups -- --ignored --nocapture` | Passed for lib and bin test targets |
+| `cargo test -p slayerfs meta::stores::redis::tests::test_rename_lua -- --ignored --nocapture` | Passed: 13 rename Lua cases for lib and bin test targets |
+| `cargo test -p slayerfs meta::stores::redis::tests::test_rmdir_lua -- --ignored --nocapture` | Passed: 4 rmdir Lua cases for lib and bin test targets |
+| `cargo test -p slayerfs meta::client::tests::test_rename_operations -- --nocapture` | Passed for lib and bin test targets |
+| `cargo test -p slayerfs --test rename_integration_test -- --nocapture` | Passed: 6 integration tests |
+| `cargo test -p slayerfs vfs::fs::tests::basic_tests -- --nocapture` | Passed: 8 basic VFS tests for lib and bin test targets |
+| `cargo test -p slayerfs --test gc_test -- --nocapture` | Passed after an earlier full-suite-only `test_gc_respects_min_age` flake |
+| `timeout 20m cargo test -p slayerfs --lib --bins --tests` | Passed on rerun: lib target 288 passed/136 ignored, bin target 280 passed/136 ignored, integration tests passed with expected ignored external-service tests |
 | `git diff --check` | Passed |
 
 ## Files And Responsibilities
@@ -413,25 +447,64 @@ dirperf pass 21s
 metaperf pass 212s
 ```
 
-- [ ] **Step 3: Return attrs from metadata mutations where safe**
+- [x] **Step 3: Collapse Redis rename source/destination dentry lookup into one Lua operation**
+
+Run:
+
+```bash
+cargo test -p slayerfs meta::stores::redis::tests::test_rename_uses_lua_dentry_lookup_without_rust_prelookups -- --ignored --nocapture
+cargo test -p slayerfs meta::stores::redis::tests::test_rename_lua -- --ignored --nocapture
+cargo test -p slayerfs meta::client::tests::test_rename_operations -- --nocapture
+cargo test -p slayerfs --test rename_integration_test -- --nocapture
+bash docker/compose-xfstests/run_redis_perf.sh --tools "dirperf metaperf"
+```
+
+Verified evidence:
+
+```text
+docker/compose-xfstests/artifacts/perf-run-1780162288-9988
+dirperf pass 21s
+metaperf pass 213s
+rename 935.6 ops/s
+```
+
+The optimization is kept because it reduced store-side Redis `HGET` calls and improved isolated rename throughput. It does not close the overall `dirperf` gap by itself.
+
+- [ ] **Step 4: Return attrs from metadata mutations where safe**
 
 Extend Redis/store APIs or helper methods so create/unlink/rmdir/rename can return the affected inode attrs or child inodes directly when the store already has the data inside the atomic operation.
 
 Expected: preserve POSIX/FUSE error semantics while removing follow-up stat/lookup calls from successful hot paths.
 
-- [ ] **Step 4: Review close-to-open refresh scope**
+- [x] **Step 5: Remove duplicate FUSE open stat without relaxing close-to-open refresh**
 
-`Vfs::open()` still does `stat_fresh()` for normal opens. Keep this for correctness unless a narrower cache-validity rule can be proved by tests and Docker perf.
+FUSE `open()` previously did a cached `stat_ino()` and then called `Vfs::open()`, which performed `meta_stat_fresh()` again for close-to-open semantics. It now calls `open_fresh_ino()`, which performs the fresh stat once, rejects directories and missing inodes, and then opens with the already-fresh attr.
 
-Expected: any relaxation must have explicit stale-read and multi-client regression coverage.
+Run:
 
-- [ ] **Step 5: Consider Redis rmdir/rename single-EVAL equivalents**
+```bash
+cargo test -p slayerfs vfs::fs::tests::basic_tests::test_open_fresh_by_ino_checks_current_attr_once -- --nocapture
+bash docker/compose-xfstests/run_redis_perf.sh --tools "dirperf metaperf"
+```
+
+Verified evidence:
+
+```text
+docker/compose-xfstests/artifacts/perf-run-1780164106-6479
+dirperf pass 21s
+metaperf pass 207s
+open 1984.6 ops/s
+```
+
+The optimization is kept because it preserves the fresh stat and improves the focused metadata wall time. It does not close the `dirperf` gap to JuiceFS.
+
+- [ ] **Step 6: Consider remaining Redis single-EVAL equivalents**
 
 Apply the `unlink()` lesson narrowly: move only duplicated store-side round trips into existing atomic Redis scripts where the script already has the data, then verify with ignored Redis tests and focused `dirperf metaperf`.
 
 Expected: improve create/open/rename or directory cleanup paths without reintroducing the reverted FUSE/VFS precheck-removal regression.
 
-- [ ] **Step 6: Consider parent dentry caching or batched create handling**
+- [ ] **Step 7: Consider parent dentry caching or batched create handling**
 
 Use this only after Step 1 proves repeated parent/child lookup traffic dominates `dirperf`.
 
