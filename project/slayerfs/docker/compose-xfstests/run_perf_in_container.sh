@@ -221,6 +221,7 @@ EOF
     append_env_export PERF_FUSE_OPS_LOG "0"
     append_env_export SLAYERFS_FUSE_OP_LOG "0"
     append_env_export SLAYERFS_FUSE_LOG_FILE
+    append_env_export SLAYERFS_VFS_TIMING "0"
     append_env_export RUST_LOG
 
     cat >>"$helper" <<'EOF'
@@ -376,6 +377,20 @@ redis_diag_after_tool() {
     } >"$artifact_dir/diagnostics/redis-${tool}-after.txt" 2>&1 || true
 }
 
+stats_snapshot_after_tool() {
+    local tool="$1"
+    local stats_path="$mount_dir/.stats"
+    {
+        date -Iseconds
+        echo
+        if [[ -e "$stats_path" ]]; then
+            tr -d '\000' <"$stats_path"
+        else
+            echo "missing $stats_path"
+        fi
+    } >"$artifact_dir/diagnostics/stats-${tool}-after.txt" 2>&1 || true
+}
+
 mount_slayerfs() {
     mkdir -p "$mount_dir"
     if findmnt -rn --target "$mount_dir" --output FSTYPE 2>/dev/null | grep -Eq '^fuse(\.|$)'; then
@@ -419,6 +434,7 @@ run_logged_tool() {
     set -e
     end="$(date +%s)"
     elapsed="$((end - start))"
+    stats_snapshot_after_tool "$tool"
     redis_diag_after_tool "$tool"
 
     local log_size

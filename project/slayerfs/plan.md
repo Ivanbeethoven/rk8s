@@ -1214,9 +1214,34 @@ fio-randrw read/write: 116.34/53.85 MiB/s.
 dirperf: 14s.
 Redis note: command counts match the pre-experiment shape and `total_net_output_bytes` is back to 731197 bytes.
 Decision: current retained code is performance-neutral on wall time; Step 14 remains open for timing/perf-symbol investigation.
+
+docker/compose-xfstests/artifacts/perf-run-1780206512-22044
+Command: `SLAYERFS_VFS_TIMING=1 ./docker/compose-xfstests/run_redis_perf.sh --tools "dirperf"`.
+Experiment: gated VFS timing counters plus automatic `.stats` artifact snapshots.
+dirperf: 13s.
+VFS timing:
+  create total 11001 ops / 2.692628s total; create metadata 2.689575s.
+  unlink total 11001 ops / 2.621313s total; lookup 8.187ms, stat 6.796ms, metadata unlink 2.577286s, recently-unlinked map update 5.800ms.
+  deleted-inode timestamp setattr remove-first map path 11001 ops / 0.157ms total.
+Decision: keep the gated timing/artifact path. The recently-unlinked map is no longer the bottleneck; create/unlink await time is overwhelmingly metadata-store/Lua-side, so further map cleanup is unlikely to recover the remaining second.
+
+docker/compose-xfstests/artifacts/perf-run-1780206984-7508
+Command: `./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf"`.
+Experiment: temporary FUSE `unlink` precheck removal, leaving VFS `unlink_at` as the single validation point.
+fio-randrw read/write: 117.80/54.85 MiB/s.
+dirperf: 14s.
+Decision: reverted. The cleanup is plausible but did not move mixed dirperf below 14s, so it is not enough evidence for a performance patch.
+
+docker/compose-xfstests/artifacts/perf-run-1780207569-21270
+Command: `./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf"`.
+Experiment: final retained code after reverting the FUSE unlink precheck experiment, with gated VFS timing disabled by default and `.stats` snapshots copied into tool diagnostics.
+fio-randrw read/write: 122.79/56.97 MiB/s.
+dirperf: 14s.
+Stats artifact note: `diagnostics/stats-dirperf-after.txt` is NUL-stripped and shows VFS timing counters at zero when `SLAYERFS_VFS_TIMING` is not enabled.
+Decision: keep the diagnostic infrastructure, not as a direct performance win. The mixed dirperf target remains open.
 ```
 
-Next hypothesis: mixed `dirperf` remains at a stable 14s, while JuiceFS/isolated target remains 13s. FUSE traces show create/unlink service time is still the meaningful local hot path, but Redis command-count reductions and larger Lua responses have not explained the remaining second. Next, use an unstripped PID-attached perf profile or a low-overhead internal timing counter around VFS create/unlink substeps to split local costs between MetaClient cache hits, recently-unlinked map work, and Redis await time; avoid another broad default-tuning change or response-shape change unless it explains the final 1s gap.
+Next hypothesis: mixed `dirperf` remains at a stable 14s, while JuiceFS/isolated target remains 13s. Low-overhead VFS timing ruled out recently-unlinked map work and showed create/unlink are dominated by metadata create/unlink await time. Next, either inspect Redis create/unlink Lua command shape for a real command-count/round-trip reduction or use an unstripped PID-attached perf profile to split the remaining cost between Redis client await/scheduler overhead and server-side Lua execution. Avoid further local map cleanup or FUSE precheck cleanup unless a profile shows it contributes measurable mixed wall time.
 
 ## Maintenance Rules
 

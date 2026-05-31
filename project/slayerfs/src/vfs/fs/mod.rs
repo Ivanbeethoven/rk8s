@@ -88,6 +88,17 @@ const RECENTLY_UNLINKED_ATTR_CLEANUP_THRESHOLD: usize = 4096;
 const RECENTLY_UNLINKED_ATTR_CLEANUP_INTERVAL: u64 =
     RECENTLY_UNLINKED_ATTR_CLEANUP_THRESHOLD as u64;
 
+fn vfs_timing_enabled_from_env() -> bool {
+    std::env::var("SLAYERFS_VFS_TIMING")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 use crate::vfs::Inode;
 use crate::vfs::backend::Backend;
 use crate::vfs::cache::config::CacheConfig;
@@ -254,6 +265,7 @@ where
     append_locks: DashMap<i64, Arc<Mutex<()>>>,
     posix_lock_owners: DashMap<(i64, i64), ()>,
     pub(crate) stats: Arc<crate::vfs::stats::FsStats>,
+    vfs_timing_enabled: bool,
 }
 
 impl<S, M> VfsState<S, M>
@@ -361,6 +373,7 @@ where
             append_locks: DashMap::new(),
             posix_lock_owners: DashMap::new(),
             stats: Arc::new(crate::vfs::stats::FsStats::new()),
+            vfs_timing_enabled: vfs_timing_enabled_from_env(),
         }
     }
 
@@ -795,6 +808,18 @@ where
         &self.state.stats
     }
 
+    fn vfs_timing_timer<'a>(
+        &'a self,
+        ops_counter: &'a AtomicU64,
+        lat_counter: &'a AtomicU64,
+    ) -> crate::vfs::stats::MaybeOpTimer<'a> {
+        crate::vfs::stats::MaybeOpTimer::new(
+            self.state.vfs_timing_enabled,
+            ops_counter,
+            lat_counter,
+        )
+    }
+
     pub(crate) fn meta_layer(&self) -> &M {
         self.core.meta_layer.as_ref()
     }
@@ -1174,11 +1199,23 @@ where
         name: &str,
         create_new: bool,
     ) -> Result<i64, VfsError> {
+        let _total_timer = self.vfs_timing_timer(
+            &self.stats().vfs_create_total_ops,
+            &self.stats().vfs_create_total_lat_us,
+        );
         if name.is_empty() || name.contains('/') || name.contains('\0') {
             return Err(VfsError::InvalidFilename);
         }
 
-        match self.meta_create_file(parent_ino, name.to_string()).await {
+        let create_result = {
+            let _meta_timer = self.vfs_timing_timer(
+                &self.stats().vfs_create_meta_ops,
+                &self.stats().vfs_create_meta_lat_us,
+            );
+            self.meta_create_file(parent_ino, name.to_string()).await
+        };
+
+        match create_result {
             Ok(ino) => Ok(ino),
             Err(VfsError::AlreadyExists { .. }) => {
                 if create_new {
@@ -1248,22 +1285,49 @@ where
     /// Remove a regular file or symlink using parent inode and name directly.
     #[tracing::instrument(level = "debug", skip(self), fields(parent_ino, name))]
     pub(crate) async fn unlink_at(&self, parent_ino: i64, name: &str) -> Result<(), VfsError> {
+        let _total_timer = self.vfs_timing_timer(
+            &self.stats().vfs_unlink_total_ops,
+            &self.stats().vfs_unlink_total_lat_us,
+        );
         if name.is_empty() || name.contains('/') || name.contains('\0') {
             return Err(VfsError::InvalidFilename);
         }
 
-        let ino = self
-            .meta_lookup_required(parent_ino, name, PathHint::none())
-            .await?;
-        let attr = self.meta_stat_required(ino, PathHint::none()).await?;
+        let ino = {
+            let _lookup_timer = self.vfs_timing_timer(
+                &self.stats().vfs_unlink_lookup_ops,
+                &self.stats().vfs_unlink_lookup_lat_us,
+            );
+            self.meta_lookup_required(parent_ino, name, PathHint::none())
+                .await?
+        };
+        let attr = {
+            let _stat_timer = self.vfs_timing_timer(
+                &self.stats().vfs_unlink_stat_ops,
+                &self.stats().vfs_unlink_stat_lat_us,
+            );
+            self.meta_stat_required(ino, PathHint::none()).await?
+        };
         if attr.kind == FileType::Dir {
             return Err(VfsError::IsADirectory {
                 path: PathHint::none(),
             });
         }
 
-        self.meta_unlink(parent_ino, name).await?;
-        self.remember_recently_unlinked_attr(ino, attr);
+        {
+            let _meta_timer = self.vfs_timing_timer(
+                &self.stats().vfs_unlink_meta_ops,
+                &self.stats().vfs_unlink_meta_lat_us,
+            );
+            self.meta_unlink(parent_ino, name).await?;
+        }
+        {
+            let _recent_timer = self.vfs_timing_timer(
+                &self.stats().vfs_unlink_recent_ops,
+                &self.stats().vfs_unlink_recent_lat_us,
+            );
+            self.remember_recently_unlinked_attr(ino, attr);
+        }
         Ok(())
     }
 
@@ -1840,10 +1904,16 @@ where
     ) -> Result<FileAttr, VfsError> {
         if Self::deleted_inode_timestamp_only_setattr(req, &flags) {
             let remove_after = self.state.handles.has_no_handle(ino);
-            if remove_after
-                && let Some((_, (mut attr, inserted_at))) =
-                    self.state.recently_unlinked.remove(&ino)
-            {
+            let removed = if remove_after {
+                let _remove_timer = self.vfs_timing_timer(
+                    &self.stats().vfs_setattr_recent_remove_ops,
+                    &self.stats().vfs_setattr_recent_remove_lat_us,
+                );
+                self.state.recently_unlinked.remove(&ino)
+            } else {
+                None
+            };
+            if let Some((_, (mut attr, inserted_at))) = removed {
                 let original = attr.clone();
                 if let Err(err) = Self::apply_timestamp_setattr_locally(&mut attr, req, &flags) {
                     self.state
@@ -1856,7 +1926,14 @@ where
                 return Ok(attr);
             }
 
-            if let Some(mut entry) = self.state.recently_unlinked.get_mut(&ino) {
+            let recent_entry = {
+                let _get_mut_timer = self.vfs_timing_timer(
+                    &self.stats().vfs_setattr_recent_get_mut_ops,
+                    &self.stats().vfs_setattr_recent_get_mut_lat_us,
+                );
+                self.state.recently_unlinked.get_mut(&ino)
+            };
+            if let Some(mut entry) = recent_entry {
                 let mut attr = entry.0.clone();
                 Self::apply_timestamp_setattr_locally(&mut attr, req, &flags)?;
                 attr.nlink = 0;
@@ -1864,6 +1941,10 @@ where
                 self.state.handles.update_attr_for_inode(ino, &attr);
                 drop(entry);
                 if remove_after {
+                    let _remove_timer = self.vfs_timing_timer(
+                        &self.stats().vfs_setattr_recent_remove_ops,
+                        &self.stats().vfs_setattr_recent_remove_lat_us,
+                    );
                     self.state.recently_unlinked.remove(&ino);
                 }
                 return Ok(attr);

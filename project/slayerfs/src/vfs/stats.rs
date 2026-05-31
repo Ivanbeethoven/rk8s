@@ -9,7 +9,7 @@
 //! throughput and latency in the terminal.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Relaxed ordering is sufficient for stats counters — we only need eventual
 /// visibility, not happens-before relationships.
@@ -64,6 +64,44 @@ pub struct FsStats {
     /// Total metadata transaction latency in microseconds
     pub meta_txn_lat_us: AtomicU64,
 
+    // ─── VFS diagnostic timing ───────────────────────────────────
+    /// Total VFS create_file_at operations timed by the optional diagnostic path
+    pub vfs_create_total_ops: AtomicU64,
+    /// Total VFS create_file_at latency in microseconds
+    pub vfs_create_total_lat_us: AtomicU64,
+    /// Total metadata create calls inside create_file_at
+    pub vfs_create_meta_ops: AtomicU64,
+    /// Total metadata create latency inside create_file_at in microseconds
+    pub vfs_create_meta_lat_us: AtomicU64,
+    /// Total VFS unlink_at operations timed by the optional diagnostic path
+    pub vfs_unlink_total_ops: AtomicU64,
+    /// Total VFS unlink_at latency in microseconds
+    pub vfs_unlink_total_lat_us: AtomicU64,
+    /// Total lookup calls inside unlink_at
+    pub vfs_unlink_lookup_ops: AtomicU64,
+    /// Total lookup latency inside unlink_at in microseconds
+    pub vfs_unlink_lookup_lat_us: AtomicU64,
+    /// Total stat calls inside unlink_at
+    pub vfs_unlink_stat_ops: AtomicU64,
+    /// Total stat latency inside unlink_at in microseconds
+    pub vfs_unlink_stat_lat_us: AtomicU64,
+    /// Total metadata unlink calls inside unlink_at
+    pub vfs_unlink_meta_ops: AtomicU64,
+    /// Total metadata unlink latency inside unlink_at in microseconds
+    pub vfs_unlink_meta_lat_us: AtomicU64,
+    /// Total recently-unlinked map updates inside unlink_at
+    pub vfs_unlink_recent_ops: AtomicU64,
+    /// Total recently-unlinked map update latency inside unlink_at in microseconds
+    pub vfs_unlink_recent_lat_us: AtomicU64,
+    /// Total remove-first deleted-inode setattr map probes
+    pub vfs_setattr_recent_remove_ops: AtomicU64,
+    /// Total remove-first deleted-inode setattr map latency in microseconds
+    pub vfs_setattr_recent_remove_lat_us: AtomicU64,
+    /// Total get_mut deleted-inode setattr map probes
+    pub vfs_setattr_recent_get_mut_ops: AtomicU64,
+    /// Total get_mut deleted-inode setattr map latency in microseconds
+    pub vfs_setattr_recent_get_mut_lat_us: AtomicU64,
+
     // ─── Object storage (S3) layer ───────────────────────────────
     /// Total S3 GET requests
     pub s3_get_ops: AtomicU64,
@@ -115,6 +153,24 @@ impl FsStats {
             meta_lat_us: AtomicU64::new(0),
             meta_txn_ops: AtomicU64::new(0),
             meta_txn_lat_us: AtomicU64::new(0),
+            vfs_create_total_ops: AtomicU64::new(0),
+            vfs_create_total_lat_us: AtomicU64::new(0),
+            vfs_create_meta_ops: AtomicU64::new(0),
+            vfs_create_meta_lat_us: AtomicU64::new(0),
+            vfs_unlink_total_ops: AtomicU64::new(0),
+            vfs_unlink_total_lat_us: AtomicU64::new(0),
+            vfs_unlink_lookup_ops: AtomicU64::new(0),
+            vfs_unlink_lookup_lat_us: AtomicU64::new(0),
+            vfs_unlink_stat_ops: AtomicU64::new(0),
+            vfs_unlink_stat_lat_us: AtomicU64::new(0),
+            vfs_unlink_meta_ops: AtomicU64::new(0),
+            vfs_unlink_meta_lat_us: AtomicU64::new(0),
+            vfs_unlink_recent_ops: AtomicU64::new(0),
+            vfs_unlink_recent_lat_us: AtomicU64::new(0),
+            vfs_setattr_recent_remove_ops: AtomicU64::new(0),
+            vfs_setattr_recent_remove_lat_us: AtomicU64::new(0),
+            vfs_setattr_recent_get_mut_ops: AtomicU64::new(0),
+            vfs_setattr_recent_get_mut_lat_us: AtomicU64::new(0),
             s3_get_ops: AtomicU64::new(0),
             s3_get_bytes: AtomicU64::new(0),
             s3_get_lat_us: AtomicU64::new(0),
@@ -222,6 +278,80 @@ impl FsStats {
             self.meta_txn_lat_us.load(ORD)
         ));
 
+        // VFS diagnostic timing
+        out.push_str(&format!(
+            "slayerfs_vfs_create_total_ops_total {}\n",
+            self.vfs_create_total_ops.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_create_total_lat_us_total {}\n",
+            self.vfs_create_total_lat_us.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_create_meta_ops_total {}\n",
+            self.vfs_create_meta_ops.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_create_meta_lat_us_total {}\n",
+            self.vfs_create_meta_lat_us.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_unlink_total_ops_total {}\n",
+            self.vfs_unlink_total_ops.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_unlink_total_lat_us_total {}\n",
+            self.vfs_unlink_total_lat_us.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_unlink_lookup_ops_total {}\n",
+            self.vfs_unlink_lookup_ops.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_unlink_lookup_lat_us_total {}\n",
+            self.vfs_unlink_lookup_lat_us.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_unlink_stat_ops_total {}\n",
+            self.vfs_unlink_stat_ops.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_unlink_stat_lat_us_total {}\n",
+            self.vfs_unlink_stat_lat_us.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_unlink_meta_ops_total {}\n",
+            self.vfs_unlink_meta_ops.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_unlink_meta_lat_us_total {}\n",
+            self.vfs_unlink_meta_lat_us.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_unlink_recent_ops_total {}\n",
+            self.vfs_unlink_recent_ops.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_unlink_recent_lat_us_total {}\n",
+            self.vfs_unlink_recent_lat_us.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_setattr_recent_remove_ops_total {}\n",
+            self.vfs_setattr_recent_remove_ops.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_setattr_recent_remove_lat_us_total {}\n",
+            self.vfs_setattr_recent_remove_lat_us.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_setattr_recent_get_mut_ops_total {}\n",
+            self.vfs_setattr_recent_get_mut_ops.load(ORD)
+        ));
+        out.push_str(&format!(
+            "slayerfs_vfs_setattr_recent_get_mut_lat_us_total {}\n",
+            self.vfs_setattr_recent_get_mut_lat_us.load(ORD)
+        ));
+
         // Object storage
         out.push_str(&format!(
             "slayerfs_s3_get_ops_total {}\n",
@@ -272,6 +402,12 @@ impl FsStats {
 
         out
     }
+
+    pub fn record_duration(ops_counter: &AtomicU64, lat_counter: &AtomicU64, duration: Duration) {
+        let elapsed_us = duration.as_micros() as u64;
+        ops_counter.fetch_add(1, ORD);
+        lat_counter.fetch_add(elapsed_us, ORD);
+    }
 }
 
 impl Default for FsStats {
@@ -305,9 +441,33 @@ impl<'a> OpTimer<'a> {
 
 impl<'a> Drop for OpTimer<'a> {
     fn drop(&mut self) {
-        let elapsed_us = self.start.elapsed().as_micros() as u64;
-        self.ops_counter.fetch_add(1, ORD);
-        self.lat_counter.fetch_add(elapsed_us, ORD);
+        FsStats::record_duration(self.ops_counter, self.lat_counter, self.start.elapsed());
+    }
+}
+
+/// Optional timer for diagnostic hot-path stats. Disabled timers avoid
+/// `Instant::now()` so production hot paths only pay a cheap branch.
+pub struct MaybeOpTimer<'a> {
+    start: Option<Instant>,
+    ops_counter: &'a AtomicU64,
+    lat_counter: &'a AtomicU64,
+}
+
+impl<'a> MaybeOpTimer<'a> {
+    pub fn new(enabled: bool, ops_counter: &'a AtomicU64, lat_counter: &'a AtomicU64) -> Self {
+        Self {
+            start: enabled.then(Instant::now),
+            ops_counter,
+            lat_counter,
+        }
+    }
+}
+
+impl<'a> Drop for MaybeOpTimer<'a> {
+    fn drop(&mut self) {
+        if let Some(start) = self.start {
+            FsStats::record_duration(self.ops_counter, self.lat_counter, start.elapsed());
+        }
     }
 }
 
@@ -348,6 +508,10 @@ mod tests {
         assert!(output.contains("slayerfs_s3_put_ops_total 10"));
         assert!(output.contains("slayerfs_uptime_seconds"));
         assert!(output.contains("slayerfs_cache_hits_total 0"));
+        assert!(output.contains("slayerfs_vfs_create_total_ops_total 0"));
+        assert!(output.contains("slayerfs_vfs_unlink_lookup_lat_us_total 0"));
+        assert!(output.contains("slayerfs_vfs_unlink_recent_ops_total 0"));
+        assert!(output.contains("slayerfs_vfs_setattr_recent_remove_lat_us_total 0"));
     }
 
     #[test]

@@ -277,6 +277,7 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e SLAYERFS_S3_PART_SIZE \
     -e SLAYERFS_S3_MAX_CONCURRENCY \
     -e SLAYERFS_COMPRESSION \
+    -e SLAYERFS_VFS_TIMING \
     -e PERF_LOG_TO_CONSOLE \
     perf
 container_status=$?
