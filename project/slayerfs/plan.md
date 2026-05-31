@@ -60,6 +60,7 @@ Implemented changes:
 | FUSE dispatch | Default `fuse_workers` is now `1`, which keeps the low-overhead `rfuse3` session dispatch path unless the operator explicitly requests a worker pool | Avoid worker-pool scheduling overhead on metadata-heavy workloads while preserving `--fuse-workers > 1` for high-concurrency override |
 | Perf tooling | Redis perf runner can inject `SLAYERFS_FUSE_WORKERS` and `SLAYERFS_FUSE_MAX_BACKGROUND` into generated backend config | Make FUSE dispatch and background-queue experiments reproducible from artifact-local perf runs |
 | Redis metadata | `stat_fs()` now batches node payload loads with one Redis `MGET` after the node-key scan | Remove per-inode Redis `GET` round trips from FUSE `statfs` without changing accounting semantics |
+| Perf tooling | Redis perf runner can pass `SLAYERFS_S3_PART_SIZE` and `SLAYERFS_S3_MAX_CONCURRENCY` to the perf container | Make S3/RustFS small-write concurrency sweeps reproducible without changing the default benchmark config |
 
 Environment note:
 
@@ -81,6 +82,9 @@ Rejected experiment:
 | Redis create/unlink Lua array reply parser | `docker/compose-xfstests/artifacts/perf-run-1780183967-4848` | `dirperf` stayed 15s and `metaperf` regressed to 202s; `rename` dropped to 904.5 ops/s from 949.6 ops/s | Reverted; avoiding Lua `cjson.encode` plus Rust JSON parse for tiny create/unlink responses did not improve the accepted baseline |
 | FUSE `max_background=64` as default candidate | `docker/compose-xfstests/artifacts/perf-run-1780192554-24836` | `dirperf` stayed 14s and `metaperf` was 204s; fio read/write stayed healthy at 119.91/55.74 MiB/s but tail latency worsened versus default | Rejected as a default change; queue depth alone does not explain mixed-run variance |
 | FUSE `workers=2` as default candidate | `docker/compose-xfstests/artifacts/perf-run-1780193173-15361` | Isolated `dirperf` matched 13s in `perf-run-1780193143-32485`, but mixed `dirperf` regressed to 15s despite `metaperf` improving to 198s | Rejected as a default change; keep worker pool as explicit override for metaperf-oriented experiments |
+| S3 SDK single-`Bytes` `ByteStream` fast path | `docker/compose-xfstests/artifacts/perf-run-1780196012-19201` | Single-op create dropped to 198.7 ops/s from the prior 213.7 ops/s diagnostic | Reverted; the existing stream construction is not the create bottleneck |
+| Immediate `CommitBeforeUpload` for explicit `commit_first` mode | `docker/compose-xfstests/artifacts/perf-run-1780197692-30157` | After wiring the config so the mode actually applied, single-op create reached only 197.5 ops/s | Reverted; early metadata visibility is unsafe and did not improve the S3/RustFS create gap |
+| S3 `max_concurrency=32` as perf-runner default candidate | `docker/compose-xfstests/artifacts/perf-run-1780197799-26251` | Single-op create dropped to 178.3 ops/s even though the generated backend config showed `max_concurrency: 32` | Reverted; RustFS small PUTs regress under this concurrency in the current workload |
 
 Focused comparison:
 
@@ -183,6 +187,14 @@ Focused continuation artifacts:
 | `perf-run-1780194080-13474` | SlayerFS local-fs `fio-randrw dirperf` diagnostic | 14s | n/a | `dirperf` still reported 14s after fio, so mixed metadata variance is not only object-store specific |
 | `perf-run-1780194725-4446` | Reduced local-fs `dirperf` with Redis `stat_fs()` MGET batching and `PERF_FUSE_OPS_LOG=1` | 1s | n/a | FUSE `statfs` fell from 129.8ms total in `perf-run-1780192933-16633` to 6.7ms total |
 | `perf-run-1780194768-12125` | Redis `stat_fs()` MGET batching, mixed `fio-randrw dirperf metaperf` | 14s | 204s | fio stayed healthy at 117.37/54.70 MiB/s, create/open/rename improved slightly versus `perf-run-1780191648-27152`, but mixed `dirperf` did not reach 13s |
+| `perf-run-1780195456-1924` | `SLAYERFS_COMPRESSION=off` single-op S3/RustFS `metaperf create` diagnostic | n/a | n/a | Create was 208.4 ops/s, worse than the prior 213.7 ops/s default diagnostic; compression is not the create gap |
+| `perf-run-1780195524-27745` | Reduced S3/RustFS create with `PERF_FUSE_OPS_LOG=1` | n/a | n/a | FUSE `flush` dominated latency: avg 2944.9us, p95 4756.9us; `create` itself averaged 293.4us |
+| `perf-run-1780195546-21381` | Matching local-fs create with `PERF_FUSE_OPS_LOG=1` | n/a | n/a | FUSE `flush` was much lower at avg 1630.2us while `create` stayed similar at 283.9us; object writeback is the S3-specific part of the gap |
+| `perf-run-1780196408-25723` | `SLAYERFS_WRITEBACK_MODE=commit_first` before config plumbing | n/a | n/a | Create was 203.8 ops/s, but generated config did not contain writeback settings; this proved the env was not reaching `CacheConfig` |
+| `perf-run-1780197692-30157` | True `cache.writeback_mode: commit_first` after temporary config plumbing and immediate pre-upload commit | n/a | n/a | Create was 197.5 ops/s; rejected and reverted because it was slower and weakened visibility semantics |
+| `perf-run-1780197799-26251` | S3 `max_concurrency=32` single-op create diagnostic | n/a | n/a | Create was 178.3 ops/s; rejected as a perf-runner default |
+| `perf-run-1780197857-13682` | S3 `max_concurrency=4` single-op create diagnostic | n/a | n/a | Create was 211.1 ops/s, close to but not better than the old 8-concurrency diagnostic |
+| `perf-run-1780197948-14241` | S3 `max_concurrency=1` single-op create diagnostic | n/a | n/a | Create was 205.0 ops/s; lower concurrency does not close the JuiceFS gap |
 
 Latest continuation verification:
 
@@ -220,6 +232,13 @@ Latest continuation verification:
 | `SLAYERFS_FUSE_WORKERS=1 SLAYERFS_FUSE_MAX_BACKGROUND=64 ./docker/compose-xfstests/run_redis_perf.sh --tools "dirperf"` | Passed: `perf-run-1780190903-31660`, `dirperf` 13s |
 | `./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf metaperf"` | Passed with no FUSE env override: `perf-run-1780191648-27152`, fio 120.86/56.01 MiB/s, `dirperf` 14s, `metaperf` 203s |
 | `./docker/compose-xfstests/run_redis_perf.sh --tools "dirperf"` | Passed with no FUSE env override: `perf-run-1780191973-11822`, `dirperf` 13s |
+| `SLAYERFS_COMPRESSION=off PERF_METAPERF_ARGS='-d /mnt/slayerfs/.perf-metaperf -t 15 -s 4096 -l 16 -L 16 -n 200 -N 2000 create' ./docker/compose-xfstests/run_redis_perf.sh --tools "metaperf"` | Passed: `perf-run-1780195456-1924`, create 208.4 ops/s; rejected as an optimization |
+| `PERF_FUSE_OPS_LOG=1 PERF_METAPERF_ARGS='-d /mnt/slayerfs/.perf-metaperf -t 5 -s 4096 -l 16 -L 16 -n 100 -N 500 create' ./docker/compose-xfstests/run_redis_perf.sh --tools "metaperf"` | Passed: `perf-run-1780195524-27745`; FUSE `flush` avg 2944.9us dominated S3 create |
+| `PERF_FUSE_OPS_LOG=1 PERF_METAPERF_ARGS='-d /mnt/slayerfs/.perf-metaperf -t 5 -s 4096 -l 16 -L 16 -n 100 -N 500 create' ./docker/compose-xfstests/run_redis_perf.sh --local-fs --tools "metaperf"` | Passed: `perf-run-1780195546-21381`; local-fs `flush` avg 1630.2us |
+| `SLAYERFS_S3_MAX_CONCURRENCY=4 PERF_METAPERF_ARGS='-d /mnt/slayerfs/.perf-metaperf -t 15 -s 4096 -l 16 -L 16 -n 200 -N 2000 create' ./docker/compose-xfstests/run_redis_perf.sh --tools "metaperf"` | Passed: `perf-run-1780197857-13682`, generated config showed `max_concurrency: 4`, create 211.1 ops/s |
+| `SLAYERFS_S3_MAX_CONCURRENCY=1 PERF_METAPERF_ARGS='-d /mnt/slayerfs/.perf-metaperf -t 15 -s 4096 -l 16 -L 16 -n 200 -N 2000 create' ./docker/compose-xfstests/run_redis_perf.sh --tools "metaperf"` | Passed: `perf-run-1780197948-14241`, generated config showed `max_concurrency: 1`, create 205.0 ops/s |
+| `bash -n docker/compose-xfstests/run_redis_perf.sh` | Passed after adding S3 perf env pass-through |
+| `git diff --check` | Passed after updating `plan.md` and perf runner pass-through |
 
 ## Files And Responsibilities
 
@@ -1045,9 +1064,48 @@ fio-randrw read/write: 117.37/54.70 MiB/s.
 dirperf: 14s.
 metaperf: 204s.
 Decision: keep the statfs batching as a narrow local hotspot fix, but Step 14 remains open because mixed dirperf is still above the 13s target.
+
+docker/compose-xfstests/artifacts/perf-run-1780195456-1924
+Experiment: SLAYERFS_COMPRESSION=off, single-op S3/RustFS metaperf create.
+create: 208.4 ops/s.
+Decision: reject compression as the primary create-gap explanation; disabling it was slightly worse than the prior 213.7 ops/s default diagnostic.
+
+docker/compose-xfstests/artifacts/perf-run-1780195524-27745
+Experiment: reduced S3/RustFS metaperf create with PERF_FUSE_OPS_LOG=1.
+FUSE flush: 1803 calls, avg 2944.9 us, p95 4756.9 us, p99 7171.9 us.
+FUSE create: 701 calls, avg 293.4 us.
+
+docker/compose-xfstests/artifacts/perf-run-1780195546-21381
+Experiment: matching reduced local-fs metaperf create with PERF_FUSE_OPS_LOG=1.
+FUSE flush: 2603 calls, avg 1630.2 us, p95 2392.1 us, p99 4073.1 us.
+FUSE create: 701 calls, avg 283.9 us.
+Decision: the S3 create gap is mostly the flush/object-writeback phase, not the metadata create operation.
+
+docker/compose-xfstests/artifacts/perf-run-1780196012-19201
+Experiment: temporary S3 SDK single-Bytes ByteStream fast path.
+create: 198.7 ops/s.
+Decision: reverted; the SDK stream wrapper was not the small-write bottleneck.
+
+docker/compose-xfstests/artifacts/perf-run-1780197692-30157
+Experiment: temporary true cache.writeback_mode=commit_first with immediate metadata commit before upload.
+create: 197.5 ops/s.
+Decision: reverted; the unsafe early-visibility mode did not improve create and should not be kept as a performance fix.
+
+docker/compose-xfstests/artifacts/perf-run-1780197799-26251
+Experiment: temporary S3 max_concurrency=32 perf-runner default candidate.
+create: 178.3 ops/s.
+
+docker/compose-xfstests/artifacts/perf-run-1780197857-13682
+Experiment: explicit SLAYERFS_S3_MAX_CONCURRENCY=4 diagnostic.
+create: 211.1 ops/s.
+
+docker/compose-xfstests/artifacts/perf-run-1780197948-14241
+Experiment: explicit SLAYERFS_S3_MAX_CONCURRENCY=1 diagnostic.
+create: 205.0 ops/s.
+Decision: keep only the env pass-through for reproducibility; do not change the default 8-concurrency perf-runner config because none of 1/4/32 beats the prior 8-concurrency diagnostic.
 ```
 
-Next hypothesis: the remaining mixed-run variance is not fixed by static FUSE worker/queue defaults or Redis `statfs` scanning. Investigate either (1) the S3/RustFS small-write path behind the `metaperf create` gap, (2) why local-fs fio still perturbs following metadata latency even when Redis command counts are unchanged, or (3) an unstripped PID-attached perf profile for the 14s mixed `dirperf` phase. Prefer evidence from the object writeback path or unstripped perf frames over another FUSE default change.
+Next hypothesis: the remaining mixed-run variance is not fixed by static FUSE worker/queue defaults, Redis `statfs` scanning, compression, simple S3 SDK stream wrapping, early metadata commit, or coarse S3 concurrency tuning. Investigate either (1) batching/coalescing the safe small-object writeback path without weakening close semantics, (2) why local-fs fio still perturbs following metadata latency even when Redis command counts are unchanged, or (3) an unstripped PID-attached perf profile for the 14s mixed `dirperf` phase. Prefer evidence from the object writeback path or unstripped perf frames over another default-tuning change.
 
 ## Maintenance Rules
 

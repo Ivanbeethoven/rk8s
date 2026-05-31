@@ -274,6 +274,8 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e SLAYERFS_FUSE_WORKERS \
     -e SLAYERFS_FUSE_MAX_BACKGROUND \
     -e SLAYERFS_NOFILE_LIMIT \
+    -e SLAYERFS_S3_PART_SIZE \
+    -e SLAYERFS_S3_MAX_CONCURRENCY \
     -e SLAYERFS_COMPRESSION \
     -e PERF_LOG_TO_CONSOLE \
     perf
