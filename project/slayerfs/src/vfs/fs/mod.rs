@@ -85,6 +85,8 @@ struct VfsBackgroundTasks {
 
 const RECENTLY_UNLINKED_ATTR_TTL: Duration = Duration::from_secs(5);
 const RECENTLY_UNLINKED_ATTR_CLEANUP_THRESHOLD: usize = 4096;
+const RECENTLY_UNLINKED_ATTR_CLEANUP_INTERVAL: u64 =
+    RECENTLY_UNLINKED_ATTR_CLEANUP_THRESHOLD as u64;
 
 use crate::vfs::Inode;
 use crate::vfs::backend::Backend;
@@ -282,6 +284,7 @@ where
     handles: HandleRegistry<S, M>,
     inodes: DashMap<i64, Arc<Inode>>,
     recently_unlinked: DashMap<i64, (FileAttr, Instant)>,
+    recently_unlinked_cleanup_tick: AtomicU64,
     reader: Arc<DataReader<S, M>>,
     writer: Arc<DataWriter<S, M>>,
     modified: ModifiedTracker,
@@ -389,6 +392,7 @@ where
             handles: HandleRegistry::new(),
             inodes: DashMap::new(),
             recently_unlinked: DashMap::new(),
+            recently_unlinked_cleanup_tick: AtomicU64::new(0),
             reader,
             writer,
             modified: ModifiedTracker::new(),
@@ -1909,6 +1913,22 @@ where
     ) -> Result<FileAttr, VfsError> {
         if Self::deleted_inode_timestamp_only_setattr(req, &flags) {
             let remove_after = self.state.handles.has_no_handle(ino);
+            if remove_after
+                && let Some((_, (mut attr, inserted_at))) =
+                    self.state.recently_unlinked.remove(&ino)
+            {
+                let original = attr.clone();
+                if let Err(err) = Self::apply_timestamp_setattr_locally(&mut attr, req, &flags) {
+                    self.state
+                        .recently_unlinked
+                        .insert(ino, (original, inserted_at));
+                    return Err(err);
+                }
+                attr.nlink = 0;
+                self.state.handles.update_attr_for_inode(ino, &attr);
+                return Ok(attr);
+            }
+
             if let Some(mut entry) = self.state.recently_unlinked.get_mut(&ino) {
                 let mut attr = entry.0.clone();
                 Self::apply_timestamp_setattr_locally(&mut attr, req, &flags)?;
@@ -2750,7 +2770,14 @@ where
     }
 
     fn remember_recently_unlinked_attr(&self, ino: i64, mut attr: FileAttr) {
-        if self.state.recently_unlinked.len() >= RECENTLY_UNLINKED_ATTR_CLEANUP_THRESHOLD {
+        if self.state.recently_unlinked.len() >= RECENTLY_UNLINKED_ATTR_CLEANUP_THRESHOLD
+            && self
+                .state
+                .recently_unlinked_cleanup_tick
+                .fetch_add(1, Ordering::Relaxed)
+                % RECENTLY_UNLINKED_ATTR_CLEANUP_INTERVAL
+                == 0
+        {
             self.cleanup_recently_unlinked_attrs();
         }
         attr.nlink = 0;

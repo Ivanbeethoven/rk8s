@@ -62,6 +62,7 @@ Implemented changes:
 | Redis metadata | `stat_fs()` now batches node payload loads with one Redis `MGET` after the node-key scan | Remove per-inode Redis `GET` round trips from FUSE `statfs` without changing accounting semantics |
 | Perf tooling | Redis perf runner can pass `SLAYERFS_S3_PART_SIZE` and `SLAYERFS_S3_MAX_CONCURRENCY` to the perf container | Make S3/RustFS small-write concurrency sweeps reproducible without changing the default benchmark config |
 | VFS writeback | Best-effort SSD dirty-slice persistence now runs concurrently with the object upload for each upload batch | Remove local fsync/writeback-cache latency from the foreground flush critical path without weakening upload-before-commit visibility |
+| VFS unlink/setattr | Recently-unlinked inode attr cleanup is throttled after the threshold and no-handle timestamp-only `setattr` removes the short-lived attr in one map operation | Avoid repeated full-map cleanup and one extra hot-path map operation in create/unlink-heavy `dirperf` loops |
 
 Environment note:
 
@@ -199,6 +200,13 @@ Focused continuation artifacts:
 | `perf-run-1780199010-26913` | Best-effort SSD persist overlapped with S3 upload, single-op S3/RustFS `metaperf create` | n/a | n/a | Create improved to 279.8 ops/s from the prior 213.7 ops/s S3 diagnostic, closing most of the JuiceFS 305.8 ops/s gap |
 | `perf-run-1780199065-12909` | Same writeback overlap change, mixed `fio-randrw dirperf metaperf` | 15s | 199s | fio stayed healthy at 118.48/54.72 MiB/s and create improved to 231.0 ops/s, but mixed `dirperf` regressed to 15s |
 | `perf-run-1780199386-12772` | Same writeback overlap change, dirperf-only repeat | 13s | n/a | Isolated `dirperf` still matches JuiceFS; the remaining 15s mixed result is still fio-aftereffect variance rather than this writeback change breaking standalone metadata |
+| `perf-run-1780200122-4750` | Full `dirperf` with FUSE op trace enabled | 16s | n/a | Trace overhead inflated wall time, but showed create/unlink dominate service time: create 3.109s total, unlink 3.072s total |
+| `perf-run-1780200151-7896` | `fio-randrw dirperf` with FUSE op trace enabled | 17s | n/a | Trace-only comparison showed post-fio create/unlink service time rises by about 0.65s and Redis CPU rises only about 0.2s, pointing back to VFS/FUSE hot-path overhead rather than Redis command count |
+| `perf-run-1780201045-24597` | Recently-unlinked cleanup throttling, dirperf-only repeat | 14s | n/a | Isolated run was 14s, within the current 13-14s variance band and not accepted as proof of isolated improvement |
+| `perf-run-1780201077-17050` | Recently-unlinked cleanup throttling, mixed `fio-randrw dirperf metaperf` before remove-first setattr cleanup | 14s | 201s | Mixed `dirperf` improved from the prior 15s to 14s; fio stayed healthy at 117.81/55.02 MiB/s and create improved to 271.5 ops/s |
+| `perf-run-1780201496-2914` | Same cleanup throttling, `fio-randrw dirperf` repeat | 14s | n/a | Repeated 14s mixed `dirperf`, suggesting the improvement from 15s to 14s is stable |
+| `perf-run-1780202056-13269` | Cleanup throttling plus no-handle timestamp-only setattr remove-first fast path, `fio-randrw dirperf` | 14s | n/a | Remove-first fast path did not move wall time beyond 14s but avoids an extra map operation in the hot post-unlink setattr path |
+| `perf-run-1780202194-31491` | Cleanup throttling plus remove-first fast path, full mixed `fio-randrw dirperf metaperf` | 14s | 201s | Current-code mixed validation: fio 124.04/57.28 MiB/s, create 258.3 ops/s, open 5933.1 ops/s, rename 961.9 ops/s; Step 14 remains open because `dirperf` is still one second above JuiceFS |
 
 Latest continuation verification:
 
@@ -252,6 +260,17 @@ Latest continuation verification:
 | `./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf metaperf"` | Passed: `perf-run-1780199065-12909`, fio 118.48/54.72 MiB/s, `dirperf` 15s, `metaperf` 199s |
 | `./docker/compose-xfstests/run_redis_perf.sh --tools "dirperf"` | Passed: `perf-run-1780199386-12772`, isolated `dirperf` 13s |
 | `cargo test -p slayerfs --lib --bins --tests -- --format terse` | Passed fresh before commit: lib 292 passed / 0 failed, bin 284 passed / 0 failed, compaction/GC/rename/native tests passed |
+| `PERF_FUSE_OPS_LOG=1 ./docker/compose-xfstests/run_redis_perf.sh --tools "dirperf"` | Passed: `perf-run-1780200122-4750`; trace overhead made `dirperf` 16s but isolated FUSE service was dominated by create/unlink |
+| `PERF_FUSE_OPS_LOG=1 ./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf"` | Passed: `perf-run-1780200151-7896`; post-fio trace made `dirperf` 17s and showed create/unlink service time rises more than Redis command counts explain |
+| `cargo test -p slayerfs vfs::fs::tests::test_recently_unlinked_cleanup_is_not_run_on_every_threshold_insert --lib -- --nocapture` | Red/green verified: failed before cleanup throttling, then passed after throttling recently-unlinked attr cleanup |
+| `cargo test -p slayerfs vfs::fs::tests::basic_tests -- --nocapture` | Passed: 9 VFS basic tests for lib and bin targets after the cleanup throttling change |
+| `cargo test -p slayerfs meta::stores::redis::tests::test_vfs_deleted_inode_timestamp_setattr_stays_local -- --ignored --nocapture` | Passed for lib and bin targets after the no-handle remove-first timestamp setattr fast path |
+| `./docker/compose-xfstests/run_redis_perf.sh --tools "dirperf"` | Passed: `perf-run-1780201045-24597`, isolated `dirperf` 14s |
+| `./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf metaperf"` | Passed: `perf-run-1780201077-17050`, fio 117.81/55.02 MiB/s, `dirperf` 14s, `metaperf` 201s |
+| `./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf"` | Passed: `perf-run-1780201496-2914`, repeated mixed `dirperf` 14s |
+| `./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf"` | Passed: `perf-run-1780202056-13269`, current remove-first fast path repeated mixed `dirperf` 14s |
+| `./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf metaperf"` | Passed: `perf-run-1780202194-31491`, fio 124.04/57.28 MiB/s, `dirperf` 14s, `metaperf` 201s |
+| `cargo test -p slayerfs --lib --bins --tests -- --format terse` | Passed fresh before commit: lib 293 passed / 0 failed, bin 285 passed / 0 failed, compaction/GC/rename/native tests passed |
 
 ## Files And Responsibilities
 
@@ -1134,9 +1153,37 @@ docker/compose-xfstests/artifacts/perf-run-1780199386-12772
 Dirperf-only repeat after the writeback overlap change:
 dirperf: 13s.
 Decision: isolated dirperf still matches JuiceFS; the remaining mixed 15s result is fio-aftereffect variance, not a standalone metadata regression from the writeback overlap change.
+
+docker/compose-xfstests/artifacts/perf-run-1780200122-4750
+Experiment: full isolated dirperf with PERF_FUSE_OPS_LOG=1.
+dirperf: 16s with trace overhead.
+FUSE service summary: create 11001 calls / 3.109s total / 282.6us avg; unlink 11001 calls / 3.072s total / 279.3us avg.
+Decision: trace overhead invalidates the wall time as a benchmark, but create/unlink are still the hot service-time operations.
+
+docker/compose-xfstests/artifacts/perf-run-1780200151-7896
+Experiment: full fio-randrw plus dirperf with PERF_FUSE_OPS_LOG=1.
+dirperf: 17s with trace overhead.
+FUSE service summary during dirperf: create 11000 calls / 3.269s total / 297.2us avg; unlink 10883 completed calls before the timestamp cutoff / 3.426s total / 314.8us avg.
+Decision: post-fio Redis command counts were unchanged and Redis CPU increase was too small to explain the wall-time gap; keep optimizing VFS/FUSE unlink/create local overhead.
+
+docker/compose-xfstests/artifacts/perf-run-1780201077-17050
+Experiment: throttle recently-unlinked attr cleanup after the threshold.
+fio-randrw read/write: 117.81/55.02 MiB/s.
+dirperf: 14s.
+metaperf: 201s.
+metadata detail: create 271.5 ops/s, open 5814.0 ops/s, stat 1,111,528.9 ops/s, readdir 32,632.6 ops/s, rename 964.6 ops/s.
+Decision: keep. Mixed dirperf improves from 15s to 14s and create remains close to the S3 single-op diagnostic, though isolated dirperf did not prove a standalone win.
+
+docker/compose-xfstests/artifacts/perf-run-1780202194-31491
+Experiment: current code after adding the no-handle timestamp-only setattr remove-first fast path.
+fio-randrw read/write: 124.04/57.28 MiB/s.
+dirperf: 14s.
+metaperf: 201s.
+metadata detail: create 258.3 ops/s, open 5933.1 ops/s, stat 1,105,574.9 ops/s, readdir 32,333.6 ops/s, rename 961.9 ops/s.
+Decision: keep. The remove-first fast path did not push wall time below 14s, but it reduces one map operation on the hot post-unlink timestamp setattr path and preserved the improved mixed result.
 ```
 
-Next hypothesis: the S3/RustFS create gap is now mostly addressed by overlapping best-effort SSD persistence with object upload, but mixed dirperf still varies after fio even though isolated dirperf remains 13s. Investigate why the preceding fio phase perturbs subsequent metadata latency: compare FUSE op latency and Redis commandstats for isolated dirperf versus post-fio dirperf, check whether writeback cache cleanup or remaining fio files leave local/S3/Redis pressure, and prefer an unstripped PID-attached perf profile of the mixed `dirperf` phase over another default-tuning change.
+Next hypothesis: mixed `dirperf` has moved from 15s to a stable 14s, while JuiceFS/isolated target remains 13s. FUSE traces show create/unlink service time is still the meaningful local hot path and Redis command counts are not the remaining explanation. Next, use an unstripped PID-attached perf profile or a low-overhead internal timing counter around VFS create/unlink substeps to split local costs between MetaClient cache work, modified/recently-unlinked maps, and Redis await time; avoid another broad default-tuning change unless it explains the final 1s gap.
 
 ## Maintenance Rules
 

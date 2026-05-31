@@ -42,6 +42,51 @@ async fn test_modified_tracker_touch_many_marks_all_inodes() {
     assert!(!tracker.modified_since(13, before).await);
 }
 
+fn test_file_attr(ino: i64) -> super::FileAttr {
+    super::FileAttr {
+        ino,
+        size: 0,
+        blocks: 0,
+        kind: super::FileType::File,
+        mode: 0o100644,
+        uid: 0,
+        gid: 0,
+        atime: 0,
+        mtime: 0,
+        ctime: 0,
+        nlink: 1,
+    }
+}
+
+#[tokio::test]
+async fn test_recently_unlinked_cleanup_is_not_run_on_every_threshold_insert() {
+    let layout = ChunkLayout::default();
+    let store = InMemoryBlockStore::new();
+    let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+    let meta_store = meta_handle.store();
+    let fs = VFS::new(layout, store, meta_store).await.unwrap();
+
+    for ino in 10..(10 + super::RECENTLY_UNLINKED_ATTR_CLEANUP_THRESHOLD as i64) {
+        fs.remember_recently_unlinked_attr(ino, test_file_attr(ino));
+    }
+
+    fs.remember_recently_unlinked_attr(100_000, test_file_attr(100_000));
+    fs.state.recently_unlinked.insert(
+        -1,
+        (
+            test_file_attr(-1),
+            Instant::now() - super::RECENTLY_UNLINKED_ATTR_TTL * 2,
+        ),
+    );
+
+    fs.remember_recently_unlinked_attr(100_001, test_file_attr(100_001));
+
+    assert!(
+        fs.state.recently_unlinked.contains_key(&-1),
+        "cleanup should be throttled instead of scanning the recently-unlinked map on every unlink"
+    );
+}
+
 #[cfg(test)]
 mod fsstress_013_native_tests {
     use super::*;
