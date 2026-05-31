@@ -83,20 +83,20 @@ Focused comparison:
 | --- | --- | ---: | --- | ---: | --- |
 | `fio-randrw` read BW | `perf-run-1780152993-885` | 115.41 MiB/s | `juicefs-perf-run-1780153510-28102` | 66.00 MiB/s | SlayerFS faster |
 | `fio-randrw` write BW | `perf-run-1780152993-885` | 53.15 MiB/s | `juicefs-perf-run-1780153510-28102` | 29.29 MiB/s | SlayerFS faster |
-| `dirperf` wall time | `perf-run-1780185361-22827`, `perf-run-1780185731-28879` | 14-15s | `juicefs-perf-run-1780153510-28102` | 13s | Improved but still variable |
-| `metaperf` wall time | `perf-run-1780185361-22827`, `perf-run-1780185731-28879` | 198-202s | `juicefs-perf-run-1780153510-28102` | 222s | Better on wall time |
+| `dirperf` wall time | `perf-run-1780187198-23645`, `perf-run-1780187438-20171` | 14s | `juicefs-perf-run-1780153510-28102` | 13s | Improved, now repeated at 14s |
+| `metaperf` wall time | `perf-run-1780187198-23645`, `perf-run-1780187438-20171` | 199-201s | `juicefs-perf-run-1780153510-28102` | 222s | Better on wall time |
 
-Important caveat: `metaperf` wall time is close, but individual metadata ops still lag JuiceFS on create/rename. The latest `dirperf` gap is now 14-15s vs JuiceFS 13s; the next bottleneck is still metadata/FUSE hot-path overhead rather than disk-cache throughput.
+Important caveat: `metaperf` wall time is close, but individual metadata ops still lag JuiceFS on create/rename. The latest `dirperf` gap is now 14s vs JuiceFS 13s; the next bottleneck is still metadata/FUSE hot-path overhead rather than disk-cache throughput.
 
 Latest focused metadata detail:
 
-| Operation | SlayerFS `perf-run-1780180872-21146` | JuiceFS `juicefs-perf-run-1780153510-28102` | Gap |
+| Operation | SlayerFS `perf-run-1780187198-23645`, `perf-run-1780187438-20171` | JuiceFS `juicefs-perf-run-1780153510-28102` | Gap |
 | --- | ---: | ---: | --- |
-| create | 197.9 ops/s | 285.1 ops/s | SlayerFS slower, improved locally |
-| open | 5664.9 ops/s | 6049.8 ops/s | Close to JuiceFS after skipping no-lock cleanup |
-| stat | 1,114,596.8 ops/s | 1,101,680 ops/s | Similar |
-| readdir | 32,225.2 ops/s | 37,075.7 ops/s | SlayerFS slower, improved locally |
-| rename | 949.6 ops/s | 1438.3 ops/s | SlayerFS slower, improved locally |
+| create | 185.6-205.9 ops/s | 285.1 ops/s | SlayerFS slower, still variable |
+| open | 5524.5-5743.6 ops/s | 6049.8 ops/s | Close to JuiceFS |
+| stat | 1,117,480.9-1,120,831.2 ops/s | 1,101,680 ops/s | Similar |
+| readdir | 32,657.3-33,374.8 ops/s | 37,075.7 ops/s | SlayerFS slower, improved locally |
+| rename | 919.2-927.6 ops/s | 1438.3 ops/s | SlayerFS slower, improved locally |
 
 Latest focused `dirperf` shape:
 
@@ -549,6 +549,22 @@ Complete-empty newly-created directory cache: dirperf 14s, metaperf 202s.
 docker/compose-xfstests/artifacts/perf-run-1780185731-28879
 Repeat full run for the complete-empty directory cache: dirperf 15s, metaperf 198s.
 Kept because the reduced trace proves the intended ENOENT lookup cost was removed, one full run moved dirperf closer to JuiceFS, and the repeat improved metaperf wall time versus the accepted 201s baseline. Treat the full dirperf result as variable until a third independent run confirms 14s.
+
+docker/compose-xfstests/artifacts/perf-run-1780187143-19761
+DashMap ModifiedTracker plus batched VFS touch, reduced dirperf FUSE latency split:
+  create 1201 calls, avg 247.4 us, total 297.1 ms
+  unlink 1201 calls, avg 238.6 us, total 286.5 ms
+  lookup 1212 calls, avg 14.0 us, total 17.0 ms
+Accepted as a local create/unlink-path improvement because the prior reduced trace had create at 257.8 us and unlink at 247.6 us.
+
+docker/compose-xfstests/artifacts/perf-run-1780187198-23645
+DashMap ModifiedTracker plus batched VFS touch: dirperf 14s, metaperf 199s.
+Metadata operations: create 205.9 ops/s, open 5743.6 ops/s, stat 1120831.2 ops/s, readdir 33374.8 ops/s, rename 927.6 ops/s.
+
+docker/compose-xfstests/artifacts/perf-run-1780187438-20171
+Repeat full run for DashMap ModifiedTracker plus batched VFS touch: dirperf 14s, metaperf 201s.
+Metadata operations: create 185.6 ops/s, open 5524.5 ops/s, stat 1117480.9 ops/s, readdir 32657.3 ops/s, rename 919.2 ops/s.
+Kept because two full runs repeated the 14s dirperf result, the reduced trace lowered create/unlink latency, and metaperf stayed within the previous accepted 198-202s range.
 ```
 
 - [x] **Step 2: Collapse Redis unlink into one atomic operation**
@@ -766,11 +782,50 @@ metaperf pass 198s
 
 The optimization is kept because it removes a proven Redis `HGET` from hot negative lookups under newly-created empty directories, improves the reduced FUSE lookup latency sharply, and does not show a stable metaperf wall-time regression. It still does not consistently reach JuiceFS `dirperf` 13s, and rename ops/sec remains below the previous 949.6 ops/s high-water mark.
 
-- [ ] **Step 11: Continue create/unlink cost reduction**
+- [x] **Step 11: Shard local modification tracking and batch touch updates**
 
-The latest reduced trace leaves create/unlink around 250 us each while lookup is no longer the dominant high-frequency cost.
+The reduced trace still left create/unlink around 250 us each while lookup was no longer the dominant high-frequency cost. VFS metadata mutations also updated `ModifiedTracker` through a single global `tokio::Mutex<HashMap>` and often performed two lock acquisitions per create/unlink/rename. `ModifiedTracker` now uses `DashMap`, and create/unlink/mkdir/rmdir/link/rename hot paths update related inodes with one `touch_many()` call.
 
-Expected: improve create/unlink without regressing rename, and require at least two full perf runs if the result is within 1s of the existing baseline.
+Run:
+
+```bash
+cargo test -p slayerfs vfs::fs::tests::test_modified_tracker_touch_many_marks_all_inodes -- --nocapture
+cargo test -p slayerfs vfs::fs::tests::basic_tests -- --nocapture
+cargo test -p slayerfs meta::client::tests::test_rename_operations -- --nocapture
+cargo test -p slayerfs --test rename_integration_test -- --nocapture
+PERF_FUSE_OPS_LOG=1 PERF_DIRPERF_ARGS='-d /mnt/slayerfs/.perf-dirperf -a 100 -f 100 -l 300 -c 16 -n 2 -s 1' bash docker/compose-xfstests/run_redis_perf.sh --tools dirperf
+bash docker/compose-xfstests/run_redis_perf.sh --tools "dirperf metaperf"
+```
+
+Verified evidence:
+
+```text
+RED before implementation:
+test_modified_tracker_touch_many_marks_all_inodes failed to compile because touch_many did not exist.
+
+GREEN after implementation:
+test_modified_tracker_touch_many_marks_all_inodes passed for lib and bin targets.
+VFS basic tests, MetaClient rename tests, and rename integration tests passed.
+
+docker/compose-xfstests/artifacts/perf-run-1780187143-19761
+create avg 247.4 us, unlink avg 238.6 us, down from 257.8 us / 247.6 us in perf-run-1780185311-21708.
+
+docker/compose-xfstests/artifacts/perf-run-1780187198-23645
+dirperf pass 14s
+metaperf pass 199s
+
+docker/compose-xfstests/artifacts/perf-run-1780187438-20171
+dirperf pass 14s
+metaperf pass 201s
+```
+
+The optimization is kept because it removes local mutex serialization from a hot VFS bookkeeping path, repeats the 14s `dirperf` result twice, and does not show a stable `metaperf` regression. It still does not close the final 1s `dirperf` gap to JuiceFS.
+
+- [ ] **Step 12: Investigate remaining 1s dirperf gap**
+
+The latest FUSE trace shows create/unlink still dominate high-frequency operation latency even after local bookkeeping cleanup.
+
+Expected: identify whether the remaining gap is Redis Lua execution, FUSE scheduling, kernel request pattern, or userspace directory-tool overhead before attempting another patch. Prefer proof from `perf` or Redis slow/latency evidence over another cache-only speculation.
 
 ## Maintenance Rules
 

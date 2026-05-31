@@ -7,7 +7,7 @@ use crate::meta::MetaLayer;
 use crate::meta::factory::create_meta_store_from_url;
 use crate::vfs::fs::VFS;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 struct StressRng(u64);
@@ -28,6 +28,18 @@ impl StressRng {
     fn range(&mut self, end: u64) -> u64 {
         if end == 0 { 0 } else { self.next() % end }
     }
+}
+
+#[tokio::test]
+async fn test_modified_tracker_touch_many_marks_all_inodes() {
+    let tracker = super::ModifiedTracker::new();
+    let before = Instant::now();
+
+    tracker.touch_many([11, 12]).await;
+
+    assert!(tracker.modified_since(11, before).await);
+    assert!(tracker.modified_since(12, before).await);
+    assert!(!tracker.modified_since(13, before).await);
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use crate::meta::store::{
     AclRule, MetaError, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
 };
 use dashmap::{DashMap, Entry};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -239,31 +239,38 @@ where
 }
 
 struct ModifiedTracker {
-    entries: Mutex<HashMap<i64, Instant>>,
+    entries: DashMap<i64, Instant>,
 }
 
 impl ModifiedTracker {
     fn new() -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            entries: DashMap::new(),
         }
     }
 
     async fn touch(&self, ino: i64) {
-        let mut guard = self.entries.lock().await;
-        guard.insert(ino, Instant::now());
+        self.entries.insert(ino, Instant::now());
+    }
+
+    async fn touch_many<const N: usize>(&self, inos: [i64; N]) {
+        let now = Instant::now();
+        for ino in inos {
+            self.entries.insert(ino, now);
+        }
     }
 
     async fn modified_since(&self, ino: i64, since: Instant) -> bool {
-        let guard = self.entries.lock().await;
-        guard.get(&ino).map(|&ts| ts >= since).unwrap_or(false)
+        self.entries
+            .get(&ino)
+            .map(|ts| *ts >= since)
+            .unwrap_or(false)
     }
 
     async fn cleanup_older_than(&self, ttl: Duration) {
         let now = Instant::now();
         let cutoff = now.checked_sub(ttl).unwrap_or(now);
-        let mut guard = self.entries.lock().await;
-        guard.retain(|_, ts| *ts >= cutoff);
+        self.entries.retain(|_, ts| *ts >= cutoff);
     }
 }
 
@@ -1135,8 +1142,7 @@ where
 
         let attr = self.meta_link(src_ino, parent_ino, name).await?;
 
-        self.state.modified.touch(parent_ino).await;
-        self.state.modified.touch(src_ino).await;
+        self.state.modified.touch_many([parent_ino, src_ino]).await;
 
         Ok(attr)
     }
@@ -1155,8 +1161,7 @@ where
 
         match self.meta_mkdir(parent_ino, name.to_string()).await {
             Ok(ino) => {
-                self.state.modified.touch(parent_ino).await;
-                self.state.modified.touch(ino).await;
+                self.state.modified.touch_many([parent_ino, ino]).await;
                 Ok(ino)
             }
             Err(VfsError::AlreadyExists { .. }) => {
@@ -1216,8 +1221,7 @@ where
 
         match self.meta_create_file(parent_ino, name.to_string()).await {
             Ok(ino) => {
-                self.state.modified.touch(parent_ino).await;
-                self.state.modified.touch(ino).await;
+                self.state.modified.touch_many([parent_ino, ino]).await;
                 Ok(ino)
             }
             Err(VfsError::AlreadyExists { .. }) => {
@@ -1282,8 +1286,7 @@ where
         }
 
         let result = self.meta_symlink(parent_ino, name, target).await?;
-        self.state.modified.touch(parent_ino).await;
-        self.state.modified.touch(result.0).await;
+        self.state.modified.touch_many([parent_ino, result.0]).await;
         Ok(result)
     }
 
@@ -1306,8 +1309,7 @@ where
 
         self.meta_unlink(parent_ino, name).await?;
         self.remember_recently_unlinked_attr(ino, attr);
-        self.state.modified.touch(parent_ino).await;
-        self.state.modified.touch(ino).await;
+        self.state.modified.touch_many([parent_ino, ino]).await;
         Ok(())
     }
 
@@ -1334,8 +1336,7 @@ where
         }
 
         self.meta_rmdir(parent_ino, name).await?;
-        self.state.modified.touch(parent_ino).await;
-        self.state.modified.touch(ino).await;
+        self.state.modified.touch_many([parent_ino, ino]).await;
         Ok(())
     }
 
@@ -1414,11 +1415,17 @@ where
             new_name.to_string(),
         )
         .await?;
-        self.state.modified.touch(old_parent_ino).await;
         if old_parent_ino != new_parent_ino {
-            self.state.modified.touch(new_parent_ino).await;
+            self.state
+                .modified
+                .touch_many([old_parent_ino, new_parent_ino, src_ino])
+                .await;
+        } else {
+            self.state
+                .modified
+                .touch_many([old_parent_ino, src_ino])
+                .await;
         }
-        self.state.modified.touch(src_ino).await;
 
         Ok(())
     }
@@ -1657,9 +1664,13 @@ where
             .await?;
 
         // Update cache
-        self.state.modified.touch(old_parent_ino).await;
         if old_parent_ino != new_parent_ino {
-            self.state.modified.touch(new_parent_ino).await;
+            self.state
+                .modified
+                .touch_many([old_parent_ino, new_parent_ino])
+                .await;
+        } else {
+            self.state.modified.touch(old_parent_ino).await;
         }
 
         Ok(())
