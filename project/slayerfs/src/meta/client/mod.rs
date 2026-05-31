@@ -925,12 +925,26 @@ impl<T: MetaStore + ?Sized + 'static> MetaClient<T> {
     async fn cached_lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
         let parent = self.check_root(parent);
 
-        if let Some(ino) = self.inode_cache.lookup(parent, name).await {
-            trace!(
-                "MetaClient: lookup HIT ({}, '{}') -> inode {}",
-                parent, name, ino
-            );
-            return Ok(Some(ino));
+        if let Some(result) = self.inode_cache.lookup_if_loaded(parent, name).await {
+            match result {
+                Some(ino) => {
+                    trace!(
+                        "MetaClient: lookup HIT ({}, '{}') -> inode {}",
+                        parent, name, ino
+                    );
+                    return Ok(Some(ino));
+                }
+                None if !self.options.case_insensitive => {
+                    trace!("MetaClient: complete lookup MISS ({}, '{}')", parent, name);
+                    return Ok(None);
+                }
+                None => {
+                    trace!(
+                        "MetaClient: complete lookup MISS ({}, '{}'), checking case-insensitive fallback",
+                        parent, name
+                    );
+                }
+            }
         }
 
         trace!("MetaClient: lookup MISS ({}, '{}')", parent, name);
@@ -1332,6 +1346,7 @@ impl<T: MetaStore + ?Sized + 'static> MetaLayer for MetaClient<T> {
         // Cache the new directory node
         if let Ok(Some(attr)) = self.store.stat(ino).await {
             self.inode_cache.insert_node(ino, attr, Some(parent)).await;
+            self.inode_cache.mark_children_complete_empty(ino).await;
         }
         self.inode_cache.add_child(parent, name, ino).await;
 

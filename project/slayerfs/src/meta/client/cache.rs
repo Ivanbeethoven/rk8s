@@ -138,6 +138,15 @@ impl InodeCache {
         }
     }
 
+    pub(crate) async fn mark_children_complete_empty(&self, ino: i64) {
+        if let Some(node) = self.ttl_manager.get(&ino).await {
+            let mut children_lock = node.children.write().await;
+            if matches!(&*children_lock, ChildrenState::NotLoaded) {
+                *children_lock = ChildrenState::Complete(Arc::new(BTreeMap::new()));
+            }
+        }
+    }
+
     pub(crate) async fn refresh_cached_node_for_fresh_stat(
         &self,
         ino: i64,
@@ -275,11 +284,18 @@ impl InodeCache {
         None
     }
 
-    pub(crate) async fn lookup(&self, parent_ino: i64, name: &str) -> Option<i64> {
+    pub(crate) async fn lookup_if_loaded(
+        &self,
+        parent_ino: i64,
+        name: &str,
+    ) -> Option<Option<i64>> {
         let parent_node = self.ttl_manager.get(&parent_ino).await?;
         let children_lock = parent_node.children.read().await;
-        let children_map = children_lock.get_map()?;
-        children_map.get(name).copied()
+        match &*children_lock {
+            ChildrenState::NotLoaded => None,
+            ChildrenState::Partial(children_map) => children_map.get(name).copied().map(Some),
+            ChildrenState::Complete(children_map) => Some(children_map.get(name).copied()),
+        }
     }
 
     pub(crate) async fn readdir(&self, ino: i64) -> Option<Vec<DirEntry>> {

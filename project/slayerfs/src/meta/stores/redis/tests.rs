@@ -2309,6 +2309,33 @@ async fn test_meta_client_mkdir_avoids_parent_stat_after_lua_create() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn test_meta_client_new_directory_negative_lookup_stays_local() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+
+    let dir = client.mkdir(root, "empty_dir".to_string()).await.unwrap();
+
+    reset_redis_commandstats(&store).await;
+    assert_eq!(client.lookup(dir, "missing.txt").await.unwrap(), None);
+
+    let hget_calls = redis_command_calls(&store, "hget").await;
+    assert_eq!(
+        hget_calls, 0,
+        "negative lookup in a freshly-created empty directory should stay local; observed {hget_calls} Redis HGET calls"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_meta_client_stat_fresh_uses_warm_store_node_cache() {
     let store = Arc::new(new_test_store().await);
     let root = store.root_ino();

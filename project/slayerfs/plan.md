@@ -83,10 +83,10 @@ Focused comparison:
 | --- | --- | ---: | --- | ---: | --- |
 | `fio-randrw` read BW | `perf-run-1780152993-885` | 115.41 MiB/s | `juicefs-perf-run-1780153510-28102` | 66.00 MiB/s | SlayerFS faster |
 | `fio-randrw` write BW | `perf-run-1780152993-885` | 53.15 MiB/s | `juicefs-perf-run-1780153510-28102` | 29.29 MiB/s | SlayerFS faster |
-| `dirperf` wall time | `perf-run-1780180872-21146` | 15s | `juicefs-perf-run-1780153510-28102` | 13s | Improved, closer |
-| `metaperf` wall time | `perf-run-1780180872-21146` | 201s | `juicefs-perf-run-1780153510-28102` | 222s | Better on wall time |
+| `dirperf` wall time | `perf-run-1780185361-22827`, `perf-run-1780185731-28879` | 14-15s | `juicefs-perf-run-1780153510-28102` | 13s | Improved but still variable |
+| `metaperf` wall time | `perf-run-1780185361-22827`, `perf-run-1780185731-28879` | 198-202s | `juicefs-perf-run-1780153510-28102` | 222s | Better on wall time |
 
-Important caveat: `metaperf` wall time is close, but individual metadata ops still lag JuiceFS on create/rename. The latest `dirperf` gap is now 15s vs JuiceFS 13s; the next bottleneck is still metadata/FUSE hot-path overhead rather than disk-cache throughput.
+Important caveat: `metaperf` wall time is close, but individual metadata ops still lag JuiceFS on create/rename. The latest `dirperf` gap is now 14-15s vs JuiceFS 13s; the next bottleneck is still metadata/FUSE hot-path overhead rather than disk-cache throughput.
 
 Latest focused metadata detail:
 
@@ -535,6 +535,20 @@ Rejected because it did not move dirperf closer to JuiceFS and regressed wall ti
 docker/compose-xfstests/artifacts/perf-run-1780183967-4848
 Redis create/unlink Lua array reply parser: dirperf 15s, metaperf 202s.
 Rejected because it did not move dirperf closer to JuiceFS and regressed wall time from the accepted 201s metadata baseline; rename also dropped from 949.6 ops/s to 904.5 ops/s.
+
+docker/compose-xfstests/artifacts/perf-run-1780185311-21708
+Complete-empty newly-created directory cache, reduced dirperf FUSE latency split:
+  lookup 1212 calls, avg 14.3 us, total 17.3 ms
+  create 1201 calls, avg 257.8 us, total 309.6 ms
+  unlink 1201 calls, avg 247.6 us, total 297.4 ms
+Accepted as a targeted lookup-path improvement because the pre-change reduced trace had lookup at 111.6 us avg and 135.3 ms total.
+
+docker/compose-xfstests/artifacts/perf-run-1780185361-22827
+Complete-empty newly-created directory cache: dirperf 14s, metaperf 202s.
+
+docker/compose-xfstests/artifacts/perf-run-1780185731-28879
+Repeat full run for the complete-empty directory cache: dirperf 15s, metaperf 198s.
+Kept because the reduced trace proves the intended ENOENT lookup cost was removed, one full run moved dirperf closer to JuiceFS, and the repeat improved metaperf wall time versus the accepted 201s baseline. Treat the full dirperf result as variable until a third independent run confirms 14s.
 ```
 
 - [x] **Step 2: Collapse Redis unlink into one atomic operation**
@@ -714,11 +728,49 @@ Rejected subtest: changing only `CREATE_ENTRY_LUA` and `UNLINK_LUA` to return Re
 
 Expected: improve create/open/rename or directory cleanup paths without reintroducing the reverted FUSE/VFS precheck-removal regression.
 
-- [ ] **Step 10: Consider parent dentry caching or batched create handling**
+- [x] **Step 10: Cache known-empty newly-created directories for negative lookup**
 
-Use this only after Step 1 proves repeated parent/child lookup traffic dominates `dirperf`.
+The reduced FUSE trace showed 1209/1212 lookups were ENOENT, mostly under newly-created empty directories. MetaClient now marks freshly-created directories as having a complete empty child map, and `cached_lookup()` can return a cached negative result from a complete map instead of falling through to Redis `HGET`.
 
-Expected: maintain invalidation on create/unlink/rmdir/rename and reject cache-only correctness shortcuts.
+Run:
+
+```bash
+cargo test -p slayerfs meta::stores::redis::tests::test_meta_client_new_directory_negative_lookup_stays_local -- --ignored --nocapture
+cargo test -p slayerfs meta::stores::redis::tests::test_meta_client_mkdir_avoids_parent_stat_after_lua_create -- --ignored --nocapture
+cargo test -p slayerfs meta::stores::redis::tests::test_create_entry_updates_parent_node_cache -- --ignored --nocapture
+cargo test -p slayerfs vfs::fs::tests::basic_tests -- --nocapture
+PERF_FUSE_OPS_LOG=1 PERF_DIRPERF_ARGS='-d /mnt/slayerfs/.perf-dirperf -a 100 -f 100 -l 300 -c 16 -n 2 -s 1' bash docker/compose-xfstests/run_redis_perf.sh --tools dirperf
+bash docker/compose-xfstests/run_redis_perf.sh --tools "dirperf metaperf"
+```
+
+Verified evidence:
+
+```text
+RED before implementation:
+test_meta_client_new_directory_negative_lookup_stays_local observed 2 Redis HGET calls.
+
+GREEN after implementation:
+test_meta_client_new_directory_negative_lookup_stays_local passed with 0 Redis HGET calls.
+
+docker/compose-xfstests/artifacts/perf-run-1780185311-21708
+lookup avg 14.3 us, total 17.3 ms, down from 111.6 us / 135.3 ms in perf-run-1780181989-11184.
+
+docker/compose-xfstests/artifacts/perf-run-1780185361-22827
+dirperf pass 14s
+metaperf pass 202s
+
+docker/compose-xfstests/artifacts/perf-run-1780185731-28879
+dirperf pass 15s
+metaperf pass 198s
+```
+
+The optimization is kept because it removes a proven Redis `HGET` from hot negative lookups under newly-created empty directories, improves the reduced FUSE lookup latency sharply, and does not show a stable metaperf wall-time regression. It still does not consistently reach JuiceFS `dirperf` 13s, and rename ops/sec remains below the previous 949.6 ops/s high-water mark.
+
+- [ ] **Step 11: Continue create/unlink cost reduction**
+
+The latest reduced trace leaves create/unlink around 250 us each while lookup is no longer the dominant high-frequency cost.
+
+Expected: improve create/unlink without regressing rename, and require at least two full perf runs if the result is within 1s of the existing baseline.
 
 ## Maintenance Rules
 
