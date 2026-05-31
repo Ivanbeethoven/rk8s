@@ -32,6 +32,7 @@ use parking_lot::Mutex as ParkingMutex;
 use rand::RngCore;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Display;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -128,6 +129,23 @@ struct UploadPlan {
     data: Vec<(usize, Vec<Bytes>)>,
     slice_id: Option<u64>,
     uploaded: u64,
+}
+
+async fn join_best_effort_persist<P, U, T>(
+    persist: Option<P>,
+    upload: U,
+) -> (Option<anyhow::Result<()>>, T)
+where
+    P: Future<Output = anyhow::Result<()>>,
+    U: Future<Output = T>,
+{
+    match persist {
+        Some(persist) => {
+            let (persist_result, upload_result) = tokio::join!(persist, upload);
+            (Some(persist_result), upload_result)
+        }
+        None => (None, upload.await),
+    }
 }
 
 #[derive(Default, Copy, Clone, Debug)]
@@ -1688,45 +1706,54 @@ where
                     let layout = shared.config.layout;
                     join_set.spawn(async move {
                         // Best-effort SSD persist for crash recovery.
-                        if let Some(wb) = &wb_ref {
+                        let persist = wb_ref.as_ref().map(|wb| {
+                            let wb = wb.clone();
+                            let chunks = all_chunks.clone();
                             let key = crate::vfs::cache::keys::DirtySliceKey {
                                 ino,
                                 chunk_id,
                                 local_seq: slice_id,
                                 epoch: 0,
                             };
-                            if let Err(e) = wb
-                                .persist_slice(key, all_chunks.clone(), batch_offset)
-                                .await
-                            {
-                                tracing::debug!(
-                                    ino, chunk_id, slice_id, error = ?e,
-                                    "SSD persist skipped"
-                                );
+                            async move {
+                                wb.persist_slice(key, chunks, batch_offset)
+                                    .await
+                                    .map(|_| ())
                             }
-                        }
+                        });
 
                         let uploader = DataUploader::new(layout, &shared2.backend);
-                        let result = backoff(UPLOAD_MAX_RETRIES, || async {
-                            match uploader
-                                .write_at_vectored(slice_id, batch_offset.into(), &all_chunks)
-                                .await
-                            {
-                                Ok(_) => Ok(()),
-                                Err(err) => {
-                                    warn!(
-                                        chunk_id,
-                                        slice_id,
-                                        offset = batch_offset,
-                                        len = data_len,
-                                        error = ?err,
-                                        "pipeline upload failed, retrying"
-                                    );
-                                    Err(MetaError::ContinueRetry(RetryReason::VersionConflict))
+                        let upload = async {
+                            backoff(UPLOAD_MAX_RETRIES, || async {
+                                match uploader
+                                    .write_at_vectored(slice_id, batch_offset.into(), &all_chunks)
+                                    .await
+                                {
+                                    Ok(_) => Ok(()),
+                                    Err(err) => {
+                                        warn!(
+                                            chunk_id,
+                                            slice_id,
+                                            offset = batch_offset,
+                                            len = data_len,
+                                            error = ?err,
+                                            "pipeline upload failed, retrying"
+                                        );
+                                        Err(MetaError::ContinueRetry(RetryReason::VersionConflict))
+                                    }
                                 }
-                            }
-                        })
-                        .await;
+                            })
+                            .await
+                        };
+
+                        let (persist_result, result) =
+                            join_best_effort_persist(persist, upload).await;
+                        if let Some(Err(e)) = persist_result {
+                            tracing::debug!(
+                                ino, chunk_id, slice_id, error = ?e,
+                                "SSD persist skipped"
+                            );
+                        }
 
                         match result {
                             Ok(()) => Ok((start_idx, end_idx, data_len)),
@@ -3344,6 +3371,29 @@ mod tests {
             writer.has_pending().await,
             "writeback error should remain observable by later flush/fsync/close calls"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_best_effort_persist_runs_concurrently_with_upload() {
+        let start = Instant::now();
+        let (persist_result, upload_result) = join_best_effort_persist(
+            Some(async {
+                sleep(Duration::from_millis(120)).await;
+                anyhow::Ok(())
+            }),
+            async {
+                sleep(Duration::from_millis(40)).await;
+                Ok::<usize, anyhow::Error>(7usize)
+            },
+        )
+        .await;
+
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "persist and upload should overlap instead of running sequentially"
+        );
+        assert!(persist_result.unwrap().is_ok());
+        assert_eq!(upload_result.unwrap(), 7);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

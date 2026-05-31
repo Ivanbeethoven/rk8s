@@ -61,6 +61,7 @@ Implemented changes:
 | Perf tooling | Redis perf runner can inject `SLAYERFS_FUSE_WORKERS` and `SLAYERFS_FUSE_MAX_BACKGROUND` into generated backend config | Make FUSE dispatch and background-queue experiments reproducible from artifact-local perf runs |
 | Redis metadata | `stat_fs()` now batches node payload loads with one Redis `MGET` after the node-key scan | Remove per-inode Redis `GET` round trips from FUSE `statfs` without changing accounting semantics |
 | Perf tooling | Redis perf runner can pass `SLAYERFS_S3_PART_SIZE` and `SLAYERFS_S3_MAX_CONCURRENCY` to the perf container | Make S3/RustFS small-write concurrency sweeps reproducible without changing the default benchmark config |
+| VFS writeback | Best-effort SSD dirty-slice persistence now runs concurrently with the object upload for each upload batch | Remove local fsync/writeback-cache latency from the foreground flush critical path without weakening upload-before-commit visibility |
 
 Environment note:
 
@@ -195,6 +196,9 @@ Focused continuation artifacts:
 | `perf-run-1780197799-26251` | S3 `max_concurrency=32` single-op create diagnostic | n/a | n/a | Create was 178.3 ops/s; rejected as a perf-runner default |
 | `perf-run-1780197857-13682` | S3 `max_concurrency=4` single-op create diagnostic | n/a | n/a | Create was 211.1 ops/s, close to but not better than the old 8-concurrency diagnostic |
 | `perf-run-1780197948-14241` | S3 `max_concurrency=1` single-op create diagnostic | n/a | n/a | Create was 205.0 ops/s; lower concurrency does not close the JuiceFS gap |
+| `perf-run-1780199010-26913` | Best-effort SSD persist overlapped with S3 upload, single-op S3/RustFS `metaperf create` | n/a | n/a | Create improved to 279.8 ops/s from the prior 213.7 ops/s S3 diagnostic, closing most of the JuiceFS 305.8 ops/s gap |
+| `perf-run-1780199065-12909` | Same writeback overlap change, mixed `fio-randrw dirperf metaperf` | 15s | 199s | fio stayed healthy at 118.48/54.72 MiB/s and create improved to 231.0 ops/s, but mixed `dirperf` regressed to 15s |
+| `perf-run-1780199386-12772` | Same writeback overlap change, dirperf-only repeat | 13s | n/a | Isolated `dirperf` still matches JuiceFS; the remaining 15s mixed result is still fio-aftereffect variance rather than this writeback change breaking standalone metadata |
 
 Latest continuation verification:
 
@@ -239,6 +243,15 @@ Latest continuation verification:
 | `SLAYERFS_S3_MAX_CONCURRENCY=1 PERF_METAPERF_ARGS='-d /mnt/slayerfs/.perf-metaperf -t 15 -s 4096 -l 16 -L 16 -n 200 -N 2000 create' ./docker/compose-xfstests/run_redis_perf.sh --tools "metaperf"` | Passed: `perf-run-1780197948-14241`, generated config showed `max_concurrency: 1`, create 205.0 ops/s |
 | `bash -n docker/compose-xfstests/run_redis_perf.sh` | Passed after adding S3 perf env pass-through |
 | `git diff --check` | Passed after updating `plan.md` and perf runner pass-through |
+| `cargo test -p slayerfs vfs::io::writer::tests::test_best_effort_persist_runs_concurrently_with_upload --lib -- --nocapture` | Red/green verified: failed before the helper existed, then passed after running best-effort persist concurrently with upload |
+| `cargo test -p slayerfs vfs::io::writer::tests::test_flush_blocks_write_until_upload_done --lib -- --nocapture` | Passed after the writeback overlap change |
+| `cargo test -p slayerfs vfs::io::writer::tests::test_flush_reports_upload_failure --lib -- --nocapture` | Passed after the writeback overlap change |
+| `cargo test -p slayerfs vfs::io::writer::tests::test_file_writer_flush_commits_and_reads --lib -- --nocapture` | Passed after the writeback overlap change |
+| `cargo test -p slayerfs vfs::io::writer::tests --lib -- --nocapture` | Passed: 17 writer tests |
+| `PERF_METAPERF_ARGS='-d /mnt/slayerfs/.perf-metaperf -t 15 -s 4096 -l 16 -L 16 -n 200 -N 2000 create' ./docker/compose-xfstests/run_redis_perf.sh --tools "metaperf"` | Passed: `perf-run-1780199010-26913`, default S3/RustFS create improved to 279.8 ops/s |
+| `./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf metaperf"` | Passed: `perf-run-1780199065-12909`, fio 118.48/54.72 MiB/s, `dirperf` 15s, `metaperf` 199s |
+| `./docker/compose-xfstests/run_redis_perf.sh --tools "dirperf"` | Passed: `perf-run-1780199386-12772`, isolated `dirperf` 13s |
+| `cargo test -p slayerfs --lib --bins --tests -- --format terse` | Passed fresh before commit: lib 292 passed / 0 failed, bin 284 passed / 0 failed, compaction/GC/rename/native tests passed |
 
 ## Files And Responsibilities
 
@@ -1103,9 +1116,27 @@ docker/compose-xfstests/artifacts/perf-run-1780197948-14241
 Experiment: explicit SLAYERFS_S3_MAX_CONCURRENCY=1 diagnostic.
 create: 205.0 ops/s.
 Decision: keep only the env pass-through for reproducibility; do not change the default 8-concurrency perf-runner config because none of 1/4/32 beats the prior 8-concurrency diagnostic.
+
+docker/compose-xfstests/artifacts/perf-run-1780199010-26913
+Experiment: run best-effort SSD dirty-slice persistence concurrently with the object upload, single-op S3/RustFS metaperf create.
+create: 279.8 ops/s.
+Decision: keep. This removes sequential local fsync/writeback-cache cost from the foreground upload path while still waiting for both best-effort persist and object upload before marking the upload batch complete. The result closes most of the gap to JuiceFS create at 305.8 ops/s.
+
+docker/compose-xfstests/artifacts/perf-run-1780199065-12909
+Mixed verification after the writeback overlap change:
+fio-randrw read/write: 118.48/54.72 MiB/s.
+dirperf: 15s.
+metaperf: 199s.
+metadata detail: create 231.0 ops/s, open 6012.9 ops/s, stat 1,104,350.4 ops/s, readdir 33,007.1 ops/s, rename 972.7 ops/s.
+Decision: keep the writeback overlap because it improves create and metaperf without hurting fio, but Step 14 remains open because mixed dirperf is still above the 13s target.
+
+docker/compose-xfstests/artifacts/perf-run-1780199386-12772
+Dirperf-only repeat after the writeback overlap change:
+dirperf: 13s.
+Decision: isolated dirperf still matches JuiceFS; the remaining mixed 15s result is fio-aftereffect variance, not a standalone metadata regression from the writeback overlap change.
 ```
 
-Next hypothesis: the remaining mixed-run variance is not fixed by static FUSE worker/queue defaults, Redis `statfs` scanning, compression, simple S3 SDK stream wrapping, early metadata commit, or coarse S3 concurrency tuning. Investigate either (1) batching/coalescing the safe small-object writeback path without weakening close semantics, (2) why local-fs fio still perturbs following metadata latency even when Redis command counts are unchanged, or (3) an unstripped PID-attached perf profile for the 14s mixed `dirperf` phase. Prefer evidence from the object writeback path or unstripped perf frames over another default-tuning change.
+Next hypothesis: the S3/RustFS create gap is now mostly addressed by overlapping best-effort SSD persistence with object upload, but mixed dirperf still varies after fio even though isolated dirperf remains 13s. Investigate why the preceding fio phase perturbs subsequent metadata latency: compare FUSE op latency and Redis commandstats for isolated dirperf versus post-fio dirperf, check whether writeback cache cleanup or remaining fio files leave local/S3/Redis pressure, and prefer an unstripped PID-attached perf profile of the mixed `dirperf` phase over another default-tuning change.
 
 ## Maintenance Rules
 
