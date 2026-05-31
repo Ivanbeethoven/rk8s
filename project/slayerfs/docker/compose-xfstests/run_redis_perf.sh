@@ -271,6 +271,8 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e PERF_FIO_RUNTIME \
     -e PERF_FUSE_OPS_LOG \
     -e SLAYERFS_FUSE_OP_LOG \
+    -e SLAYERFS_FUSE_WORKERS \
+    -e SLAYERFS_FUSE_MAX_BACKGROUND \
     -e SLAYERFS_NOFILE_LIMIT \
     -e SLAYERFS_COMPRESSION \
     -e PERF_LOG_TO_CONSOLE \

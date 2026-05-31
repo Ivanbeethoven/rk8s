@@ -48,7 +48,7 @@ The demo will:
 
 ### FUSE Mount Concurrency
 
-`slayerfs mount` now enables the `rfuse3` worker pool by default, and still allows explicit overrides:
+`slayerfs mount` defaults to the low-overhead `rfuse3` session dispatch path, and still allows explicit worker-pool overrides:
 
 ```bash
 slayerfs mount /mnt/slayer \
@@ -59,7 +59,7 @@ slayerfs mount /mnt/slayer \
 ```
 
 Notes:
-- By default, SlayerFS derives the worker count from host parallelism and keeps it at least `2`
+- By default, SlayerFS uses `--fuse-workers 1`; this avoids worker-pool scheduling overhead on metadata-heavy workloads
 - `--fuse-workers 0` or `1` keeps the legacy `rfuse3` session dispatch
 - `--fuse-workers > 1` enables the `rfuse3` worker pool
 - `--fuse-max-background` caps queued + running FUSE requests

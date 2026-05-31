@@ -14,9 +14,7 @@ pub const DEFAULT_S3_MAX_CONCURRENCY: usize = 32;
 pub const DEFAULT_FUSE_MAX_BACKGROUND: usize = 512;
 
 fn default_fuse_workers() -> usize {
-    std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get().max(2))
-        .unwrap_or(4)
+    1
 }
 
 #[derive(Parser)]
@@ -487,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_config_defaults_enable_fuse_workers() {
+    fn mount_config_defaults_use_low_overhead_fuse_dispatch() {
         let config = MountConfig::from_sources(MountArgs {
             config: None,
             mount_point: Some(PathBuf::from("/mnt/slayer")),
@@ -511,8 +509,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(config.fuse_workers, default_fuse_workers());
-        assert!(config.fuse_workers > 1);
+        assert_eq!(config.fuse_workers, 1);
         assert_eq!(config.fuse_max_background, DEFAULT_FUSE_MAX_BACKGROUND);
     }
 

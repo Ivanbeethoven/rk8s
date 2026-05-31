@@ -37,7 +37,7 @@ slayerfs mount [MOUNT_POINT] \
   --meta-etcd-urls <URL1,URL2,...>   # Etcd 端点
   --chunk-size <BYTES>               # Chunk 大小 (默认 64 MiB)
   --block-size <BYTES>               # Block 大小 (默认 4 MiB)
-  --fuse-workers <N>                  # FUSE worker 数 (默认 CPU 核数, min 2)
+  --fuse-workers <N>                  # FUSE worker 数 (默认 1)
   --fuse-max-background <N>          # FUSE 最大排队请求 (默认 512)
   --privileged                       # 特权挂载模式 (使用 /dev/fuse)
 ```
@@ -181,10 +181,10 @@ S3 相关参数说明：
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `fuse-workers` | CPU 核数 (min 2) | rfuse3 worker pool 大小。0 或 1 使用旧版 session dispatch |
+| `fuse-workers` | 1 | rfuse3 worker pool 大小。0 或 1 使用低开销 session dispatch |
 | `fuse-max-background` | 512 | 排队 + 执行中的 FUSE 请求最大数 |
 
-worker pool 模式（`workers > 1`）下，FUSE 请求由 worker 线程池并发处理，适合高并发 IO 场景。
+worker pool 模式（`workers > 1`）下，FUSE 请求由 worker 线程池并发处理，适合需要额外 FUSE 并发的 IO 场景；metadata-heavy workload 默认保留低调度开销路径。
 
 ## 挂载模式
 

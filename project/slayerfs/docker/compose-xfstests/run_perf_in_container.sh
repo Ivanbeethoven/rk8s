@@ -145,6 +145,17 @@ layout:
   block_size: ${SLAYERFS_BLOCK_SIZE:-4194304}
 EOF
 
+        if [[ -n "${SLAYERFS_FUSE_WORKERS:-}" || -n "${SLAYERFS_FUSE_MAX_BACKGROUND:-}" ]]; then
+            echo
+            echo "fuse:"
+            if [[ -n "${SLAYERFS_FUSE_WORKERS:-}" ]]; then
+                echo "  workers: ${SLAYERFS_FUSE_WORKERS}"
+            fi
+            if [[ -n "${SLAYERFS_FUSE_MAX_BACKGROUND:-}" ]]; then
+                echo "  max_background: ${SLAYERFS_FUSE_MAX_BACKGROUND}"
+            fi
+        fi
+
         # Cache section (compression, etc.)
         local comp="${SLAYERFS_COMPRESSION:-none}"
         if [[ "$comp" != "none" ]]; then
