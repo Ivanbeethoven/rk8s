@@ -3276,6 +3276,38 @@ async fn test_link_root_inode_rejected_fallback() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn test_stat_fs_batches_node_fetches_with_mget() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    for idx in 0..4 {
+        let ino = store
+            .create_file(root, format!("sf_batch_{idx}.txt"))
+            .await
+            .unwrap();
+        store.set_file_size(ino, 1024 + idx).await.unwrap();
+    }
+    store.mkdir(root, "sf_batch_dir".to_string()).await.unwrap();
+
+    reset_redis_commandstats(&store).await;
+    let snap = store.stat_fs().await.unwrap();
+
+    assert!(snap.used_inodes >= 6);
+    let get_calls = redis_command_calls(&store, "get").await;
+    let mget_calls = redis_command_calls(&store, "mget").await;
+    assert!(
+        get_calls <= 1,
+        "stat_fs should batch node loads instead of issuing one GET per inode; observed {get_calls} GET calls"
+    );
+    assert_eq!(
+        mget_calls, 1,
+        "stat_fs should fetch all node payloads with one Redis MGET"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_stat_fs_accounting_fallback() {
     let store = new_test_store().await;
     let root = store.root_ino();

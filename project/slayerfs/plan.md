@@ -59,6 +59,7 @@ Implemented changes:
 | FUSE lock cleanup | `flush()`/`release()` now skips POSIX owner unlock metadata work unless this process actually observed a FUSE `setlk` for that inode/owner | Avoid redundant Redis Lua lock-cleanup scripts on ordinary close-heavy workloads while preserving cleanup for known lock owners, including owner `0` |
 | FUSE dispatch | Default `fuse_workers` is now `1`, which keeps the low-overhead `rfuse3` session dispatch path unless the operator explicitly requests a worker pool | Avoid worker-pool scheduling overhead on metadata-heavy workloads while preserving `--fuse-workers > 1` for high-concurrency override |
 | Perf tooling | Redis perf runner can inject `SLAYERFS_FUSE_WORKERS` and `SLAYERFS_FUSE_MAX_BACKGROUND` into generated backend config | Make FUSE dispatch and background-queue experiments reproducible from artifact-local perf runs |
+| Redis metadata | `stat_fs()` now batches node payload loads with one Redis `MGET` after the node-key scan | Remove per-inode Redis `GET` round trips from FUSE `statfs` without changing accounting semantics |
 
 Environment note:
 
@@ -176,6 +177,12 @@ Focused continuation artifacts:
 | `perf-run-1780192933-16633` | Current-code reduced `dirperf` with `PERF_FUSE_OPS_LOG=1` on local-fs | 1s | n/a | FUSE trace showed create/unlink remain dominant but close to prior accepted latency: create avg 255.4 us, unlink avg 248.4 us |
 | `perf-run-1780193143-32485` | `SLAYERFS_FUSE_WORKERS=2` dirperf-only experiment | 13s | n/a | Isolated `dirperf` still matches JuiceFS, so two workers are not immediately disqualified |
 | `perf-run-1780193173-15361` | `SLAYERFS_FUSE_WORKERS=2`, mixed `fio-randrw dirperf metaperf` | 15s | 198s | Metaperf improves, but mixed dirperf regresses; reject as default |
+| `perf-run-1780193771-12678` | S3/RustFS single-op `metaperf create` diagnostic | n/a | n/a | Create was 213.7 ops/s over 15s; Redis `evalsha` CPU was only 537ms, so create latency is not Redis-server CPU dominated |
+| `juicefs-perf-run-1780193824-1655` | Matching JuiceFS single-op `metaperf create` diagnostic | n/a | n/a | JuiceFS create was 305.8 ops/s with the same 15s parameters |
+| `perf-run-1780193978-14212` | SlayerFS local-fs single-op `metaperf create` diagnostic | n/a | n/a | Local-fs create reached 381.6 ops/s, showing the S3/RustFS small-write path contributes heavily to the create gap |
+| `perf-run-1780194080-13474` | SlayerFS local-fs `fio-randrw dirperf` diagnostic | 14s | n/a | `dirperf` still reported 14s after fio, so mixed metadata variance is not only object-store specific |
+| `perf-run-1780194725-4446` | Reduced local-fs `dirperf` with Redis `stat_fs()` MGET batching and `PERF_FUSE_OPS_LOG=1` | 1s | n/a | FUSE `statfs` fell from 129.8ms total in `perf-run-1780192933-16633` to 6.7ms total |
+| `perf-run-1780194768-12125` | Redis `stat_fs()` MGET batching, mixed `fio-randrw dirperf metaperf` | 14s | 204s | fio stayed healthy at 117.37/54.70 MiB/s, create/open/rename improved slightly versus `perf-run-1780191648-27152`, but mixed `dirperf` did not reach 13s |
 
 Latest continuation verification:
 
@@ -203,6 +210,9 @@ Latest continuation verification:
 | `bash docker/compose-xfstests/run_redis_perf.sh --tools "dirperf metaperf"` | Passed: `perf-run-1780176122-15261`, `dirperf` 16s, `metaperf` 205s |
 | `bash docker/compose-xfstests/run_redis_perf.sh --tools "dirperf metaperf"` | Passed: `perf-run-1780180872-21146`, `dirperf` 15s, `metaperf` 201s |
 | `cargo test -p slayerfs --test gc_test -- --nocapture` | Passed after an earlier full-suite-only `test_gc_respects_min_age` flake |
+| `cargo test -p slayerfs test_stat_fs_batches_node_fetches_with_mget -- --ignored --nocapture` | Red/green verified: failed before the patch with 6 Redis `GET` calls, then passed for lib and bin test targets with 1 Redis `MGET` |
+| `PERF_FUSE_OPS_LOG=1 PERF_DIRPERF_ARGS='-d /mnt/slayerfs/.perf-dirperf -a 100 -f 100 -l 300 -c 16 -n 2 -s 1' ./docker/compose-xfstests/run_redis_perf.sh --local-fs --tools "dirperf"` | Passed: `perf-run-1780194725-4446`, reduced `dirperf` 1s, FUSE `statfs` total latency reduced to 6.7ms |
+| `./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf metaperf"` | Passed: `perf-run-1780194768-12125`, fio 117.37/54.70 MiB/s, `dirperf` 14s, `metaperf` 204s |
 | `cargo test -p slayerfs --lib --bins --tests -- --format terse` | Passed: lib target 291 passed/147 ignored, bin target 283 passed/147 ignored, integration tests passed with expected ignored external-service tests |
 | `git diff --check` | Passed |
 | `bash -n docker/compose-xfstests/run_perf_in_container.sh docker/compose-xfstests/run_redis_perf.sh` | Passed after adding perf-runner FUSE override plumbing |
@@ -1001,9 +1011,43 @@ fio-randrw read/write: 115.48/53.05 MiB/s.
 dirperf: 15s.
 metaperf: 198s.
 Decision: reject as a default change. Two workers may be useful for metaperf-oriented diagnostics, but it directly violates the mixed dirperf target.
+
+docker/compose-xfstests/artifacts/perf-run-1780193771-12678
+Experiment: single-op S3/RustFS metaperf create, 15s.
+create: 213.7 ops/s.
+Redis commandstats: evalsha 8606 calls, 537ms total server CPU.
+
+docker/compose-xfstests/artifacts/juicefs-perf-run-1780193824-1655
+Matching JuiceFS single-op metaperf create, 15s.
+create: 305.8 ops/s.
+
+docker/compose-xfstests/artifacts/perf-run-1780193978-14212
+Matching SlayerFS local-fs single-op metaperf create, 15s.
+create: 381.6 ops/s.
+Decision: the S3/RustFS small-write path is a major part of the create gap, while Redis server CPU is not.
+
+docker/compose-xfstests/artifacts/perf-run-1780194080-13474
+Experiment: local-fs fio-randrw followed by dirperf.
+fio-randrw read/write: 119.44/55.60 MiB/s.
+dirperf: 14s.
+Decision: mixed dirperf variance is not purely S3/RustFS-specific; fio/cache/system load also perturbs the following metadata phase.
+
+docker/compose-xfstests/artifacts/perf-run-1780194725-4446
+Reduced local-fs dirperf FUSE trace after Redis stat_fs MGET batching:
+  statfs 3 calls, avg 2.2 ms, total 6.7 ms
+  create 1201 calls, avg 245.0 us, total 294.3 ms
+  unlink 1201 calls, avg 242.9 us, total 291.7 ms
+Compared with perf-run-1780192933-16633, statfs dropped by about 123ms total without increasing create/unlink latency.
+
+docker/compose-xfstests/artifacts/perf-run-1780194768-12125
+Mixed verification after Redis stat_fs MGET batching:
+fio-randrw read/write: 117.37/54.70 MiB/s.
+dirperf: 14s.
+metaperf: 204s.
+Decision: keep the statfs batching as a narrow local hotspot fix, but Step 14 remains open because mixed dirperf is still above the 13s target.
 ```
 
-Next hypothesis: the remaining mixed-run variance is not fixed by static FUSE worker/queue defaults. Investigate either (1) why `metaperf create` consumes many Redis `GET`/`HGET` commands after setup, or (2) why the S3/RustFS fio phase perturbs following metadata latency even when metadata command counts are unchanged. Prefer per-operation metaperf commandstats or an unstripped PID-attached perf profile over another FUSE default change.
+Next hypothesis: the remaining mixed-run variance is not fixed by static FUSE worker/queue defaults or Redis `statfs` scanning. Investigate either (1) the S3/RustFS small-write path behind the `metaperf create` gap, (2) why local-fs fio still perturbs following metadata latency even when Redis command counts are unchanged, or (3) an unstripped PID-attached perf profile for the 14s mixed `dirperf` phase. Prefer evidence from the object writeback path or unstripped perf frames over another FUSE default change.
 
 ## Maintenance Rules
 

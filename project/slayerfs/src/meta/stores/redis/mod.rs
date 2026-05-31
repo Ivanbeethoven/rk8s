@@ -2675,15 +2675,28 @@ impl MetaStore for RedisMetaStore {
             .await
             .map_err(redis_err)?;
 
+        if keys.is_empty() {
+            return Ok(StatFsSnapshot {
+                total_space: 0,
+                available_space: 0,
+                used_inodes: 0,
+                available_inodes: 0,
+            });
+        }
+
+        let nodes: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
+            .arg(&keys)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_err)?;
+
         let mut used_space = 0u64;
         let mut used_inodes = 0u64;
 
-        for key in keys {
-            let data: Option<Vec<u8>> = conn.get(&key).await.map_err(redis_err)?;
+        for (key, data) in keys.iter().zip(nodes.into_iter()) {
             let Some(bytes) = data else {
                 continue;
             };
-
             let node: StoredNode = serde_json::from_slice(&bytes)
                 .map_err(|e| MetaError::Internal(format!("Failed to parse node {key}: {e}")))?;
 
