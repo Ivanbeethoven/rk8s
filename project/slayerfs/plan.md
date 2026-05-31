@@ -78,6 +78,8 @@ Rejected experiment:
 | VFS lazy write-handle `FileWriter` allocation | `docker/compose-xfstests/artifacts/perf-run-1780179246-24852` | `dirperf` stayed 16s, but `metaperf` regressed to 209s; `open` improved to 2922.3 ops/s while `create`, `readdir`, and `rename` regressed | Reverted; avoiding writer allocation on empty write handles did not improve the accepted wall-time baseline |
 | FUSE unlink known-child helper | `docker/compose-xfstests/artifacts/perf-run-1780182725-32445` | `dirperf` stayed 15s and `metaperf` regressed to 204s; `rename` dropped to 922.0 ops/s from 949.6 ops/s | Reverted; removing local duplicate VFS lookup/stat in FUSE unlink did not improve the accepted baseline |
 | Redis create/unlink Lua array reply parser | `docker/compose-xfstests/artifacts/perf-run-1780183967-4848` | `dirperf` stayed 15s and `metaperf` regressed to 202s; `rename` dropped to 904.5 ops/s from 949.6 ops/s | Reverted; avoiding Lua `cjson.encode` plus Rust JSON parse for tiny create/unlink responses did not improve the accepted baseline |
+| FUSE `max_background=64` as default candidate | `docker/compose-xfstests/artifacts/perf-run-1780192554-24836` | `dirperf` stayed 14s and `metaperf` was 204s; fio read/write stayed healthy at 119.91/55.74 MiB/s but tail latency worsened versus default | Rejected as a default change; queue depth alone does not explain mixed-run variance |
+| FUSE `workers=2` as default candidate | `docker/compose-xfstests/artifacts/perf-run-1780193173-15361` | Isolated `dirperf` matched 13s in `perf-run-1780193143-32485`, but mixed `dirperf` regressed to 15s despite `metaperf` improving to 198s | Rejected as a default change; keep worker pool as explicit override for metaperf-oriented experiments |
 
 Focused comparison:
 
@@ -170,6 +172,10 @@ Focused continuation artifacts:
 | `perf-run-1780191179-17401` | Same FUSE override with `fio-randrw dirperf` | 14s | n/a | fio read/write stayed healthy at 119.47/55.41 MiB/s |
 | `perf-run-1780191648-27152` | Code default `fuse_workers=1`, no env override, mixed `fio-randrw dirperf metaperf` | 14s | 203s | fio improved to 120.86/56.01 MiB/s; backend config contained no explicit `fuse:` section |
 | `perf-run-1780191973-11822` | Code default `fuse_workers=1`, no env override, dirperf-only repeat | 13s | n/a | Isolated `dirperf` matches JuiceFS `juicefs-perf-run-1780190527-11724` |
+| `perf-run-1780192554-24836` | Code default workers with `SLAYERFS_FUSE_MAX_BACKGROUND=64`, mixed `fio-randrw dirperf metaperf` | 14s | 204s | Negative result; smaller background queue did not improve mixed metadata and worsened fio tail latency |
+| `perf-run-1780192933-16633` | Current-code reduced `dirperf` with `PERF_FUSE_OPS_LOG=1` on local-fs | 1s | n/a | FUSE trace showed create/unlink remain dominant but close to prior accepted latency: create avg 255.4 us, unlink avg 248.4 us |
+| `perf-run-1780193143-32485` | `SLAYERFS_FUSE_WORKERS=2` dirperf-only experiment | 13s | n/a | Isolated `dirperf` still matches JuiceFS, so two workers are not immediately disqualified |
+| `perf-run-1780193173-15361` | `SLAYERFS_FUSE_WORKERS=2`, mixed `fio-randrw dirperf metaperf` | 15s | 198s | Metaperf improves, but mixed dirperf regresses; reject as default |
 
 Latest continuation verification:
 
@@ -966,6 +972,38 @@ Decision: keep the low-overhead default FUSE dispatch and the perf-runner overri
 - [ ] **Step 14: Stabilize mixed metadata variability without sacrificing fio**
 
 Expected: improve the mixed `fio-randrw dirperf metaperf` run so `dirperf` consistently lands at or below 13s and `metaperf` stays below the JuiceFS 222s comparison, while keeping `fio-randrw` read/write at or above 100/45 MiB/s. Start from FUSE/kernel scheduling evidence or request-shape evidence; do not add speculative Redis caching unless a trace shows the exact extra operation.
+
+Current diagnostic evidence:
+
+```text
+docker/compose-xfstests/artifacts/perf-run-1780192554-24836
+Experiment: SLAYERFS_FUSE_MAX_BACKGROUND=64 with code default workers.
+fio-randrw read/write: 119.91/55.74 MiB/s.
+dirperf: 14s.
+metaperf: 204s.
+Decision: reject as a default change; the smaller queue did not improve mixed metadata and worsened fio tail latency versus perf-run-1780191648-27152.
+
+docker/compose-xfstests/artifacts/perf-run-1780192933-16633
+Reduced local-fs dirperf FUSE trace after the default workers=1 change:
+  create 1201 calls, avg 255.4 us, total 306.7 ms
+  unlink 1201 calls, avg 248.4 us, total 298.3 ms
+  lookup 1212 calls, avg 15.9 us, total 19.2 ms
+  statfs 3 calls, avg 43.3 ms, total 129.8 ms
+Compared with perf-run-1780187143-19761, create/unlink are only slightly slower and lookup remains fixed, so there is no clear new extra FUSE request to remove.
+
+docker/compose-xfstests/artifacts/perf-run-1780193143-32485
+Experiment: SLAYERFS_FUSE_WORKERS=2, dirperf-only.
+dirperf: 13s.
+
+docker/compose-xfstests/artifacts/perf-run-1780193173-15361
+Experiment: SLAYERFS_FUSE_WORKERS=2, mixed fio-randrw dirperf metaperf.
+fio-randrw read/write: 115.48/53.05 MiB/s.
+dirperf: 15s.
+metaperf: 198s.
+Decision: reject as a default change. Two workers may be useful for metaperf-oriented diagnostics, but it directly violates the mixed dirperf target.
+```
+
+Next hypothesis: the remaining mixed-run variance is not fixed by static FUSE worker/queue defaults. Investigate either (1) why `metaperf create` consumes many Redis `GET`/`HGET` commands after setup, or (2) why the S3/RustFS fio phase perturbs following metadata latency even when metadata command counts are unchanged. Prefer per-operation metaperf commandstats or an unstripped PID-attached perf profile over another FUSE default change.
 
 ## Maintenance Rules
 
