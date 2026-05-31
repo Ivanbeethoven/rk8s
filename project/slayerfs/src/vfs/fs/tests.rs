@@ -30,18 +30,6 @@ impl StressRng {
     }
 }
 
-#[tokio::test]
-async fn test_modified_tracker_touch_many_marks_all_inodes() {
-    let tracker = super::ModifiedTracker::new();
-    let before = Instant::now();
-
-    tracker.touch_many([11, 12]).await;
-
-    assert!(tracker.modified_since(11, before).await);
-    assert!(tracker.modified_since(12, before).await);
-    assert!(!tracker.modified_since(13, before).await);
-}
-
 fn test_file_attr(ino: i64) -> super::FileAttr {
     super::FileAttr {
         ino,

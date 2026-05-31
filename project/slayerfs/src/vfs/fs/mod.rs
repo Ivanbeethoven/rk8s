@@ -240,42 +240,6 @@ where
     }
 }
 
-struct ModifiedTracker {
-    entries: DashMap<i64, Instant>,
-}
-
-impl ModifiedTracker {
-    fn new() -> Self {
-        Self {
-            entries: DashMap::new(),
-        }
-    }
-
-    async fn touch(&self, ino: i64) {
-        self.entries.insert(ino, Instant::now());
-    }
-
-    async fn touch_many<const N: usize>(&self, inos: [i64; N]) {
-        let now = Instant::now();
-        for ino in inos {
-            self.entries.insert(ino, now);
-        }
-    }
-
-    async fn modified_since(&self, ino: i64, since: Instant) -> bool {
-        self.entries
-            .get(&ino)
-            .map(|ts| *ts >= since)
-            .unwrap_or(false)
-    }
-
-    async fn cleanup_older_than(&self, ttl: Duration) {
-        let now = Instant::now();
-        let cutoff = now.checked_sub(ttl).unwrap_or(now);
-        self.entries.retain(|_, ts| *ts >= cutoff);
-    }
-}
-
 struct VfsState<S, M>
 where
     S: BlockStore + Send + Sync + 'static,
@@ -287,7 +251,6 @@ where
     recently_unlinked_cleanup_tick: AtomicU64,
     reader: Arc<DataReader<S, M>>,
     writer: Arc<DataWriter<S, M>>,
-    modified: ModifiedTracker,
     append_locks: DashMap<i64, Arc<Mutex<()>>>,
     posix_lock_owners: DashMap<(i64, i64), ()>,
     pub(crate) stats: Arc<crate::vfs::stats::FsStats>,
@@ -395,7 +358,6 @@ where
             recently_unlinked_cleanup_tick: AtomicU64::new(0),
             reader,
             writer,
-            modified: ModifiedTracker::new(),
             append_locks: DashMap::new(),
             posix_lock_owners: DashMap::new(),
             stats: Arc::new(crate::vfs::stats::FsStats::new()),
@@ -1064,8 +1026,6 @@ where
                 }
                 None => {
                     let ino = self.meta_mkdir(cur_ino, part.to_string()).await?;
-                    self.state.modified.touch(cur_ino).await;
-                    self.state.modified.touch(ino).await;
                     cur_ino = ino;
                 }
             }
@@ -1146,8 +1106,6 @@ where
 
         let attr = self.meta_link(src_ino, parent_ino, name).await?;
 
-        self.state.modified.touch_many([parent_ino, src_ino]).await;
-
         Ok(attr)
     }
 
@@ -1164,10 +1122,7 @@ where
         }
 
         match self.meta_mkdir(parent_ino, name.to_string()).await {
-            Ok(ino) => {
-                self.state.modified.touch_many([parent_ino, ino]).await;
-                Ok(ino)
-            }
+            Ok(ino) => Ok(ino),
             Err(VfsError::AlreadyExists { .. }) => {
                 if !existing_dir_ok {
                     return Err(VfsError::AlreadyExists {
@@ -1224,10 +1179,7 @@ where
         }
 
         match self.meta_create_file(parent_ino, name.to_string()).await {
-            Ok(ino) => {
-                self.state.modified.touch_many([parent_ino, ino]).await;
-                Ok(ino)
-            }
+            Ok(ino) => Ok(ino),
             Err(VfsError::AlreadyExists { .. }) => {
                 if create_new {
                     return Err(VfsError::AlreadyExists {
@@ -1290,7 +1242,6 @@ where
         }
 
         let result = self.meta_symlink(parent_ino, name, target).await?;
-        self.state.modified.touch_many([parent_ino, result.0]).await;
         Ok(result)
     }
 
@@ -1313,7 +1264,6 @@ where
 
         self.meta_unlink(parent_ino, name).await?;
         self.remember_recently_unlinked_attr(ino, attr);
-        self.state.modified.touch_many([parent_ino, ino]).await;
         Ok(())
     }
 
@@ -1340,7 +1290,6 @@ where
         }
 
         self.meta_rmdir(parent_ino, name).await?;
-        self.state.modified.touch_many([parent_ino, ino]).await;
         Ok(())
     }
 
@@ -1419,17 +1368,6 @@ where
             new_name.to_string(),
         )
         .await?;
-        if old_parent_ino != new_parent_ino {
-            self.state
-                .modified
-                .touch_many([old_parent_ino, new_parent_ino, src_ino])
-                .await;
-        } else {
-            self.state
-                .modified
-                .touch_many([old_parent_ino, src_ino])
-                .await;
-        }
 
         Ok(())
     }
@@ -1667,16 +1605,6 @@ where
         self.meta_rename_exchange(old_parent_ino, &old_name, new_parent_ino, &new_name)
             .await?;
 
-        // Update cache
-        if old_parent_ino != new_parent_ino {
-            self.state
-                .modified
-                .touch_many([old_parent_ino, new_parent_ino])
-                .await;
-        } else {
-            self.state.modified.touch(old_parent_ino).await;
-        }
-
         Ok(())
     }
 
@@ -1866,7 +1794,6 @@ where
             self.state.handles.update_attr_for_inode(ino, &attr);
         }
 
-        self.state.modified.touch(ino).await;
         drop(guards);
         Ok(())
     }
@@ -2012,7 +1939,6 @@ where
             attr.size = size;
         }
 
-        self.state.modified.touch(ino).await;
         self.state.handles.update_attr_for_inode(ino, &attr);
 
         // _guards dropped here — after meta_set_attr has read the correct state
@@ -2073,7 +1999,6 @@ where
     pub async fn chmod(&self, ino: i64, new_mode: u32) -> Result<FileAttr, VfsError> {
         let attr = self.meta_chmod(ino, new_mode).await?;
 
-        self.state.modified.touch(ino).await;
         self.state.handles.update_attr_for_inode(ino, &attr);
 
         Ok(attr)
@@ -2092,7 +2017,6 @@ where
     ) -> Result<FileAttr, VfsError> {
         let attr = self.meta_chown(ino, uid, gid).await?;
 
-        self.state.modified.touch(ino).await;
         self.state.handles.update_attr_for_inode(ino, &attr);
 
         Ok(attr)
@@ -2224,8 +2148,6 @@ where
             self.extend_local_file_size(handle.ino, new_end);
         }
 
-        self.state.modified.touch(handle.ino).await;
-
         tracing::trace!(
             fh,
             ino = handle.ino,
@@ -2279,7 +2201,6 @@ where
             self.extend_local_file_size(ino, new_end);
         }
 
-        self.state.modified.touch(ino).await;
         Ok(written)
     }
 
@@ -2791,16 +2712,6 @@ where
         self.state.recently_unlinked.retain(|_, (_, inserted_at)| {
             now.duration_since(*inserted_at) <= RECENTLY_UNLINKED_ATTR_TTL
         });
-    }
-
-    /// Check whether a file has been modified since a given point in time.
-    pub(crate) async fn modified_since(&self, ino: i64, since: Instant) -> bool {
-        self.state.modified.modified_since(ino, since).await
-    }
-
-    /// Drop modification markers older than `ttl` to keep the tracker bounded.
-    pub(crate) async fn cleanup_modified(&self, ttl: Duration) {
-        self.state.modified.cleanup_older_than(ttl).await;
     }
 
     /// Get file lock information for a given inode and query.

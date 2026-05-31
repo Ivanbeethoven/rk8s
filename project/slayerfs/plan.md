@@ -63,6 +63,7 @@ Implemented changes:
 | Perf tooling | Redis perf runner can pass `SLAYERFS_S3_PART_SIZE` and `SLAYERFS_S3_MAX_CONCURRENCY` to the perf container | Make S3/RustFS small-write concurrency sweeps reproducible without changing the default benchmark config |
 | VFS writeback | Best-effort SSD dirty-slice persistence now runs concurrently with the object upload for each upload batch | Remove local fsync/writeback-cache latency from the foreground flush critical path without weakening upload-before-commit visibility |
 | VFS unlink/setattr | Recently-unlinked inode attr cleanup is throttled after the threshold and no-handle timestamp-only `setattr` removes the short-lived attr in one map operation | Avoid repeated full-map cleanup and one extra hot-path map operation in create/unlink-heavy `dirperf` loops |
+| VFS local bookkeeping | Removed the unused `ModifiedTracker` and its create/unlink/rename/write hot-path updates | Drop a DashMap write path that had no production readers and only added local bookkeeping cost |
 
 Environment note:
 
@@ -87,6 +88,7 @@ Rejected experiment:
 | S3 SDK single-`Bytes` `ByteStream` fast path | `docker/compose-xfstests/artifacts/perf-run-1780196012-19201` | Single-op create dropped to 198.7 ops/s from the prior 213.7 ops/s diagnostic | Reverted; the existing stream construction is not the create bottleneck |
 | Immediate `CommitBeforeUpload` for explicit `commit_first` mode | `docker/compose-xfstests/artifacts/perf-run-1780197692-30157` | After wiring the config so the mode actually applied, single-op create reached only 197.5 ops/s | Reverted; early metadata visibility is unsafe and did not improve the S3/RustFS create gap |
 | S3 `max_concurrency=32` as perf-runner default candidate | `docker/compose-xfstests/artifacts/perf-run-1780197799-26251` | Single-op create dropped to 178.3 ops/s even though the generated backend config showed `max_concurrency: 32` | Reverted; RustFS small PUTs regress under this concurrency in the current workload |
+| Redis/VFS `unlink_with_attr` returning Lua attr | `docker/compose-xfstests/artifacts/perf-run-1780204449-28172` | Mixed `dirperf` stayed 14s and Redis output bytes rose to 2.44MB from the prior 0.73MB-class run because every unlink returned attr JSON | Reverted; it did not reduce command counts and increased Redis response traffic |
 
 Focused comparison:
 
@@ -207,6 +209,9 @@ Focused continuation artifacts:
 | `perf-run-1780201496-2914` | Same cleanup throttling, `fio-randrw dirperf` repeat | 14s | n/a | Repeated 14s mixed `dirperf`, suggesting the improvement from 15s to 14s is stable |
 | `perf-run-1780202056-13269` | Cleanup throttling plus no-handle timestamp-only setattr remove-first fast path, `fio-randrw dirperf` | 14s | n/a | Remove-first fast path did not move wall time beyond 14s but avoids an extra map operation in the hot post-unlink setattr path |
 | `perf-run-1780202194-31491` | Cleanup throttling plus remove-first fast path, full mixed `fio-randrw dirperf metaperf` | 14s | 201s | Current-code mixed validation: fio 124.04/57.28 MiB/s, create 258.3 ops/s, open 5933.1 ops/s, rename 961.9 ops/s; Step 14 remains open because `dirperf` is still one second above JuiceFS |
+| `perf-run-1780203555-860` | Removed unused `ModifiedTracker` hot-path writes, `fio-randrw dirperf` | 14s | n/a | Wall time did not move, but the change removes dead local DashMap writes from create/unlink/rename/write paths |
+| `perf-run-1780204449-28172` | Temporary Redis/VFS `unlink_with_attr` attr-return experiment, `fio-randrw dirperf` | 14s | n/a | Rejected and reverted: wall time and Redis command counts stayed flat while Redis output bytes increased materially |
+| `perf-run-1780205229-27708` | Final current code after reverting attr-return experiment, `fio-randrw dirperf` | 14s | n/a | Confirms retained code still has the 14s mixed result; Redis output bytes returned to the 0.73MB-class baseline |
 
 Latest continuation verification:
 
@@ -258,8 +263,16 @@ Latest continuation verification:
 | `cargo test -p slayerfs vfs::io::writer::tests --lib -- --nocapture` | Passed: 17 writer tests |
 | `PERF_METAPERF_ARGS='-d /mnt/slayerfs/.perf-metaperf -t 15 -s 4096 -l 16 -L 16 -n 200 -N 2000 create' ./docker/compose-xfstests/run_redis_perf.sh --tools "metaperf"` | Passed: `perf-run-1780199010-26913`, default S3/RustFS create improved to 279.8 ops/s |
 | `./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf metaperf"` | Passed: `perf-run-1780199065-12909`, fio 118.48/54.72 MiB/s, `dirperf` 15s, `metaperf` 199s |
+| `cargo test -p slayerfs vfs::fs::tests::basic_tests -- --nocapture` | Passed after removing unused `ModifiedTracker`: 9 VFS basic tests for lib and bin targets |
+| `cargo test -p slayerfs meta::stores::redis::tests::test_meta_client_unlink_with_attr_avoids_prelookup_stat -- --ignored --nocapture` | Red/green diagnostic for the rejected attr-return experiment: failed before the API existed, then passed after implementation; experiment was reverted because Docker perf did not improve |
+| `cargo test -p slayerfs meta::stores::redis::tests::test_unlink_last_reference_updates_parent_and_deleted_child_atomically -- --ignored --nocapture` | Passed for lib and bin test targets during the rejected attr-return experiment validation |
+| `cargo test -p slayerfs meta::stores::redis::tests::test_unlink_directory_rejected_fallback -- --ignored --nocapture` | Passed for lib and bin test targets during the rejected attr-return experiment validation |
+| `cargo test -p slayerfs meta::stores::redis::tests::test_hardlink_state_machine_full_transition -- --ignored --nocapture` | Passed for lib and bin test targets during the rejected attr-return experiment validation |
+| `./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf"` | Passed: `perf-run-1780203555-860`, fio 116.17/53.43 MiB/s, `dirperf` 14s |
+| `./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf"` | Passed for rejected attr-return experiment: `perf-run-1780204449-28172`, fio 124.29/57.39 MiB/s, `dirperf` 14s |
+| `./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf"` | Passed after reverting attr-return experiment: `perf-run-1780205229-27708`, fio 116.34/53.85 MiB/s, `dirperf` 14s |
 | `./docker/compose-xfstests/run_redis_perf.sh --tools "dirperf"` | Passed: `perf-run-1780199386-12772`, isolated `dirperf` 13s |
-| `cargo test -p slayerfs --lib --bins --tests -- --format terse` | Passed fresh before commit: lib 292 passed / 0 failed, bin 284 passed / 0 failed, compaction/GC/rename/native tests passed |
+| `cargo test -p slayerfs --lib --bins --tests -- --format terse` | Passed on final retained code: lib 292 passed/148 ignored, bin 284 passed/148 ignored, compaction/GC/rename/native tests passed with expected ignored external-service tests |
 | `PERF_FUSE_OPS_LOG=1 ./docker/compose-xfstests/run_redis_perf.sh --tools "dirperf"` | Passed: `perf-run-1780200122-4750`; trace overhead made `dirperf` 16s but isolated FUSE service was dominated by create/unlink |
 | `PERF_FUSE_OPS_LOG=1 ./docker/compose-xfstests/run_redis_perf.sh --tools "fio-randrw dirperf"` | Passed: `perf-run-1780200151-7896`; post-fio trace made `dirperf` 17s and showed create/unlink service time rises more than Redis command counts explain |
 | `cargo test -p slayerfs vfs::fs::tests::test_recently_unlinked_cleanup_is_not_run_on_every_threshold_insert --lib -- --nocapture` | Red/green verified: failed before cleanup throttling, then passed after throttling recently-unlinked attr cleanup |
@@ -1181,9 +1194,29 @@ dirperf: 14s.
 metaperf: 201s.
 metadata detail: create 258.3 ops/s, open 5933.1 ops/s, stat 1,105,574.9 ops/s, readdir 32,333.6 ops/s, rename 961.9 ops/s.
 Decision: keep. The remove-first fast path did not push wall time below 14s, but it reduces one map operation on the hot post-unlink timestamp setattr path and preserved the improved mixed result.
+
+docker/compose-xfstests/artifacts/perf-run-1780203555-860
+Experiment: remove unused `ModifiedTracker` hot-path writes.
+fio-randrw read/write: 116.17/53.43 MiB/s.
+dirperf: 14s.
+Decision: keep cautiously. It did not move wall time, but the tracker had no production readers and wrote to a DashMap in create/unlink/rename/write paths.
+
+docker/compose-xfstests/artifacts/perf-run-1780204449-28172
+Experiment: temporary Redis/VFS `unlink_with_attr` path returning deleted attr from Lua.
+fio-randrw read/write: 124.29/57.39 MiB/s.
+dirperf: 14s.
+Redis note: command counts stayed unchanged and `total_net_output_bytes` rose to 2.44MB.
+Decision: reverted. Returning attr JSON from every unlink increased response traffic without improving mixed dirperf.
+
+docker/compose-xfstests/artifacts/perf-run-1780205229-27708
+Experiment: final current code after reverting the attr-return experiment.
+fio-randrw read/write: 116.34/53.85 MiB/s.
+dirperf: 14s.
+Redis note: command counts match the pre-experiment shape and `total_net_output_bytes` is back to 731197 bytes.
+Decision: current retained code is performance-neutral on wall time; Step 14 remains open for timing/perf-symbol investigation.
 ```
 
-Next hypothesis: mixed `dirperf` has moved from 15s to a stable 14s, while JuiceFS/isolated target remains 13s. FUSE traces show create/unlink service time is still the meaningful local hot path and Redis command counts are not the remaining explanation. Next, use an unstripped PID-attached perf profile or a low-overhead internal timing counter around VFS create/unlink substeps to split local costs between MetaClient cache work, modified/recently-unlinked maps, and Redis await time; avoid another broad default-tuning change unless it explains the final 1s gap.
+Next hypothesis: mixed `dirperf` remains at a stable 14s, while JuiceFS/isolated target remains 13s. FUSE traces show create/unlink service time is still the meaningful local hot path, but Redis command-count reductions and larger Lua responses have not explained the remaining second. Next, use an unstripped PID-attached perf profile or a low-overhead internal timing counter around VFS create/unlink substeps to split local costs between MetaClient cache hits, recently-unlinked map work, and Redis await time; avoid another broad default-tuning change or response-shape change unless it explains the final 1s gap.
 
 ## Maintenance Rules
 
