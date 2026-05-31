@@ -83,35 +83,35 @@ Focused comparison:
 | --- | --- | ---: | --- | ---: | --- |
 | `fio-randrw` read BW | `perf-run-1780152993-885` | 115.41 MiB/s | `juicefs-perf-run-1780153510-28102` | 66.00 MiB/s | SlayerFS faster |
 | `fio-randrw` write BW | `perf-run-1780152993-885` | 53.15 MiB/s | `juicefs-perf-run-1780153510-28102` | 29.29 MiB/s | SlayerFS faster |
-| `dirperf` wall time | `perf-run-1780187198-23645`, `perf-run-1780187438-20171` | 14s | `juicefs-perf-run-1780153510-28102` | 13s | Improved, now repeated at 14s |
-| `metaperf` wall time | `perf-run-1780187198-23645`, `perf-run-1780187438-20171` | 199-201s | `juicefs-perf-run-1780153510-28102` | 222s | Better on wall time |
+| `dirperf` wall time | `perf-run-1780190018-24278` | 14s | `juicefs-perf-run-1780153510-28102` | 13s | Improved, still 1s gap |
+| `metaperf` wall time | `perf-run-1780190018-24278` | 199s | `juicefs-perf-run-1780153510-28102` | 222s | Better on wall time |
 
-Important caveat: `metaperf` wall time is close, but individual metadata ops still lag JuiceFS on create/rename. The latest `dirperf` gap is now 14s vs JuiceFS 13s; the next bottleneck is still metadata/FUSE hot-path overhead rather than disk-cache throughput.
+Important caveat: `metaperf` wall time is close, but individual metadata ops still lag JuiceFS on create/rename. The latest `dirperf` gap is still 14s vs JuiceFS 13s. Redis diagnostics from `perf-run-1780190018-24278` show Redis Lua server CPU is not the dominant wall-clock cost, so the next bottleneck is likely command round trips, FUSE/kernel scheduling, or the directory tool's serialized request pattern rather than Lua computation itself.
 
 Latest focused metadata detail:
 
-| Operation | SlayerFS `perf-run-1780187198-23645`, `perf-run-1780187438-20171` | JuiceFS `juicefs-perf-run-1780153510-28102` | Gap |
+| Operation | SlayerFS `perf-run-1780190018-24278` | JuiceFS `juicefs-perf-run-1780153510-28102` | Gap |
 | --- | ---: | ---: | --- |
-| create | 185.6-205.9 ops/s | 285.1 ops/s | SlayerFS slower, still variable |
-| open | 5524.5-5743.6 ops/s | 6049.8 ops/s | Close to JuiceFS |
-| stat | 1,117,480.9-1,120,831.2 ops/s | 1,101,680 ops/s | Similar |
-| readdir | 32,657.3-33,374.8 ops/s | 37,075.7 ops/s | SlayerFS slower, improved locally |
-| rename | 919.2-927.6 ops/s | 1438.3 ops/s | SlayerFS slower, improved locally |
+| create | 197.7 ops/s | 285.1 ops/s | SlayerFS slower, still variable |
+| open | 5670.8 ops/s | 6049.8 ops/s | Close to JuiceFS |
+| stat | 1,116,279.7 ops/s | 1,101,680 ops/s | Similar |
+| readdir | 32,110.8 ops/s | 37,075.7 ops/s | SlayerFS slower |
+| rename | 926.8 ops/s | 1438.3 ops/s | SlayerFS slower, repeat-variable |
 
 Latest focused `dirperf` shape:
 
 ```text
-docker/compose-xfstests/artifacts/perf-run-1780180872-21146
-100 1.233
-200 1.136
-300 1.311
-400 1.256
-500 1.266
-600 1.257
-700 1.501
-800 1.469
-900 1.471
-1000 1.430
+docker/compose-xfstests/artifacts/perf-run-1780190018-24278
+100 1.190
+200 1.068
+300 1.102
+400 1.132
+500 1.222
+600 1.167
+700 1.222
+800 1.268
+900 1.341
+1000 1.355
 ```
 
 Latest pre-commit verification:
@@ -140,6 +140,7 @@ Latest post-commit metadata continuation:
 | Meta client create/mkdir parent stat removal | New Redis commandstats tests failed before the patch with 2 Redis `GET` calls, then passed with at most 1 `GET` after skipping the client-side parent stat | Keep; `dirperf` matched the best 20s run |
 | VFS no-write flush/close timestamp skip | New Redis commandstats tests failed before the patch with 1 Redis `SET` on no-write flush and close, then passed with zero Redis `SET` calls | Keep; `dirperf` improved to 16s and `metaperf` to 205s |
 | FUSE POSIX no-lock cleanup skip | New FUSE flush tests cover both no-lock skip and known lock owner release, including owner `0`; Docker perf improved to `dirperf` 15s and `metaperf` 201s | Keep |
+| Redis same-dir rename parent update trim | New ignored commandstats test failed before the patch with 3 Redis `GET` calls, then passed after skipping the redundant parent `GET`/`SET` when old and new parent are identical; `test_rename_lua` still passed | Keep; Docker perf repeated `dirperf` 14s and kept `metaperf` at 196-199s |
 
 Focused continuation artifacts:
 
@@ -565,6 +566,17 @@ docker/compose-xfstests/artifacts/perf-run-1780187438-20171
 Repeat full run for DashMap ModifiedTracker plus batched VFS touch: dirperf 14s, metaperf 201s.
 Metadata operations: create 185.6 ops/s, open 5524.5 ops/s, stat 1117480.9 ops/s, readdir 32657.3 ops/s, rename 919.2 ops/s.
 Kept because two full runs repeated the 14s dirperf result, the reduced trace lowered create/unlink latency, and metaperf stayed within the previous accepted 198-202s range.
+
+docker/compose-xfstests/artifacts/perf-run-1780189185-18181
+Perf runner Redis diagnostics plus same-dir rename parent update trim: dirperf 14s, metaperf 196s.
+Metadata operations: create 202.6 ops/s, open 5602.8 ops/s, stat 1114674.4 ops/s, readdir 32368.0 ops/s, rename 952.4 ops/s.
+Redis dirperf diagnostics: evalsha 22,006 calls, 1.42s total server CPU, worst command latency spike 2ms.
+
+docker/compose-xfstests/artifacts/perf-run-1780190018-24278
+Repeat after final verification: dirperf 14s, metaperf 199s.
+Metadata operations: create 197.7 ops/s, open 5670.8 ops/s, stat 1116279.7 ops/s, readdir 32110.8 ops/s, rename 926.8 ops/s.
+Redis dirperf diagnostics: evalsha 22,006 calls, 1.41s total server CPU, worst Redis latency spike 1ms.
+Kept because commandstats prove the same-dir rename micro-optimization removes redundant Redis parent GET/SET, the repeat preserves the 14s dirperf result, and the new diagnostics show the remaining dirperf gap is not dominated by Redis Lua CPU.
 ```
 
 - [x] **Step 2: Collapse Redis unlink into one atomic operation**
@@ -821,11 +833,65 @@ metaperf pass 201s
 
 The optimization is kept because it removes local mutex serialization from a hot VFS bookkeeping path, repeats the 14s `dirperf` result twice, and does not show a stable `metaperf` regression. It still does not close the final 1s `dirperf` gap to JuiceFS.
 
-- [ ] **Step 12: Investigate remaining 1s dirperf gap**
+- [x] **Step 12: Investigate remaining 1s dirperf gap and trim same-dir rename parent updates**
 
-The latest FUSE trace shows create/unlink still dominate high-frequency operation latency even after local bookkeeping cleanup.
+The latest FUSE trace shows create/unlink still dominate high-frequency operation latency even after local bookkeeping cleanup. Perf runner diagnostics were extended so redis-backed runs can capture per-tool Redis `INFO commandstats`, `SLOWLOG`, `LATENCY`, and working FUSE op traces under the current artifact directory.
 
-Expected: identify whether the remaining gap is Redis Lua execution, FUSE scheduling, kernel request pattern, or userspace directory-tool overhead before attempting another patch. Prefer proof from `perf` or Redis slow/latency evidence over another cache-only speculation.
+Run:
+
+```bash
+bash -n docker/compose-xfstests/run_perf_in_container.sh
+PERF_FUSE_OPS_LOG=1 PERF_DIRPERF_ARGS='-d /mnt/slayerfs/.perf-dirperf -a 100 -f 100 -l 200 -c 16 -n 2 -s 1' ./docker/compose-xfstests/run_redis_perf.sh --local-fs --tools "dirperf"
+./docker/compose-xfstests/run_redis_perf.sh --tools "dirperf metaperf"
+cargo test -p slayerfs test_rename_same_dir_skips_redundant_parent_get_set -- --ignored --nocapture
+cargo test -p slayerfs test_rename_lua -- --ignored --nocapture
+./docker/compose-xfstests/run_redis_perf.sh --tools "dirperf metaperf"
+git diff --check
+cargo test -p slayerfs
+```
+
+Verified evidence:
+
+```text
+docker/compose-xfstests/artifacts/perf-run-1780188294-9506
+Small local-fs diagnostic run: Redis diagnostics generated and slayerfs_fuse_ops.log contained 12,176 lines.
+
+docker/compose-xfstests/artifacts/perf-run-1780188323-25552
+Before same-dir rename parent update trim:
+dirperf pass 14s
+metaperf pass 231s
+Redis dirperf evalsha: 22,006 calls, 1.36s total server CPU, worst Redis command latency spike 3ms.
+
+RED before implementation:
+test_rename_same_dir_skips_redundant_parent_get_set failed with 3 Redis GET calls.
+
+GREEN after implementation:
+test_rename_same_dir_skips_redundant_parent_get_set passed.
+test_rename_lua passed 13 ignored Redis tests for both lib and bin test targets.
+
+docker/compose-xfstests/artifacts/perf-run-1780189185-18181
+dirperf pass 14s
+metaperf pass 196s
+Metadata operations: create 202.6 ops/s, open 5602.8 ops/s, stat 1114674.4 ops/s, readdir 32368.0 ops/s, rename 952.4 ops/s.
+Redis dirperf evalsha: 22,006 calls, 1.42s total server CPU, worst Redis command latency spike 2ms.
+
+docker/compose-xfstests/artifacts/perf-run-1780190018-24278
+Final repeat:
+dirperf pass 14s
+metaperf pass 199s
+Metadata operations: create 197.7 ops/s, open 5670.8 ops/s, stat 1116279.7 ops/s, readdir 32110.8 ops/s, rename 926.8 ops/s.
+Redis dirperf evalsha: 22,006 calls, 1.41s total server CPU, worst Redis latency spike 1ms.
+
+Final checks:
+git diff --check passed.
+cargo test -p slayerfs passed: lib 291 passed/147 ignored, bin 283 passed/147 ignored, integration tests passed, doctests 9 ignored.
+```
+
+Decision: keep the perf-runner diagnostic support and the same-directory rename Lua trim. The test proves one redundant parent `GET`/`SET` is removed from same-dir rename, and Docker perf did not regress. However, `dirperf` stayed at 14s while Redis Lua CPU was only about 1.4s of the 14s wall time, so the remaining 1s gap is not primarily Lua execution cost.
+
+- [ ] **Step 13: Profile the remaining `dirperf` wall-clock outside Redis Lua CPU**
+
+Expected: identify whether the last 14s vs 13s gap is caused by Redis command round trips/command count, FUSE scheduling, kernel request pattern, or userspace `dirperf` serialization. Prefer CPU/off-CPU perf, FUSE trace summaries, or comparable JuiceFS Redis/FUSE evidence before adding another metadata cache or Lua micro-optimization.
 
 ## Maintenance Rules
 

@@ -1566,6 +1566,36 @@ async fn test_rename_uses_lua_dentry_lookup_without_rust_prelookups() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn test_rename_same_dir_skips_redundant_parent_get_set() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    store
+        .create_file(root, "src.txt".to_string())
+        .await
+        .unwrap();
+
+    reset_redis_commandstats(&store).await;
+    store
+        .rename(root, "src.txt", root, "dst.txt".to_string())
+        .await
+        .unwrap();
+
+    let get_calls = redis_command_calls(&store, "get").await;
+    let set_calls = redis_command_calls(&store, "set").await;
+    assert!(
+        get_calls <= 2,
+        "same-dir rename should fetch parent once and child once; observed {get_calls} Redis GET calls"
+    );
+    assert!(
+        set_calls <= 2,
+        "same-dir rename should save child and parent once; observed {set_calls} Redis SET calls"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_rename_lua_hardlink() {
     let store = new_test_store().await;
     let root = store.root_ino();

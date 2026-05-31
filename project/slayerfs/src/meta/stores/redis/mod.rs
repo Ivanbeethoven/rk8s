@@ -930,17 +930,21 @@ const RENAME_LUA: &str = r#"
     -- Save updated child node
     redis.call('SET', child_node_key, cjson.encode(child_node))
 
-    -- Update parent directory timestamps and directory link counts
-    local old_parent_json = redis.call('GET', old_parent_node_key)
-    if old_parent_json then
-        local ok_op, old_parent_node = pcall(cjson.decode, old_parent_json)
-        if ok_op and old_parent_node and old_parent_node.attr then
-            if child_node.kind == "Dir" and old_parent_ino ~= new_parent_ino then
-                old_parent_node.attr.nlink = old_parent_node.attr.nlink - 1
+    -- Update parent directory timestamps and directory link counts.
+    -- For same-directory rename, new_parent_node already represents the only
+    -- parent that needs touching, so avoid a redundant GET/SET of the same key.
+    if old_parent_ino ~= new_parent_ino then
+        local old_parent_json = redis.call('GET', old_parent_node_key)
+        if old_parent_json then
+            local ok_op, old_parent_node = pcall(cjson.decode, old_parent_json)
+            if ok_op and old_parent_node and old_parent_node.attr then
+                if child_node.kind == "Dir" then
+                    old_parent_node.attr.nlink = old_parent_node.attr.nlink - 1
+                end
+                old_parent_node.attr.mtime = timestamp
+                old_parent_node.attr.ctime = timestamp
+                redis.call('SET', old_parent_node_key, cjson.encode(old_parent_node))
             end
-            old_parent_node.attr.mtime = timestamp
-            old_parent_node.attr.ctime = timestamp
-            redis.call('SET', old_parent_node_key, cjson.encode(old_parent_node))
         end
     end
 

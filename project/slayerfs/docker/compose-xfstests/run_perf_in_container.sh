@@ -208,6 +208,8 @@ EOF
     append_env_export SLAYERFS_MOUNT_READY_DELAY_SECS "1"
     append_env_export SLAYERFS_NOFILE_LIMIT "1048576"
     append_env_export PERF_FUSE_OPS_LOG "0"
+    append_env_export SLAYERFS_FUSE_OP_LOG "0"
+    append_env_export SLAYERFS_FUSE_LOG_FILE
     append_env_export RUST_LOG
 
     cat >>"$helper" <<'EOF'
@@ -216,8 +218,8 @@ if [[ -n "${SLAYERFS_NOFILE_LIMIT:-}" ]]; then
         || echo "failed to raise nofile limit to $SLAYERFS_NOFILE_LIMIT; current=$(ulimit -n)" >&2
 fi
 
-# Enable FUSE op tracing when PERF_FUSE_OPS_LOG=1 for detailed profiling
-if [[ "${PERF_FUSE_OPS_LOG:-0}" == "1" ]]; then
+# Enable FUSE op tracing when requested for detailed profiling.
+if [[ "${PERF_FUSE_OPS_LOG:-0}" == "1" || "${SLAYERFS_FUSE_OP_LOG:-0}" == "1" ]]; then
     export RUST_LOG="${RUST_LOG:-slayerfs=info,rfuse3::raw::logfs=debug}"
 else
     export RUST_LOG="${RUST_LOG:-error}"
@@ -256,12 +258,15 @@ EOF
 }
 
 prepare_artifacts() {
-    mkdir -p "$artifact_dir/results" "$artifact_dir/tools"
+    mkdir -p "$artifact_dir/results" "$artifact_dir/tools" "$artifact_dir/diagnostics"
     touch "$artifact_dir/perf.log" "$artifact_dir/perf-summary.tsv" "$artifact_dir/report.md" >/dev/null 2>&1 || true
     printf 'tool\tstatus\tseconds\tlog\n' >"$artifact_dir/perf-summary.tsv"
     if truthy_env "${PERF_FUSE_OPS_LOG:-0}" || truthy_env "${SLAYERFS_FUSE_OP_LOG:-0}"; then
         export SLAYERFS_FUSE_OP_LOG=1
         export SLAYERFS_FUSE_LOG_FILE="$artifact_dir/slayerfs_fuse_ops.log"
+    else
+        export SLAYERFS_FUSE_OP_LOG=0
+        unset SLAYERFS_FUSE_LOG_FILE || true
     fi
 }
 
@@ -311,6 +316,55 @@ require_tool_bin() {
     fi
 }
 
+redis_diag_enabled() {
+    [[ "$meta_backend" == "redis" ]] || return 1
+    [[ -n "$meta_url" ]] || return 1
+    command -v redis-cli >/dev/null 2>&1 || return 1
+}
+
+redis_diag_cli() {
+    redis-cli -u "$meta_url" "$@"
+}
+
+redis_diag_before_tool() {
+    local tool="$1"
+    redis_diag_enabled || return 0
+
+    {
+        echo "# Redis diagnostic reset before $tool"
+        date -Iseconds
+        redis_diag_cli CONFIG SET latency-monitor-threshold "${PERF_REDIS_LATENCY_THRESHOLD_MS:-1}" || true
+        redis_diag_cli CONFIG RESETSTAT || true
+        redis_diag_cli SLOWLOG RESET || true
+        redis_diag_cli LATENCY RESET || true
+    } >"$artifact_dir/diagnostics/redis-${tool}-before.txt" 2>&1 || true
+}
+
+redis_diag_after_tool() {
+    local tool="$1"
+    redis_diag_enabled || return 0
+
+    {
+        echo "# Redis diagnostics after $tool"
+        date -Iseconds
+        echo
+        echo "## INFO commandstats"
+        redis_diag_cli INFO commandstats || true
+        echo
+        echo "## INFO stats"
+        redis_diag_cli INFO stats || true
+        echo
+        echo "## SLOWLOG GET 20"
+        redis_diag_cli SLOWLOG GET 20 || true
+        echo
+        echo "## LATENCY LATEST"
+        redis_diag_cli LATENCY LATEST || true
+        echo
+        echo "## LATENCY DOCTOR"
+        redis_diag_cli LATENCY DOCTOR || true
+    } >"$artifact_dir/diagnostics/redis-${tool}-after.txt" 2>&1 || true
+}
+
 mount_slayerfs() {
     mkdir -p "$mount_dir"
     if findmnt -rn --target "$mount_dir" --output FSTYPE 2>/dev/null | grep -Eq '^fuse(\.|$)'; then
@@ -342,6 +396,7 @@ run_logged_tool() {
     start="$(date +%s)"
     info "运行压力工具: $tool"
     info "  命令: $*"
+    redis_diag_before_tool "$tool"
     set +e
     if [[ "${PERF_LOG_TO_CONSOLE:-false}" == "true" ]]; then
         "$@" 2>&1 | tee "$log_path"
@@ -353,6 +408,7 @@ run_logged_tool() {
     set -e
     end="$(date +%s)"
     elapsed="$((end - start))"
+    redis_diag_after_tool "$tool"
 
     local log_size
     log_size=$(wc -c < "$log_path" 2>/dev/null || echo 0)
@@ -992,6 +1048,64 @@ if metaperf_log.exists():
     except Exception:
         pass
 
+# --- Diagnostics ---
+diag_dir = artifact_dir / "diagnostics"
+redis_diag_paths = sorted(diag_dir.glob("redis-*-after.txt")) if diag_dir.exists() else []
+if redis_diag_paths:
+    lines.extend([
+        "",
+        "## Redis Diagnostics",
+        "",
+        "| Tool | Top commandstats | Details |",
+        "| --- | --- | --- |",
+    ])
+
+    def parse_commandstats(path):
+        commands = []
+        for raw in path.read_text(errors="replace").splitlines():
+            if not raw.startswith("cmdstat_") or ":" not in raw:
+                continue
+            name, payload = raw.split(":", 1)
+            fields = {}
+            for item in payload.split(","):
+                if "=" in item:
+                    key, value = item.split("=", 1)
+                    fields[key] = value
+            try:
+                calls = int(float(fields.get("calls", "0")))
+                usec_per_call = float(fields.get("usec_per_call", "0"))
+            except ValueError:
+                continue
+            if calls > 0:
+                commands.append((name.removeprefix("cmdstat_"), calls, usec_per_call))
+        return sorted(commands, key=lambda item: item[1] * item[2], reverse=True)[:5]
+
+    for path in redis_diag_paths:
+        tool = path.name.removeprefix("redis-").removesuffix("-after.txt")
+        top = parse_commandstats(path)
+        if top:
+            summary = "<br>".join(
+                f"{cmd}: calls={calls}, usec/call={usec_per_call:.2f}"
+                for cmd, calls, usec_per_call in top
+            )
+        else:
+            summary = "n/a"
+        rel = path.relative_to(artifact_dir)
+        lines.append(f"| {tool} | {summary} | {rel} |")
+
+fuse_log = artifact_dir / "slayerfs_fuse_ops.log"
+if fuse_log.exists() and fuse_log.stat().st_size > 0:
+    try:
+        line_count = sum(1 for _ in fuse_log.open("rb"))
+        lines.extend([
+            "",
+            "## FUSE Op Trace",
+            "",
+            f"- slayerfs_fuse_ops.log: {line_count:,} lines",
+        ])
+    except Exception:
+        pass
+
 # --- Bottleneck Analysis ---
 if fio_json_paths:
     try:
@@ -1115,11 +1229,11 @@ main() {
     info "写入 SlayerFS 配置: $config_path"
     write_config
 
-    info "安装 mount helper: /usr/sbin/mount.fuse.slayerfs"
-    install_mount_helper
-
     info "准备产物目录: $artifact_dir"
     prepare_artifacts
+
+    info "安装 mount helper: /usr/sbin/mount.fuse.slayerfs"
+    install_mount_helper
 
     mount_slayerfs
 

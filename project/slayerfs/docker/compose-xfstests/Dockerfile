@@ -27,6 +27,7 @@ RUN apt-get update && \
         psmisc \
         python3 \
         quota \
+        redis-tools \
         sed \
         sudo \
         uuid-runtime \
