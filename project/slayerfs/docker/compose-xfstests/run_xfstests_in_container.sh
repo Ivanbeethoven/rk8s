@@ -283,8 +283,66 @@ EOF
 }
 
 prepare_results_dir() {
-    mkdir -p "$artifact_dir/results" "$xfstests_dir/results"
+    mkdir -p "$artifact_dir/results" "$artifact_dir/diagnostics" "$xfstests_dir/results"
     touch "$artifact_dir/results/check.log" "$artifact_dir/check.console.log" >/dev/null 2>&1 || true
+}
+
+redis_diag_enabled() {
+    [[ "$meta_backend" == "redis" ]] || return 1
+    [[ -n "$meta_url" ]] || return 1
+    command -v redis-cli >/dev/null 2>&1 || return 1
+}
+
+redis_diag_cli() {
+    redis-cli -u "$meta_url" "$@"
+}
+
+redis_diag_before_xfstests() {
+    redis_diag_enabled || return 0
+    {
+        echo "# Redis diagnostic reset before xfstests"
+        date -Iseconds
+        redis_diag_cli CONFIG SET latency-monitor-threshold "${XFSTESTS_REDIS_LATENCY_THRESHOLD_MS:-1}" || true
+        redis_diag_cli CONFIG RESETSTAT || true
+        redis_diag_cli SLOWLOG RESET || true
+        redis_diag_cli LATENCY RESET || true
+    } >"$artifact_dir/diagnostics/redis-xfstests-before.txt" 2>&1 || true
+}
+
+redis_diag_after_xfstests() {
+    redis_diag_enabled || return 0
+    {
+        echo "# Redis diagnostics after xfstests"
+        date -Iseconds
+        echo
+        echo "## INFO commandstats"
+        redis_diag_cli INFO commandstats || true
+        echo
+        echo "## INFO stats"
+        redis_diag_cli INFO stats || true
+        echo
+        echo "## SLOWLOG GET 20"
+        redis_diag_cli SLOWLOG GET 20 || true
+        echo
+        echo "## LATENCY LATEST"
+        redis_diag_cli LATENCY LATEST || true
+        echo
+        echo "## LATENCY DOCTOR"
+        redis_diag_cli LATENCY DOCTOR || true
+    } >"$artifact_dir/diagnostics/redis-xfstests-after.txt" 2>&1 || true
+}
+
+stats_snapshot_after_xfstests() {
+    local stats_path="$mount_dir/.stats"
+    {
+        date -Iseconds
+        echo
+        if [[ -e "$stats_path" ]]; then
+            tr -d '\000' <"$stats_path"
+        else
+            echo "missing $stats_path"
+        fi
+    } >"$artifact_dir/diagnostics/stats-xfstests-after.txt" 2>&1 || true
 }
 
 copy_artifacts() {
@@ -401,10 +459,13 @@ main() {
     prepare_results_dir
 
     info "运行 xfstests (FUSE): dir=$xfstests_dir mount=$mount_dir"
+    redis_diag_before_xfstests
     set +e
     run_xfstests
     status=$?
     set -e
+    stats_snapshot_after_xfstests
+    redis_diag_after_xfstests
 
     if [[ -f "$artifact_dir/check.console.log" ]]; then
         cp -f "$artifact_dir/check.console.log" "$artifact_dir/xfstests-script.log" >/dev/null 2>&1 || true

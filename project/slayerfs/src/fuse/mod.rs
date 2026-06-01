@@ -63,6 +63,9 @@ fn fuse_cache_ttl() -> Duration {
 const STATS_INODE: u64 = 0x7FFF_FFFF_0000_0003;
 /// Name of the virtual stats file.
 const STATS_FILENAME: &str = ".stats";
+const STATS_FILE_SIZE: u64 = 16 * 1024;
+const STATS_FILE_BLOCKS: u64 = 32;
+const STATS_FILE_BLOCK_SIZE: u32 = 4096;
 #[cfg(all(test, target_os = "linux"))]
 mod mount_tests {
     use super::*;
@@ -372,8 +375,8 @@ where
             let now: Timestamp = std::time::SystemTime::now().into();
             let attr = rfuse3::raw::reply::FileAttr {
                 ino: STATS_INODE,
-                size: 4096,
-                blocks: 1,
+                size: STATS_FILE_SIZE,
+                blocks: STATS_FILE_BLOCKS,
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -383,7 +386,7 @@ where
                 uid: req.uid,
                 gid: req.gid,
                 rdev: 0,
-                blksize: 4096,
+                blksize: STATS_FILE_BLOCK_SIZE,
                 #[cfg(target_os = "macos")]
                 crtime: now,
                 #[cfg(target_os = "macos")]
@@ -650,8 +653,8 @@ where
             let now: Timestamp = std::time::SystemTime::now().into();
             let attr = rfuse3::raw::reply::FileAttr {
                 ino: STATS_INODE,
-                size: 4096,
-                blocks: 1,
+                size: STATS_FILE_SIZE,
+                blocks: STATS_FILE_BLOCKS,
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -661,7 +664,7 @@ where
                 uid: req.uid,
                 gid: req.gid,
                 rdev: 0,
-                blksize: 4096,
+                blksize: STATS_FILE_BLOCK_SIZE,
                 #[cfg(target_os = "macos")]
                 crtime: now,
                 #[cfg(target_os = "macos")]

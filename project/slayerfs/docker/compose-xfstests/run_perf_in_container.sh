@@ -1120,6 +1120,63 @@ if redis_diag_paths:
         rel = path.relative_to(artifact_dir)
         lines.append(f"| {tool} | {summary} | {rel} |")
 
+slayerfs_stats_paths = sorted(diag_dir.glob("stats-*-after.txt")) if diag_dir.exists() else []
+if slayerfs_stats_paths:
+    lines.extend([
+        "",
+        "## SlayerFS Stats",
+        "",
+        "| Tool | Cache hit | FUSE read | FUSE write | Dirty | Read buffer | S3 ops | Details |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+    ])
+
+    def parse_slayerfs_stats(path):
+        metrics = {}
+        for raw in path.read_text(errors="replace").splitlines():
+            raw = raw.strip()
+            if not raw.startswith("slayerfs_"):
+                continue
+            parts = raw.split()
+            if len(parts) < 2:
+                continue
+            try:
+                metrics[parts[0]] = float(parts[1])
+            except ValueError:
+                continue
+        return metrics
+
+    def fmt_mib(value):
+        return f"{value / 1048576.0:.1f} MiB"
+
+    for path in slayerfs_stats_paths:
+        tool = path.name.removeprefix("stats-").removesuffix("-after.txt")
+        metrics = parse_slayerfs_stats(path)
+        hits = metrics.get("slayerfs_cache_hits_total", 0.0)
+        misses = metrics.get("slayerfs_cache_misses_total", 0.0)
+        requests = metrics.get("slayerfs_cache_requests_total", hits + misses)
+        hit_ratio = metrics.get(
+            "slayerfs_cache_hit_ratio",
+            hits / requests if requests else 0.0,
+        )
+        fuse_read = metrics.get("slayerfs_fuse_read_bytes_total", 0.0)
+        fuse_write = metrics.get("slayerfs_fuse_write_bytes_total", 0.0)
+        dirty = metrics.get(
+            "slayerfs_writeback_dirty_bytes",
+            metrics.get("slayerfs_buffer_dirty_bytes", 0.0),
+        )
+        read_buffer = metrics.get(
+            "slayerfs_reader_buffer_bytes",
+            metrics.get("slayerfs_buffer_read_bytes", 0.0),
+        )
+        s3_get = metrics.get("slayerfs_s3_get_ops_total", 0.0)
+        s3_put = metrics.get("slayerfs_s3_put_ops_total", 0.0)
+        rel = path.relative_to(artifact_dir)
+        lines.append(
+            f"| {tool} | {hit_ratio * 100.0:.1f}% ({int(hits)}/{int(requests)}) | "
+            f"{fmt_mib(fuse_read)} | {fmt_mib(fuse_write)} | {fmt_mib(dirty)} | "
+            f"{fmt_mib(read_buffer)} | GET={int(s3_get)}, PUT={int(s3_put)} | {rel} |"
+        )
+
 fuse_log = artifact_dir / "slayerfs_fuse_ops.log"
 if fuse_log.exists() and fuse_log.stat().st_size > 0:
     try:
