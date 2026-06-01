@@ -9,7 +9,8 @@ use crate::chunk::SliceDesc;
 use crate::meta::INODE_ID_KEY;
 use crate::meta::config::{Config, DatabaseType, default_tikv_namespace};
 use crate::meta::store::{
-    DirEntry, FileAttr, FileType, MetaError, MetaStore, MetaStoreCapabilities, RetryReason,
+    DirEntry, FileAttr, FileType, MetaError, MetaStore, MetaStoreCapabilities, OpenFlags,
+    RetryReason, SetAttrFlags, SetAttrRequest,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -133,6 +134,14 @@ impl TiKvMetaStore {
         self.key_bytes("chunk/")
     }
 
+    fn inode_prefix(&self) -> Vec<u8> {
+        self.key_bytes("inode/")
+    }
+
+    fn link_parent_key(&self, ino: i64) -> Vec<u8> {
+        self.key_bytes(&format!("link_parent/{ino}"))
+    }
+
     pub(crate) fn counter_key(&self, name: &str) -> Vec<u8> {
         self.key_bytes(&format!("counter/{name}"))
     }
@@ -143,12 +152,6 @@ impl TiKvMetaStore {
 
     pub(crate) fn scoped_key(namespace: &str, suffix: &str) -> Vec<u8> {
         format!("{}/{}", namespace, suffix).into_bytes()
-    }
-
-    fn unsupported(&self, operation: &str) -> MetaError {
-        MetaError::NotSupported(format!(
-            "TiKV metadata backend operation `{operation}` is not implemented yet"
-        ))
     }
 
     fn tikv_err(operation: &str, error: tikv_client::Error) -> MetaError {
@@ -289,6 +292,8 @@ impl TiKvMetaStore {
             mtime: now,
             ctime: now,
             nlink: 2,
+            symlink_target: None,
+            deleted: false,
         }
     }
 
@@ -310,6 +315,11 @@ impl TiKvMetaStore {
     fn decode_counter(bytes: &[u8]) -> Result<i64, MetaError> {
         serde_json::from_slice(bytes)
             .map_err(|e| MetaError::Serialization(format!("TiKV counter decode failed: {e}")))
+    }
+
+    fn decode_link_parents(bytes: &[u8]) -> Result<Vec<StoredLinkParent>, MetaError> {
+        serde_json::from_slice(bytes)
+            .map_err(|e| MetaError::Serialization(format!("TiKV link parent decode failed: {e}")))
     }
 
     fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, MetaError> {
@@ -428,6 +438,46 @@ impl TiKvMetaStore {
         .await
     }
 
+    async fn txn_get_link_parents(
+        &self,
+        txn: &mut Transaction,
+        ino: i64,
+        lock: bool,
+        operation: &str,
+    ) -> Result<Vec<StoredLinkParent>, MetaError> {
+        Self::txn_get_raw(txn, self.link_parent_key(ino), lock, operation)
+            .await?
+            .as_deref()
+            .map(Self::decode_link_parents)
+            .transpose()
+            .map(|parents| parents.unwrap_or_default())
+    }
+
+    async fn txn_put_link_parents(
+        &self,
+        txn: &mut Transaction,
+        ino: i64,
+        parents: &[StoredLinkParent],
+        operation: &str,
+    ) -> Result<(), MetaError> {
+        Self::txn_put_raw(
+            txn,
+            self.link_parent_key(ino),
+            Self::encode(&parents)?,
+            operation,
+        )
+        .await
+    }
+
+    async fn txn_delete_link_parents(
+        &self,
+        txn: &mut Transaction,
+        ino: i64,
+        operation: &str,
+    ) -> Result<(), MetaError> {
+        Self::txn_delete_raw(txn, self.link_parent_key(ino), operation).await
+    }
+
     async fn txn_get_dentry(
         &self,
         txn: &mut Transaction,
@@ -515,6 +565,19 @@ impl TiKvMetaStore {
         kind: StoredNodeKind,
         operation: &str,
     ) -> Result<i64, MetaError> {
+        self.txn_create_node_with_target(txn, parent, name, kind, None, operation)
+            .await
+    }
+
+    async fn txn_create_node_with_target(
+        &self,
+        txn: &mut Transaction,
+        parent: i64,
+        name: String,
+        kind: StoredNodeKind,
+        symlink_target: Option<String>,
+        operation: &str,
+    ) -> Result<i64, MetaError> {
         let mut parent_node = self.txn_require_dir(txn, parent, true, operation).await?;
         if self
             .txn_get_dentry(txn, parent, &name, true, operation)
@@ -526,10 +589,14 @@ impl TiKvMetaStore {
 
         let ino = self.txn_next_inode(txn, operation).await?;
         let now = Self::now();
+        let target_len = symlink_target.as_ref().map(|target| target.len() as u64);
         let (size, blocks, mode, nlink) = match kind {
             StoredNodeKind::File => (0, 0, 0o100644, 1),
             StoredNodeKind::Dir => (ROOT_SIZE, ROOT_SIZE.div_ceil(512), 0o40755, 2),
-            StoredNodeKind::Symlink => (0, 0, 0o120777, 1),
+            StoredNodeKind::Symlink => {
+                let size = target_len.unwrap_or(0);
+                (size, size.div_ceil(512), 0o120777, 1)
+            }
         };
         let node = StoredNode {
             ino,
@@ -545,6 +612,8 @@ impl TiKvMetaStore {
             mtime: now,
             ctime: now,
             nlink,
+            symlink_target,
+            deleted: false,
         };
         let dentry = StoredDentry { ino, kind };
 
@@ -559,6 +628,123 @@ impl TiKvMetaStore {
         self.txn_put_dentry(txn, parent, &name, &dentry, operation)
             .await?;
         Ok(ino)
+    }
+    async fn txn_remove_non_dir_dentry(
+        &self,
+        txn: &mut Transaction,
+        parent: i64,
+        name: &str,
+        dentry: StoredDentry,
+        now: i64,
+        operation: &str,
+    ) -> Result<(), MetaError> {
+        if dentry.kind == StoredNodeKind::Dir {
+            return Err(MetaError::NotSupported(
+                "TiKV unlink for directories is not supported; use rmdir".to_string(),
+            ));
+        }
+
+        let mut node = self
+            .txn_get_node(txn, dentry.ino, true, operation)
+            .await?
+            .ok_or(MetaError::NotFound(dentry.ino))?;
+        if node.kind == StoredNodeKind::Dir {
+            return Err(MetaError::NotSupported(
+                "TiKV unlink for directories is not supported; use rmdir".to_string(),
+            ));
+        }
+        if node.deleted || node.nlink == 0 {
+            return Err(MetaError::NotFound(dentry.ino));
+        }
+
+        Self::txn_delete_raw(txn, self.dentry_key(parent, name), operation).await?;
+
+        if node.nlink > 1 {
+            let mut link_parents = self
+                .txn_get_link_parents(txn, node.ino, true, operation)
+                .await?;
+            let before = link_parents.len();
+            link_parents.retain(|link| !(link.parent == parent && link.name == name));
+            if link_parents.len() == before {
+                return Err(MetaError::Internal(format!(
+                    "expected link parent binding {parent}/{name} for inode {}",
+                    node.ino
+                )));
+            }
+
+            node.nlink -= 1;
+            node.deleted = false;
+            if node.nlink == 1 {
+                let remaining = link_parents.first().cloned().ok_or_else(|| {
+                    MetaError::Internal(format!(
+                        "missing remaining link parent for inode {}",
+                        node.ino
+                    ))
+                })?;
+                node.parent = remaining.parent;
+                node.name = remaining.name;
+                self.txn_delete_link_parents(txn, node.ino, operation)
+                    .await?;
+            } else {
+                node.parent = 0;
+                node.name.clear();
+                self.txn_put_link_parents(txn, node.ino, &link_parents, operation)
+                    .await?;
+            }
+        } else {
+            node.nlink = 0;
+            node.deleted = true;
+            node.parent = 0;
+            node.name.clear();
+            self.txn_delete_link_parents(txn, node.ino, operation)
+                .await?;
+        }
+
+        node.mtime = now;
+        node.ctime = now;
+        self.txn_put_node(txn, &node, operation).await
+    }
+
+    async fn txn_move_node_binding(
+        &self,
+        txn: &mut Transaction,
+        node: &mut StoredNode,
+        old_parent: i64,
+        old_name: &str,
+        new_parent: i64,
+        new_name: &str,
+        operation: &str,
+    ) -> Result<(), MetaError> {
+        if node.kind == StoredNodeKind::Dir || node.nlink <= 1 {
+            node.parent = new_parent;
+            node.name = new_name.to_string();
+            return Ok(());
+        }
+
+        let mut link_parents = self
+            .txn_get_link_parents(txn, node.ino, true, operation)
+            .await?;
+        let mut updated = false;
+        for link in &mut link_parents {
+            if link.parent == old_parent && link.name == old_name {
+                link.parent = new_parent;
+                link.name = new_name.to_string();
+                updated = true;
+                break;
+            }
+        }
+
+        if !updated {
+            return Err(MetaError::Internal(format!(
+                "expected link parent binding {old_parent}/{old_name} for inode {}",
+                node.ino
+            )));
+        }
+
+        node.parent = 0;
+        node.name.clear();
+        self.txn_put_link_parents(txn, node.ino, &link_parents, operation)
+            .await
     }
 }
 
@@ -585,6 +771,12 @@ struct StoredDentry {
     kind: StoredNodeKind,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredLinkParent {
+    parent: i64,
+    name: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredNode {
     ino: i64,
@@ -600,14 +792,28 @@ struct StoredNode {
     mtime: i64,
     ctime: i64,
     nlink: u32,
+    #[serde(default)]
+    symlink_target: Option<String>,
+    #[serde(default)]
+    deleted: bool,
 }
 
 impl StoredNode {
     fn to_attr(&self) -> FileAttr {
+        let size = self
+            .symlink_target
+            .as_ref()
+            .map(|target| target.len() as u64)
+            .unwrap_or(self.size);
+        let blocks = if self.symlink_target.is_some() {
+            size.div_ceil(512)
+        } else {
+            self.blocks
+        };
         FileAttr {
             ino: self.ino,
-            size: self.size,
-            blocks: self.blocks,
+            size,
+            blocks,
             kind: self.kind.into(),
             mode: self.mode,
             uid: self.uid,
@@ -630,6 +836,9 @@ impl MetaStore for TiKvMetaStore {
         MetaStoreCapabilities {
             namespace: true,
             file_data: true,
+            hardlinks: true,
+            symlinks: true,
+            rename_exchange: true,
             stat_fs: false,
             ..MetaStoreCapabilities::default()
         }
@@ -802,6 +1011,152 @@ impl MetaStore for TiKvMetaStore {
         .await
     }
 
+    async fn link(&self, ino: i64, parent: i64, name: &str) -> Result<FileAttr, MetaError> {
+        if ino == ROOT_INODE {
+            return Err(MetaError::NotSupported(
+                "cannot create hard links to the root inode".to_string(),
+            ));
+        }
+
+        let operation = "link";
+        let name = name.to_string();
+        self.write_txn(operation, |store, txn| {
+            let name = name.clone();
+            Box::pin(async move {
+                let mut parent_node = store.txn_require_dir(txn, parent, true, operation).await?;
+                if store
+                    .txn_get_dentry(txn, parent, &name, true, operation)
+                    .await?
+                    .is_some()
+                {
+                    return Err(MetaError::AlreadyExists {
+                        parent,
+                        name: name.to_string(),
+                    });
+                }
+
+                let mut node = store
+                    .txn_get_node(txn, ino, true, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(ino))?;
+                if node.kind == StoredNodeKind::Dir {
+                    return Err(MetaError::NotSupported(
+                        "cannot create hard links to directories".to_string(),
+                    ));
+                }
+                if node.kind == StoredNodeKind::Symlink {
+                    return Err(MetaError::NotSupported(
+                        "cannot create hard links to symbolic links".to_string(),
+                    ));
+                }
+                if node.deleted || node.nlink == 0 {
+                    return Err(MetaError::NotFound(ino));
+                }
+
+                let mut link_parents = if node.nlink == 1 {
+                    vec![StoredLinkParent {
+                        parent: node.parent,
+                        name: node.name.clone(),
+                    }]
+                } else {
+                    store
+                        .txn_get_link_parents(txn, ino, true, operation)
+                        .await?
+                };
+                link_parents.push(StoredLinkParent {
+                    parent,
+                    name: name.to_string(),
+                });
+
+                let now = Self::now();
+                node.nlink = node.nlink.saturating_add(1);
+                node.parent = 0;
+                node.name.clear();
+                node.deleted = false;
+                node.mtime = now;
+                node.ctime = now;
+                parent_node.mtime = now;
+                parent_node.ctime = now;
+
+                store
+                    .txn_put_link_parents(txn, ino, &link_parents, operation)
+                    .await?;
+                store.txn_put_node(txn, &node, operation).await?;
+                store.txn_put_node(txn, &parent_node, operation).await?;
+                store
+                    .txn_put_dentry(
+                        txn,
+                        parent,
+                        &name,
+                        &StoredDentry {
+                            ino,
+                            kind: StoredNodeKind::File,
+                        },
+                        operation,
+                    )
+                    .await?;
+
+                Ok(node.to_attr())
+            })
+        })
+        .await
+    }
+
+    async fn symlink(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+    ) -> Result<(i64, FileAttr), MetaError> {
+        let operation = "symlink";
+        let name = name.to_string();
+        let target = target.to_string();
+        self.write_txn(operation, |store, txn| {
+            let name = name.clone();
+            let target = target.clone();
+            Box::pin(async move {
+                let ino = store
+                    .txn_create_node_with_target(
+                        txn,
+                        parent,
+                        name,
+                        StoredNodeKind::Symlink,
+                        Some(target),
+                        operation,
+                    )
+                    .await?;
+                let attr = store
+                    .txn_get_node(txn, ino, false, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(ino))?
+                    .to_attr();
+                Ok((ino, attr))
+            })
+        })
+        .await
+    }
+
+    async fn read_symlink(&self, ino: i64) -> Result<String, MetaError> {
+        let operation = "read_symlink";
+        self.read_txn(operation, |store, txn| {
+            Box::pin(async move {
+                let node = store
+                    .txn_get_node(txn, ino, false, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(ino))?;
+                if node.kind != StoredNodeKind::Symlink {
+                    return Err(MetaError::NotSupported(format!(
+                        "inode {ino} is not a symbolic link"
+                    )));
+                }
+                node.symlink_target.ok_or_else(|| {
+                    MetaError::Internal(format!("symlink target missing for inode {ino}"))
+                })
+            })
+        })
+        .await
+    }
+
     async fn unlink(&self, parent: i64, name: &str) -> Result<(), MetaError> {
         let operation = "unlink";
         let name = name.to_string();
@@ -813,18 +1168,14 @@ impl MetaStore for TiKvMetaStore {
                     .txn_get_dentry(txn, parent, &name, true, operation)
                     .await?
                     .ok_or(MetaError::NotFound(parent))?;
-                if dentry.kind == StoredNodeKind::Dir {
-                    return Err(MetaError::NotSupported(
-                        "TiKV unlink for directories is not supported; use rmdir".to_string(),
-                    ));
-                }
 
                 let now = Self::now();
+                store
+                    .txn_remove_non_dir_dentry(txn, parent, &name, dentry, now, operation)
+                    .await?;
                 parent_node.mtime = now;
                 parent_node.ctime = now;
-                store.txn_put_node(txn, &parent_node, operation).await?;
-                Self::txn_delete_raw(txn, store.dentry_key(parent, &name), operation).await?;
-                Self::txn_delete_raw(txn, store.inode_key(dentry.ino), operation).await
+                store.txn_put_node(txn, &parent_node, operation).await
             })
         })
         .await
@@ -857,51 +1208,126 @@ impl MetaStore for TiKvMetaStore {
                         .txn_require_dir(txn, new_parent, true, operation)
                         .await?
                 };
-                let dentry = store
+                let source_dentry = store
                     .txn_get_dentry(txn, old_parent, &old_name, true, operation)
                     .await?
                     .ok_or(MetaError::NotFound(old_parent))?;
-                if store
-                    .txn_get_dentry(txn, new_parent, &new_name, true, operation)
+
+                let mut source_node = store
+                    .txn_get_node(txn, source_dentry.ino, true, operation)
                     .await?
-                    .is_some()
-                {
-                    return Err(MetaError::AlreadyExists {
-                        parent: new_parent,
-                        name: new_name,
-                    });
+                    .ok_or(MetaError::NotFound(source_dentry.ino))?;
+                if source_node.deleted || source_node.nlink == 0 {
+                    return Err(MetaError::NotFound(source_dentry.ino));
                 }
 
-                let mut node = store
-                    .txn_get_node(txn, dentry.ino, true, operation)
-                    .await?
-                    .ok_or(MetaError::NotFound(dentry.ino))?;
+                let destination = store
+                    .txn_get_dentry(txn, new_parent, &new_name, true, operation)
+                    .await?;
                 let now = Self::now();
-                node.parent = new_parent;
-                node.name = new_name.clone();
-                node.ctime = now;
-                node.mtime = now;
+                let mut old_parent_nlink_delta = 0;
+                let mut new_parent_nlink_delta = 0;
+
+                if let Some(dest_dentry) = destination {
+                    if dest_dentry.ino == source_dentry.ino {
+                        return Ok(());
+                    }
+
+                    let dest_node = store
+                        .txn_get_node(txn, dest_dentry.ino, true, operation)
+                        .await?
+                        .ok_or(MetaError::NotFound(dest_dentry.ino))?;
+
+                    match (source_node.kind, dest_node.kind) {
+                        (StoredNodeKind::Dir, StoredNodeKind::Dir) => {
+                            let child_prefix = store.dentry_prefix(dest_dentry.ino);
+                            if !Self::txn_scan_prefix(txn, child_prefix, Some(1), operation)
+                                .await?
+                                .is_empty()
+                            {
+                                return Err(MetaError::DirectoryNotEmpty(dest_dentry.ino));
+                            }
+                            Self::txn_delete_raw(
+                                txn,
+                                store.dentry_key(new_parent, &new_name),
+                                operation,
+                            )
+                            .await?;
+                            Self::txn_delete_raw(txn, store.inode_key(dest_dentry.ino), operation)
+                                .await?;
+                            store
+                                .txn_delete_link_parents(txn, dest_dentry.ino, operation)
+                                .await?;
+                            new_parent_nlink_delta -= 1;
+                        }
+                        (StoredNodeKind::Dir, _) => {
+                            return Err(MetaError::Io(std::io::Error::from(
+                                std::io::ErrorKind::NotADirectory,
+                            )));
+                        }
+                        (_, StoredNodeKind::Dir) => {
+                            return Err(MetaError::Io(std::io::Error::from(
+                                std::io::ErrorKind::IsADirectory,
+                            )));
+                        }
+                        _ => {
+                            store
+                                .txn_remove_non_dir_dentry(
+                                    txn,
+                                    new_parent,
+                                    &new_name,
+                                    dest_dentry,
+                                    now,
+                                    operation,
+                                )
+                                .await?;
+                        }
+                    }
+                }
+
+                store
+                    .txn_move_node_binding(
+                        txn,
+                        &mut source_node,
+                        old_parent,
+                        &old_name,
+                        new_parent,
+                        &new_name,
+                        operation,
+                    )
+                    .await?;
+                source_node.ctime = now;
+                source_node.mtime = now;
 
                 old_parent_node.mtime = now;
                 old_parent_node.ctime = now;
                 new_parent_node.mtime = now;
                 new_parent_node.ctime = now;
-                if dentry.kind == StoredNodeKind::Dir && old_parent != new_parent {
-                    old_parent_node.nlink = old_parent_node.nlink.saturating_sub(1);
-                    new_parent_node.nlink = new_parent_node.nlink.saturating_add(1);
+                if source_node.kind == StoredNodeKind::Dir && old_parent != new_parent {
+                    old_parent_nlink_delta -= 1;
+                    new_parent_nlink_delta += 1;
                 }
 
                 Self::txn_delete_raw(txn, store.dentry_key(old_parent, &old_name), operation)
                     .await?;
-                store.txn_put_node(txn, &node, operation).await?;
+                store.txn_put_node(txn, &source_node, operation).await?;
                 if old_parent == new_parent {
+                    old_parent_node.nlink = apply_nlink_delta(
+                        old_parent_node.nlink,
+                        old_parent_nlink_delta + new_parent_nlink_delta,
+                    );
                     store.txn_put_node(txn, &old_parent_node, operation).await?;
                 } else {
+                    old_parent_node.nlink =
+                        apply_nlink_delta(old_parent_node.nlink, old_parent_nlink_delta);
+                    new_parent_node.nlink =
+                        apply_nlink_delta(new_parent_node.nlink, new_parent_nlink_delta);
                     store.txn_put_node(txn, &old_parent_node, operation).await?;
                     store.txn_put_node(txn, &new_parent_node, operation).await?;
                 }
+
                 store
-                    .txn_put_dentry(txn, new_parent, &new_name, &dentry, operation)
+                    .txn_put_dentry(txn, new_parent, &new_name, &source_dentry, operation)
                     .await
             })
         })
@@ -915,8 +1341,140 @@ impl MetaStore for TiKvMetaStore {
         new_parent: i64,
         new_name: &str,
     ) -> Result<(), MetaError> {
-        let _ = (old_parent, old_name, new_parent, new_name);
-        Err(self.unsupported("rename_exchange"))
+        if old_parent == new_parent && old_name == new_name {
+            return Ok(());
+        }
+
+        let operation = "rename_exchange";
+        let old_name = old_name.to_string();
+        let new_name = new_name.to_string();
+        self.write_txn(operation, |store, txn| {
+            let old_name = old_name.clone();
+            let new_name = new_name.clone();
+            Box::pin(async move {
+                let mut old_parent_node = store
+                    .txn_require_dir(txn, old_parent, true, operation)
+                    .await?;
+                let mut new_parent_node = if old_parent == new_parent {
+                    old_parent_node.clone()
+                } else {
+                    store
+                        .txn_require_dir(txn, new_parent, true, operation)
+                        .await?
+                };
+
+                let old_dentry = store
+                    .txn_get_dentry(txn, old_parent, &old_name, true, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(old_parent))?;
+                let new_dentry = store
+                    .txn_get_dentry(txn, new_parent, &new_name, true, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(new_parent))?;
+
+                if old_dentry.ino == new_dentry.ino {
+                    return Ok(());
+                }
+
+                let mut old_node = store
+                    .txn_get_node(txn, old_dentry.ino, true, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(old_dentry.ino))?;
+                let mut new_node = store
+                    .txn_get_node(txn, new_dentry.ino, true, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(new_dentry.ino))?;
+
+                if old_node.deleted || old_node.nlink == 0 {
+                    return Err(MetaError::NotFound(old_dentry.ino));
+                }
+                if new_node.deleted || new_node.nlink == 0 {
+                    return Err(MetaError::NotFound(new_dentry.ino));
+                }
+
+                let now = Self::now();
+                let mut old_parent_nlink_delta = 0;
+                let mut new_parent_nlink_delta = 0;
+
+                if old_parent != new_parent {
+                    if old_node.kind == StoredNodeKind::Dir {
+                        old_parent_nlink_delta -= 1;
+                        new_parent_nlink_delta += 1;
+                    }
+                    if new_node.kind == StoredNodeKind::Dir {
+                        new_parent_nlink_delta -= 1;
+                        old_parent_nlink_delta += 1;
+                    }
+                }
+
+                store
+                    .txn_move_node_binding(
+                        txn,
+                        &mut old_node,
+                        old_parent,
+                        &old_name,
+                        new_parent,
+                        &new_name,
+                        operation,
+                    )
+                    .await?;
+                store
+                    .txn_move_node_binding(
+                        txn,
+                        &mut new_node,
+                        new_parent,
+                        &new_name,
+                        old_parent,
+                        &old_name,
+                        operation,
+                    )
+                    .await?;
+
+                old_node.mtime = now;
+                old_node.ctime = now;
+                new_node.mtime = now;
+                new_node.ctime = now;
+
+                Self::txn_put_raw(
+                    txn,
+                    store.dentry_key(old_parent, &old_name),
+                    Self::encode(&new_dentry)?,
+                    operation,
+                )
+                .await?;
+                Self::txn_put_raw(
+                    txn,
+                    store.dentry_key(new_parent, &new_name),
+                    Self::encode(&old_dentry)?,
+                    operation,
+                )
+                .await?;
+                store.txn_put_node(txn, &old_node, operation).await?;
+                store.txn_put_node(txn, &new_node, operation).await?;
+
+                old_parent_node.mtime = now;
+                old_parent_node.ctime = now;
+                new_parent_node.mtime = now;
+                new_parent_node.ctime = now;
+                if old_parent == new_parent {
+                    old_parent_node.nlink = apply_nlink_delta(
+                        old_parent_node.nlink,
+                        old_parent_nlink_delta + new_parent_nlink_delta,
+                    );
+                    store.txn_put_node(txn, &old_parent_node, operation).await?;
+                } else {
+                    old_parent_node.nlink =
+                        apply_nlink_delta(old_parent_node.nlink, old_parent_nlink_delta);
+                    new_parent_node.nlink =
+                        apply_nlink_delta(new_parent_node.nlink, new_parent_nlink_delta);
+                    store.txn_put_node(txn, &old_parent_node, operation).await?;
+                    store.txn_put_node(txn, &new_parent_node, operation).await?;
+                }
+
+                Ok(())
+            })
+        })
+        .await
     }
 
     async fn set_file_size(&self, ino: i64, size: u64) -> Result<(), MetaError> {
@@ -971,6 +1529,136 @@ impl MetaStore for TiKvMetaStore {
         .await
     }
 
+    async fn set_attr(
+        &self,
+        ino: i64,
+        req: &SetAttrRequest,
+        flags: SetAttrFlags,
+    ) -> Result<FileAttr, MetaError> {
+        let operation = "set_attr";
+        let req = *req;
+        let clear_suid = flags.contains(SetAttrFlags::CLEAR_SUID);
+        let clear_sgid = flags.contains(SetAttrFlags::CLEAR_SGID);
+        let set_atime_now = flags.contains(SetAttrFlags::SET_ATIME_NOW);
+        let set_mtime_now = flags.contains(SetAttrFlags::SET_MTIME_NOW);
+        self.write_txn(operation, |store, txn| {
+            Box::pin(async move {
+                let mut node = store
+                    .txn_get_node(txn, ino, true, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(ino))?;
+                let now = Self::now();
+                let mut ctime_update = false;
+
+                if let Some(mode) = req.mode {
+                    let kind_bits = node.mode & 0o170000;
+                    node.mode = kind_bits | (mode & 0o777);
+                    ctime_update = true;
+                }
+                if let Some(uid) = req.uid {
+                    node.uid = uid;
+                    ctime_update = true;
+                }
+                if let Some(gid) = req.gid {
+                    node.gid = gid;
+                    ctime_update = true;
+                }
+                if clear_suid {
+                    node.mode &= !0o4000;
+                    ctime_update = true;
+                }
+                if clear_sgid {
+                    node.mode &= !0o2000;
+                    ctime_update = true;
+                }
+
+                if let Some(size) = req.size {
+                    if node.kind != StoredNodeKind::File {
+                        return Err(MetaError::NotSupported(
+                            "truncate flag only supported for regular files".to_string(),
+                        ));
+                    }
+                    if node.size != size {
+                        node.size = size;
+                        node.blocks = size.div_ceil(512);
+                        node.mtime = now;
+                    }
+                    ctime_update = true;
+                }
+
+                if set_atime_now {
+                    node.atime = now;
+                    ctime_update = true;
+                } else if let Some(atime) = req.atime {
+                    node.atime = atime;
+                    ctime_update = true;
+                }
+
+                if set_mtime_now {
+                    node.mtime = now;
+                    ctime_update = true;
+                } else if let Some(mtime) = req.mtime {
+                    node.mtime = mtime;
+                    ctime_update = true;
+                }
+
+                if let Some(ctime) = req.ctime {
+                    node.ctime = ctime;
+                } else if ctime_update {
+                    node.ctime = now;
+                }
+
+                store.txn_put_node(txn, &node, operation).await?;
+                Ok(node.to_attr())
+            })
+        })
+        .await
+    }
+
+    async fn open(&self, ino: i64, flags: OpenFlags) -> Result<FileAttr, MetaError> {
+        let operation = "open";
+        let truncate = flags.contains(OpenFlags::TRUNC);
+        self.write_txn(operation, |store, txn| {
+            Box::pin(async move {
+                let mut node = store
+                    .txn_get_node(txn, ino, true, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(ino))?;
+                if node.kind == StoredNodeKind::Symlink {
+                    return Err(MetaError::NotSupported(
+                        "opening symlink targets is not implemented".to_string(),
+                    ));
+                }
+                if truncate && node.kind != StoredNodeKind::File {
+                    return Err(MetaError::NotSupported(
+                        "truncate flag only supported for regular files".to_string(),
+                    ));
+                }
+
+                let now = Self::now();
+                node.atime = now;
+                if truncate {
+                    node.size = 0;
+                    node.blocks = 0;
+                    node.mtime = now;
+                    node.ctime = now;
+                }
+
+                store.txn_put_node(txn, &node, operation).await?;
+                Ok(node.to_attr())
+            })
+        })
+        .await
+    }
+
+    async fn close(&self, ino: i64) -> Result<(), MetaError> {
+        if self.stat(ino).await?.is_some() {
+            Ok(())
+        } else {
+            Err(MetaError::NotFound(ino))
+        }
+    }
+
     async fn get_names(&self, ino: i64) -> Result<Vec<(Option<i64>, String)>, MetaError> {
         if ino == ROOT_INODE {
             return Ok(vec![(None, "/".to_string())]);
@@ -979,13 +1667,25 @@ impl MetaStore for TiKvMetaStore {
         let operation = "get_names";
         self.read_txn(operation, |store, txn| {
             Box::pin(async move {
-                store
-                    .txn_get_node(txn, ino, false, operation)
-                    .await
-                    .map(|node| {
-                        node.map(|node| vec![(Some(node.parent), node.name)])
-                            .unwrap_or_default()
-                    })
+                let Some(node) = store.txn_get_node(txn, ino, false, operation).await? else {
+                    return Ok(Vec::new());
+                };
+                if node.deleted || node.nlink == 0 {
+                    return Ok(Vec::new());
+                }
+                if node.kind == StoredNodeKind::Dir || node.nlink <= 1 {
+                    return Ok(vec![(Some(node.parent), node.name)]);
+                }
+
+                let mut out: Vec<_> = store
+                    .txn_get_link_parents(txn, ino, false, operation)
+                    .await?
+                    .into_iter()
+                    .map(|link| (Some(link.parent), link.name))
+                    .collect();
+                out.sort();
+                out.dedup();
+                Ok(out)
             })
         })
         .await
@@ -1002,21 +1702,48 @@ impl MetaStore for TiKvMetaStore {
                 let Some(node) = store.txn_get_node(txn, ino, false, operation).await? else {
                     return Ok(Vec::new());
                 };
-
-                let mut parts = vec![node.name];
-                let mut current_parent = node.parent;
-                while current_parent != ROOT_INODE {
-                    let Some(parent) = store
-                        .txn_get_node(txn, current_parent, false, operation)
-                        .await?
-                    else {
-                        return Ok(Vec::new());
-                    };
-                    parts.push(parent.name);
-                    current_parent = parent.parent;
+                if node.deleted || node.nlink == 0 {
+                    return Ok(Vec::new());
                 }
-                parts.reverse();
-                Ok(vec![format!("/{}", parts.join("/"))])
+
+                let bindings = if node.kind == StoredNodeKind::Dir || node.nlink <= 1 {
+                    vec![StoredLinkParent {
+                        parent: node.parent,
+                        name: node.name,
+                    }]
+                } else {
+                    store
+                        .txn_get_link_parents(txn, ino, false, operation)
+                        .await?
+                };
+
+                let mut out = Vec::with_capacity(bindings.len());
+                for binding in bindings {
+                    let mut parts = vec![binding.name];
+                    let mut current_parent = binding.parent;
+                    while current_parent != ROOT_INODE {
+                        let Some(parent) = store
+                            .txn_get_node(txn, current_parent, false, operation)
+                            .await?
+                        else {
+                            parts.clear();
+                            break;
+                        };
+                        if parent.deleted || parent.nlink == 0 {
+                            parts.clear();
+                            break;
+                        }
+                        parts.push(parent.name);
+                        current_parent = parent.parent;
+                    }
+                    if !parts.is_empty() {
+                        parts.reverse();
+                        out.push(format!("/{}", parts.join("/")));
+                    }
+                }
+                out.sort();
+                out.dedup();
+                Ok(out)
             })
         })
         .await
@@ -1080,15 +1807,31 @@ impl MetaStore for TiKvMetaStore {
     }
 
     async fn get_deleted_files(&self) -> Result<Vec<i64>, MetaError> {
-        Ok(Vec::new())
+        let operation = "get_deleted_files";
+        self.read_txn(operation, |store, txn| {
+            Box::pin(async move {
+                let pairs =
+                    Self::txn_scan_prefix(txn, store.inode_prefix(), None, operation).await?;
+                let mut out = Vec::new();
+                for pair in pairs {
+                    let node = Self::decode_node(pair.value())?;
+                    if node.deleted && node.kind != StoredNodeKind::Dir {
+                        out.push(node.ino);
+                    }
+                }
+                Ok(out)
+            })
+        })
+        .await
     }
 
     async fn remove_file_metadata(&self, ino: i64) -> Result<(), MetaError> {
         let operation = "remove_file_metadata";
         self.write_txn(operation, |store, txn| {
-            Box::pin(
-                async move { Self::txn_delete_raw(txn, store.inode_key(ino), operation).await },
-            )
+            Box::pin(async move {
+                Self::txn_delete_raw(txn, store.inode_key(ino), operation).await?;
+                store.txn_delete_link_parents(txn, ino, operation).await
+            })
         })
         .await
     }
@@ -1231,6 +1974,14 @@ fn prefix_range_end(prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+fn apply_nlink_delta(nlink: u32, delta: i32) -> u32 {
+    if delta >= 0 {
+        nlink.saturating_add(delta as u32)
+    } else {
+        nlink.saturating_sub(delta.unsigned_abs())
+    }
 }
 
 #[cfg(test)]
