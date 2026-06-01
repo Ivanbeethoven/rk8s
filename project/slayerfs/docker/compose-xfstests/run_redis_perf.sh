@@ -28,6 +28,7 @@ usage() {
   --s3                       使用 rustfs 作为对象存储（默认）
   --minio                    使用 MinIO 作为对象存储
   --local-fs                 改为使用本地目录作为对象存储
+  --s3-writeback             启用 S3 commit-before-upload 写回语义（等价于 SLAYERFS_WRITEBACK_MODE=commit_before_upload）
   --tools "<tool...>"        指定压力工具列表，默认: "fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
   --slayerfs-bench           额外运行一次宿主机 cargo bench --bench slayerfs_bench
   --bench-args "<args...>"   透传给 cargo bench 之后的 Criterion 参数
@@ -41,6 +42,7 @@ usage() {
   PERF_DIRSTRESS_ARGS PERF_DIRPERF_ARGS PERF_METAPERF_ARGS PERF_LOOPTEST_ARGS
   PERF_FIO_ARGS PERF_FIO_RUNTIME PERF_FIO_SIZE PERF_FIO_BS PERF_FIO_NUMJOBS
   PERF_FIO_SEQREAD_ARGS PERF_FIO_SEQWRITE_ARGS PERF_FIO_RANDREAD_ARGS PERF_FIO_RANDWRITE_ARGS PERF_FIO_RANDRW_ARGS
+  SLAYERFS_WRITEBACK_MODE=commit_before_upload 可启用 S3 写回语义
   PERF_LOG_TO_CONSOLE=true 可恢复压测工具日志输出到终端（默认关闭）
 EOF
     exit 0
@@ -60,6 +62,7 @@ STORAGE_BACKEND="rustfs"  # rustfs | minio | local-fs
 RUN_SLAYERFS_BENCH=false
 PERF_TOOLS_VALUE="fio-bigwrite fio-bigread fio-seqread fio-seqwrite fio-randread fio-randwrite fio-randrw dirstress dirperf metaperf looptest"
 BENCH_ARGS_VALUE=""
+SLAYERFS_WRITEBACK_MODE_VALUE="${SLAYERFS_WRITEBACK_MODE:-}"
 
 while [[ $# -gt 0 ]]; do
     case "${1:-}" in
@@ -73,6 +76,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --local-fs)
             STORAGE_BACKEND="local-fs"
+            shift
+            ;;
+        --s3-writeback)
+            SLAYERFS_WRITEBACK_MODE_VALUE="commit_before_upload"
             shift
             ;;
         --tools)
@@ -102,6 +109,12 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ -n "$SLAYERFS_WRITEBACK_MODE_VALUE" && "$STORAGE_BACKEND" == "local-fs" ]]; then
+    err "S3 writeback mode requires --s3 or --minio, not --local-fs"
+    exit 1
+fi
+export SLAYERFS_WRITEBACK_MODE="$SLAYERFS_WRITEBACK_MODE_VALUE"
 
 mkdir -p "$ARTIFACTS_DIR"
 
@@ -277,6 +290,7 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps \
     -e SLAYERFS_S3_PART_SIZE \
     -e SLAYERFS_S3_MAX_CONCURRENCY \
     -e SLAYERFS_COMPRESSION \
+    -e SLAYERFS_WRITEBACK_MODE \
     -e SLAYERFS_VFS_TIMING \
     -e PERF_LOG_TO_CONSOLE \
     perf

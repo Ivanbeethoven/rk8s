@@ -18,6 +18,7 @@ use crate::meta::{MetaLayer, SLICE_ID_KEY};
 use crate::utils::{NumCastExt, UsageGuard};
 use crate::vfs::Inode;
 use crate::vfs::backend::Backend;
+use crate::vfs::cache::config::WriteBackMode;
 use crate::vfs::cache::page::CacheSlice;
 use crate::vfs::cache::page::WriteAction as PageWriteAction;
 use crate::vfs::cache::write_back::WriteBackCache;
@@ -301,7 +302,10 @@ impl SliceState {
 
         let remaining = self.data.len().saturating_sub(pending_end);
 
-        if matches!(self.state, SliceStatus::Readonly | SliceStatus::Failed) {
+        if matches!(
+            self.state,
+            SliceStatus::Readonly | SliceStatus::Failed | SliceStatus::Committed
+        ) {
             remaining > 0
         } else {
             remaining >= size as u64
@@ -313,7 +317,10 @@ impl SliceState {
         // Start from dispatched_end (not uploaded) — pipeline allows dispatching
         // new blocks while earlier ones are still in-flight.
         let start = self.dispatched_end;
-        let end = if matches!(self.state, SliceStatus::Readonly | SliceStatus::Failed) {
+        let end = if matches!(
+            self.state,
+            SliceStatus::Readonly | SliceStatus::Failed | SliceStatus::Committed
+        ) {
             if self.data.len() == 0 {
                 0
             } else {
@@ -324,6 +331,10 @@ impl SliceState {
         };
 
         (start, end)
+    }
+
+    fn upload_complete(&self) -> bool {
+        self.in_flight == 0 && !self.has_idle_block()
     }
 }
 
@@ -526,7 +537,7 @@ where
 
     fn prepare_upload(&self) -> anyhow::Result<Option<UploadPlan>> {
         self.with_mut(|s| {
-            if matches!(s.state, SliceStatus::Failed | SliceStatus::Committed) {
+            if matches!(s.state, SliceStatus::Failed) {
                 return Ok(None);
             }
             if !s.has_idle_block() {
@@ -1765,8 +1776,7 @@ where
                 // Check if we're done (no in-flight, no more blocks).
                 let is_done = {
                     let s = slice.lock();
-                    s.in_flight == 0
-                        && !s.has_idle_block()
+                    s.upload_complete()
                         && matches!(
                             s.state,
                             SliceStatus::Uploaded | SliceStatus::Committed | SliceStatus::Failed
@@ -1863,7 +1873,48 @@ where
         let empty = guard
             .chunks
             .get(&chunk_id)
-            .map(|c| c.slices.is_empty())
+            .map(|c| c.slices.is_empty() && c.recently_committed.is_empty())
+            .unwrap_or(true);
+        if empty {
+            guard.chunks.remove(&chunk_id);
+            if !guard.has_chunks() && guard.flush_waiting > 0 {
+                shared.flush_notify.notify_waiters();
+            }
+        }
+        empty
+    }
+
+    async fn move_front_slice_to_recently_committed(
+        shared: &Arc<Shared<B, M>>,
+        chunk_id: u64,
+        expected: &Arc<ParkingMutex<SliceState>>,
+    ) -> bool {
+        let mut guard = shared
+            .inner
+            .lock()
+            .instrument(tracing::trace_span!(
+                "commit_chunk.move_front_to_recently_committed"
+            ))
+            .await;
+
+        if let Some(chunk) = guard.chunks.get_mut(&chunk_id) {
+            let is_front = chunk
+                .slices
+                .front()
+                .is_some_and(|front| Arc::ptr_eq(front, expected));
+            if is_front && let Some(slice) = chunk.slices.pop_front() {
+                chunk.recently_committed.push_back(slice);
+            }
+        }
+
+        if guard.flush_waiting > 0 {
+            shared.flush_notify.notify_waiters();
+        }
+
+        let empty = guard
+            .chunks
+            .get(&chunk_id)
+            .map(|c| c.slices.is_empty() && c.recently_committed.is_empty())
             .unwrap_or(true);
         if empty {
             guard.chunks.remove(&chunk_id);
@@ -1968,46 +2019,69 @@ where
                 // waiting on a Readonly slice with no uploader.  Re-kick it here
                 // so FUSE flush/truncate cannot wait forever on commit progress.
                 if runtime.frozen {
-                    use crate::vfs::cache::config::WriteBackMode;
-
                     let early_committed = if matches!(
                         shared.config.writeback_mode,
                         WriteBackMode::CommitBeforeUpload
                     ) {
                         // CommitBeforeUpload: commit metadata immediately while
                         // upload proceeds in background.
-                        let desc = SliceHandle {
-                            slice: &slice,
-                            shared: &shared,
-                        }
-                        .desc_for_commit();
+                        let desc = handle.desc_for_commit();
 
                         if let Some(desc) = desc {
+                            let claimed = {
+                                let mut s = slice.lock();
+                                if s.meta_write_started {
+                                    false
+                                } else {
+                                    s.meta_write_started = true;
+                                    true
+                                }
+                            };
+
+                            if !claimed {
+                                continue;
+                            }
+
                             let (ino, chunk_index) = extract_ino_and_chunk_index(desc.chunk_id);
                             let file_offset =
                                 chunk_index * shared.config.layout.chunk_size + desc.offset;
                             let new_size = file_offset + desc.length;
 
-                            let ok = shared
+                            let result = shared
                                 .backend
                                 .meta()
                                 .write(ino, desc.chunk_id, desc, new_size)
-                                .await
-                                .is_ok();
+                                .await;
 
-                            if ok {
-                                shared.inode.set_committed_size(new_size);
-                                let _ = shared
-                                    .reader
-                                    .invalidate(ino as u64, file_offset, desc.length.as_usize())
-                                    .await;
-                                SliceHandle {
-                                    slice: &slice,
-                                    shared: &shared,
+                            match result {
+                                Ok(()) => {
+                                    commit_failures = 0;
+                                    shared.inode.set_committed_size(new_size);
+                                    shared.inode.add_estimated_allocated_bytes(
+                                        desc.length.as_usize() as u64,
+                                    );
+                                    let _ = shared
+                                        .reader
+                                        .invalidate(ino as u64, file_offset, desc.length.as_usize())
+                                        .await;
+                                    handle.mark_committed();
+                                    true
                                 }
-                                .mark_committed();
+                                Err(err) => {
+                                    slice.lock().meta_write_started = false;
+                                    warn!(
+                                        ino,
+                                        chunk_id = desc.chunk_id,
+                                        slice_id = desc.slice_id,
+                                        offset = desc.offset,
+                                        len = desc.length,
+                                        new_size,
+                                        error = ?err,
+                                        "commit-before-upload metadata write failed; falling back to upload-before-commit wait"
+                                    );
+                                    false
+                                }
                             }
-                            ok
                         } else {
                             false
                         }
@@ -2016,7 +2090,11 @@ where
                     };
 
                     if early_committed {
-                        Self::pop_front_slice(&shared, chunk_id).await;
+                        if handle.can_continue_upload() {
+                            Self::spawn_flush_slice(shared.clone(), slice.clone());
+                        }
+                        Self::move_front_slice_to_recently_committed(&shared, chunk_id, &slice)
+                            .await;
                         continue;
                     }
 
@@ -2433,11 +2511,22 @@ where
             if tick.is_multiple_of(100) {
                 let mut guard = shared.inner.lock().await;
                 let mut emptied = Vec::new();
+                let keep_writeback_overlay = matches!(
+                    shared.config.writeback_mode,
+                    WriteBackMode::CommitBeforeUpload
+                );
                 for (cid, chunk) in guard.chunks.iter_mut() {
                     // Keep recently-committed slices for ~2 s.
-                    chunk
-                        .recently_committed
-                        .retain(|s| s.lock().started.elapsed() < Duration::from_secs(2));
+                    chunk.recently_committed.retain(|s| {
+                        let state = s.lock();
+                        state.started.elapsed() < Duration::from_secs(2)
+                            || (keep_writeback_overlay
+                                && matches!(
+                                    state.state,
+                                    SliceStatus::Committed | SliceStatus::Failed
+                                )
+                                && !state.upload_complete())
+                    });
                     if chunk.slices.is_empty() && chunk.recently_committed.is_empty() {
                         emptied.push(*cid);
                     }
@@ -2708,13 +2797,21 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::time::{sleep, timeout};
 
-    fn test_config(layout: ChunkLayout) -> Arc<WriteConfig> {
+    fn test_config_with_writeback(
+        layout: ChunkLayout,
+        writeback_mode: WriteBackMode,
+    ) -> Arc<WriteConfig> {
         Arc::new(
             WriteConfig::new(layout)
                 .page_size(4 * 1024)
                 .freeze_min_bytes(4096)
-                .auto_flush_max_age(Duration::from_millis(5)),
+                .auto_flush_max_age(Duration::from_millis(5))
+                .writeback_mode(writeback_mode),
         )
+    }
+
+    fn test_config(layout: ChunkLayout) -> Arc<WriteConfig> {
+        test_config_with_writeback(layout, WriteBackMode::UploadBeforeCommit)
     }
 
     fn blocks_len(data: &[(usize, Vec<Bytes>)]) -> usize {
@@ -2839,6 +2936,34 @@ mod tests {
         slice.data.append(&data).unwrap();
         slice.data.freeze();
         slice.state = SliceStatus::Readonly;
+
+        let (start, end) = slice.idx_need_upload();
+        assert_eq!((start, end), (0, 2));
+
+        let blocks = slice.data.collect_pages(start, end).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks_len(&blocks), data.len());
+    }
+
+    #[test]
+    fn test_idx_need_upload_committed_writeback_includes_partial_block() {
+        let layout = ChunkLayout {
+            chunk_size: 16 * 1024,
+            block_size: 4 * 1024,
+        };
+        let mut slice = SliceState::new(
+            1,
+            0,
+            test_config_with_writeback(layout, WriteBackMode::CommitBeforeUpload),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            0,
+        );
+        let len = layout.block_size as usize + (layout.block_size as usize / 2);
+        let data = vec![3u8; len];
+        slice.data.append(&data).unwrap();
+        slice.data.freeze();
+        slice.state = SliceStatus::Committed;
 
         let (start, end) = slice.idx_need_upload();
         assert_eq!((start, end), (0, 2));
@@ -3114,6 +3239,78 @@ mod tests {
             writer.has_overlay_state().await,
             "recently_committed slices must remain visible to overlay after flush"
         );
+    }
+
+    #[tokio::test]
+    async fn test_commit_before_upload_keeps_overlay_until_upload_finishes() {
+        let layout = ChunkLayout {
+            chunk_size: 8 * 1024,
+            block_size: 4 * 1024,
+        };
+        let store = Arc::new(BlockingStore::new(true));
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
+        let ino = meta
+            .create_file(1, "writeback_overlay.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
+        let reader = Arc::new(DataReader::new(
+            Arc::new(ReadConfig::new(layout)),
+            backend.clone(),
+        ));
+        let writer = FileWriter::new(
+            inode.clone(),
+            test_config_with_writeback(layout, WriteBackMode::CommitBeforeUpload),
+            backend,
+            reader.clone(),
+            Arc::new(AtomicU64::new(0)),
+            None,
+        );
+
+        let len = (layout.block_size / 2) as usize;
+        let data = vec![9u8; len];
+        writer.write_at(0, &data).await.unwrap();
+
+        timeout(Duration::from_secs(2), writer.flush())
+            .await
+            .expect("commit-before-upload flush should not wait for blocked object upload")
+            .unwrap();
+
+        assert!(
+            !writer.has_pending().await,
+            "flush should treat metadata-committed slices as drained"
+        );
+        assert!(
+            writer.has_overlay_state().await,
+            "overlay must remain while the object upload is still blocked"
+        );
+        assert_eq!(
+            writer
+                .read_dirty_if_fully_covered(0, len)
+                .await
+                .unwrap()
+                .unwrap(),
+            data
+        );
+
+        store.unblock();
+        let file_reader = reader.open_for_handle(inode, 21);
+        let uploaded = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(out) = file_reader.read(0, len).await
+                    && out == data
+                {
+                    break out;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("blocked object upload should eventually finish");
+
+        assert_eq!(uploaded, data);
     }
 
     #[tokio::test]

@@ -156,14 +156,18 @@ EOF
             fi
         fi
 
-        # Cache section (compression, etc.)
+        # Cache section (compression, writeback mode, etc.)
         local comp="${SLAYERFS_COMPRESSION:-none}"
-        if [[ "$comp" != "none" ]]; then
+        local writeback_mode="${SLAYERFS_WRITEBACK_MODE:-}"
+        if [[ "$comp" != "none" || -n "$writeback_mode" ]]; then
             echo
-            cat <<EOF
-cache:
-  compression: ${comp}
-EOF
+            echo "cache:"
+            if [[ "$comp" != "none" ]]; then
+                echo "  compression: ${comp}"
+            fi
+            if [[ -n "$writeback_mode" ]]; then
+                echo "  writeback_mode: ${writeback_mode}"
+            fi
         fi
     } >"$config_path"
 }

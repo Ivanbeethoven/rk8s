@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use crate::chunk::bandwidth::BandwidthConfig;
 use crate::chunk::compress::Compression;
 use crate::chunk::layout::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
-use crate::vfs::cache::config::CacheConfig as VfsCacheConfig;
+use crate::vfs::cache::config::{CacheConfig as VfsCacheConfig, WriteBackMode};
 
 pub const DEFAULT_DATA_DIR: &str = "./data";
 pub const DEFAULT_META_URL: &str = "sqlite::memory:";
@@ -233,6 +233,7 @@ pub struct CacheFileConfig {
     pub memory_budget_bytes: Option<u64>,
     pub compression: Option<String>,
     pub zstd_level: Option<i32>,
+    pub writeback_mode: Option<String>,
     pub bandwidth: Option<BandwidthFileConfig>,
 }
 
@@ -286,6 +287,16 @@ impl MountConfig {
         let fuse_cfg = file_cfg.fuse.unwrap_or_default();
         let cache_cfg = file_cfg.cache.unwrap_or_default();
         let cache = cache_cfg.into_cache_config()?;
+        let data_backend = args
+            .data_backend
+            .or(data_cfg.backend)
+            .unwrap_or(DataBackendKind::LocalFs);
+
+        if matches!(cache.writeback_mode, WriteBackMode::CommitBeforeUpload)
+            && !matches!(data_backend, DataBackendKind::S3)
+        {
+            anyhow::bail!("cache.writeback_mode=commit_before_upload requires data.backend=s3");
+        }
 
         let mount_point = args.mount_point.or(file_cfg.mount_point).ok_or_else(|| {
             anyhow::anyhow!("mount point is required (positional arg or config.mount_point)")
@@ -304,10 +315,7 @@ impl MountConfig {
 
         Ok(Self {
             mount_point,
-            data_backend: args
-                .data_backend
-                .or(data_cfg.backend)
-                .unwrap_or(DataBackendKind::LocalFs),
+            data_backend,
             data_dir: args
                 .data_dir
                 .or(localfs_cfg.data_dir)
@@ -399,6 +407,9 @@ impl CacheFileConfig {
         if let Some(compression) = self.compression {
             cache.compression = parse_compression(&compression, self.zstd_level)?;
         }
+        if let Some(writeback_mode) = self.writeback_mode {
+            cache.writeback_mode = parse_writeback_mode(&writeback_mode)?;
+        }
         if let Some(bandwidth) = self.bandwidth {
             cache.bandwidth = BandwidthConfig {
                 upload_limit_mibps: bandwidth.upload_limit_mibps,
@@ -418,6 +429,21 @@ fn parse_compression(value: &str, zstd_level: Option<i32>) -> anyhow::Result<Com
         other => {
             anyhow::bail!("unsupported cache.compression '{other}' (expected none, lz4, or zstd)")
         }
+    }
+}
+
+fn parse_writeback_mode(value: &str) -> anyhow::Result<WriteBackMode> {
+    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "upload_before_commit" | "upload_first" | "safe" | "default" => {
+            Ok(WriteBackMode::UploadBeforeCommit)
+        }
+        "commit_before_upload" | "commit_first" | "writeback" | "s3_writeback" => {
+            Ok(WriteBackMode::CommitBeforeUpload)
+        }
+        other => anyhow::bail!(
+            "unsupported cache.writeback_mode '{other}' (expected upload_before_commit or commit_before_upload)"
+        ),
     }
 }
 
@@ -567,6 +593,7 @@ cache:
   memory_budget_bytes: 9437184
   compression: zstd
   zstd_level: 5
+  writeback_mode: upload_before_commit
   bandwidth:
     upload_limit_mibps: 10
     download_limit_mibps: 20
@@ -589,6 +616,10 @@ cache:
         assert_eq!(config.cache.prefetch_concurrency, 7);
         assert_eq!(config.cache.memory_budget_bytes, 9437184);
         assert_eq!(config.cache.compression, Compression::Zstd(5));
+        assert_eq!(
+            config.cache.writeback_mode,
+            WriteBackMode::UploadBeforeCommit
+        );
         assert_eq!(config.cache.bandwidth.upload_limit_mibps, Some(10));
         assert_eq!(config.cache.bandwidth.download_limit_mibps, Some(20));
     }
@@ -596,5 +627,71 @@ cache:
     #[test]
     fn parse_compression_rejects_unknown_values() {
         assert!(parse_compression("gzip", None).is_err());
+    }
+
+    #[test]
+    fn mount_config_parses_s3_writeback_mode() {
+        let path = std::env::temp_dir().join(format!(
+            "slayerfs-writeback-config-{}-{}.yaml",
+            std::process::id(),
+            "parse"
+        ));
+        std::fs::write(
+            &path,
+            r#"
+mount_point: /mnt/slayer
+data:
+  backend: s3
+cache:
+  writeback_mode: commit_before_upload
+"#,
+        )
+        .unwrap();
+
+        let config = MountConfig::from_sources(empty_mount_args(Some(path.clone()), None)).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert!(matches!(config.data_backend, DataBackendKind::S3));
+        assert_eq!(
+            config.cache.writeback_mode,
+            WriteBackMode::CommitBeforeUpload
+        );
+    }
+
+    #[test]
+    fn mount_config_rejects_commit_before_upload_for_localfs() {
+        let path = std::env::temp_dir().join(format!(
+            "slayerfs-writeback-config-{}-{}.yaml",
+            std::process::id(),
+            "reject"
+        ));
+        std::fs::write(
+            &path,
+            r#"
+mount_point: /mnt/slayer
+cache:
+  writeback_mode: commit_before_upload
+"#,
+        )
+        .unwrap();
+
+        let err = MountConfig::from_sources(empty_mount_args(Some(path.clone()), None))
+            .expect_err("commit-before-upload should require s3");
+        let _ = std::fs::remove_file(path);
+
+        assert!(err.to_string().contains("requires data.backend=s3"));
+    }
+
+    #[test]
+    fn parse_writeback_mode_accepts_aliases() {
+        assert_eq!(
+            parse_writeback_mode("upload-first").unwrap(),
+            WriteBackMode::UploadBeforeCommit
+        );
+        assert_eq!(
+            parse_writeback_mode("s3_writeback").unwrap(),
+            WriteBackMode::CommitBeforeUpload
+        );
+        assert!(parse_writeback_mode("fastest").is_err());
     }
 }

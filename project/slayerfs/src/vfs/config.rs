@@ -76,10 +76,17 @@ pub struct WriteConfig {
 
 impl Default for WriteConfig {
     fn default() -> Self {
-        let writeback_mode = match std::env::var("SLAYERFS_WRITEBACK_MODE").ok().as_deref() {
-            Some("commit_first") => crate::vfs::cache::config::WriteBackMode::CommitBeforeUpload,
-            _ => crate::vfs::cache::config::WriteBackMode::UploadBeforeCommit,
-        };
+        let writeback_mode = std::env::var("SLAYERFS_WRITEBACK_MODE")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase().replace('-', "_"))
+            .filter(|value| {
+                matches!(
+                    value.as_str(),
+                    "commit_before_upload" | "commit_first" | "writeback" | "s3_writeback"
+                )
+            })
+            .map(|_| crate::vfs::cache::config::WriteBackMode::CommitBeforeUpload)
+            .unwrap_or(crate::vfs::cache::config::WriteBackMode::UploadBeforeCommit);
 
         Self {
             layout: ChunkLayout::default(),
