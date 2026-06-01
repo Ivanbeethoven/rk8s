@@ -3,7 +3,6 @@ services:
     image: pingcap/pd:v8.5.0
     container_name: pd-slayerfs-perf-tikv
     command:
-      - /pd-server
       - --name=pd
       - --data-dir=/data/pd
       - --client-urls=http://0.0.0.0:2379
@@ -26,7 +25,6 @@ services:
       pd:
         condition: service_started
     command:
-      - /tikv-server
       - --addr=0.0.0.0:20160
       - --advertise-addr=tikv:20160
       - --status-addr=0.0.0.0:20180
@@ -56,8 +54,8 @@ services:
       - |
         timeout 180 sh -ec '
           while true; do
-            body="$(curl -fsS http://pd:2379/pd/api/v1/stores 2>/dev/null || true)"
-            echo "$body" | grep -q "\"state_name\":\"Up\"" && exit 0
+            body="$$(curl -fsS http://pd:2379/pd/api/v1/stores 2>/dev/null || true)"
+            echo "$$body" | grep -Eq '"state_name"[[:space:]]*:[[:space:]]*"Up"' && exit 0
             sleep 2
           done
         '

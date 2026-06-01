@@ -13,17 +13,30 @@ use crate::meta::store::{
 };
 use async_trait::async_trait;
 use chrono::Utc;
+use rand::{RngCore, rng};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::fmt;
+use std::future::Future;
 use std::ops::Bound;
 use std::path::Path;
+use std::pin::Pin;
+use std::time::Duration;
 use tikv_client::{BoundRange, Key, KvPair, Transaction, TransactionClient};
 
 const ROOT_INODE: i64 = 1;
 const ROOT_SIZE: u64 = 4096;
 const FIRST_ALLOCATED_INODE: i64 = 2;
 const SCAN_BATCH_LIMIT: u32 = 1024;
+const TXN_MAX_RETRIES: usize = 10;
+
+type TiKvTxnFuture<'txn, T> = Pin<Box<dyn Future<Output = Result<T, MetaError>> + Send + 'txn>>;
+
+#[derive(Clone, Copy)]
+enum TiKvTxnMode {
+    Read,
+    Write,
+}
 
 /// TiKV metadata backend.
 #[derive(Clone)]
@@ -177,6 +190,83 @@ impl TiKvMetaStore {
         if let Err(err) = txn.rollback().await {
             log::debug!("TiKV {operation} rollback failed: {err}");
         }
+    }
+
+    async fn retry_delay(attempt: usize) {
+        let jitter_bound = ((attempt + 1) * (attempt + 1)).max(1) as u64;
+        let jitter = rng().next_u64() % jitter_bound;
+        tokio::time::sleep(Duration::from_millis(20 + jitter)).await;
+    }
+
+    /// Run a retry-safe TiKV transaction closure.
+    ///
+    /// The closure may execute more than once when TiKV reports a retryable
+    /// conflict, so it should only perform TiKV reads/writes and in-memory
+    /// staging. External side effects belong after this helper returns.
+    async fn run_txn<T, F>(
+        &self,
+        operation: &'static str,
+        mode: TiKvTxnMode,
+        mut task: F,
+    ) -> Result<T, MetaError>
+    where
+        F: for<'txn> FnMut(&'txn TiKvMetaStore, &'txn mut Transaction) -> TiKvTxnFuture<'txn, T>,
+    {
+        for attempt in 0..TXN_MAX_RETRIES {
+            let mut txn = match mode {
+                TiKvTxnMode::Read => self.begin_read(operation).await?,
+                TiKvTxnMode::Write => self.begin_write(operation).await?,
+            };
+
+            let result = task(self, &mut txn).await;
+            match (mode, result) {
+                (TiKvTxnMode::Read, Ok(value)) => {
+                    Self::rollback_best_effort(&mut txn, operation).await;
+                    return Ok(value);
+                }
+                (TiKvTxnMode::Read, Err(MetaError::ContinueRetry(_))) => {
+                    Self::rollback_best_effort(&mut txn, operation).await;
+                }
+                (TiKvTxnMode::Read, Err(err)) => {
+                    Self::rollback_best_effort(&mut txn, operation).await;
+                    return Err(err);
+                }
+                (TiKvTxnMode::Write, Ok(value)) => {
+                    match self.commit_write(&mut txn, operation).await {
+                        Ok(()) => return Ok(value),
+                        Err(MetaError::ContinueRetry(_)) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                (TiKvTxnMode::Write, Err(MetaError::ContinueRetry(_))) => {
+                    Self::rollback_best_effort(&mut txn, operation).await;
+                }
+                (TiKvTxnMode::Write, Err(err)) => {
+                    Self::rollback_best_effort(&mut txn, operation).await;
+                    return Err(err);
+                }
+            }
+
+            if attempt + 1 < TXN_MAX_RETRIES {
+                Self::retry_delay(attempt).await;
+            }
+        }
+
+        Err(MetaError::MaxRetriesExceeded)
+    }
+
+    async fn read_txn<T, F>(&self, operation: &'static str, task: F) -> Result<T, MetaError>
+    where
+        F: for<'txn> FnMut(&'txn TiKvMetaStore, &'txn mut Transaction) -> TiKvTxnFuture<'txn, T>,
+    {
+        self.run_txn(operation, TiKvTxnMode::Read, task).await
+    }
+
+    async fn write_txn<T, F>(&self, operation: &'static str, task: F) -> Result<T, MetaError>
+    where
+        F: for<'txn> FnMut(&'txn TiKvMetaStore, &'txn mut Transaction) -> TiKvTxnFuture<'txn, T>,
+    {
+        self.run_txn(operation, TiKvTxnMode::Write, task).await
     }
 
     fn now() -> i64 {
@@ -470,26 +560,6 @@ impl TiKvMetaStore {
             .await?;
         Ok(ino)
     }
-
-    async fn finish_write<T>(
-        &self,
-        txn: &mut Transaction,
-        operation: &str,
-        result: Result<T, MetaError>,
-    ) -> Result<T, MetaError> {
-        match result {
-            Ok(value) => {
-                if let Err(err) = self.commit_write(txn, operation).await {
-                    return Err(err);
-                }
-                Ok(value)
-            }
-            Err(err) => {
-                Self::rollback_best_effort(txn, operation).await;
-                Err(err)
-            }
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -571,24 +641,30 @@ impl MetaStore for TiKvMetaStore {
 
     async fn stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
         let operation = "stat";
-        let mut txn = self.begin_read(operation).await?;
-        let result = self
-            .txn_get_node(&mut txn, ino, false, operation)
-            .await
-            .map(|node| node.map(|node| node.to_attr()));
-        Self::rollback_best_effort(&mut txn, operation).await;
-        result
+        self.read_txn(operation, |store, txn| {
+            Box::pin(async move {
+                store
+                    .txn_get_node(txn, ino, false, operation)
+                    .await
+                    .map(|node| node.map(|node| node.to_attr()))
+            })
+        })
+        .await
     }
 
     async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
         let operation = "lookup";
-        let mut txn = self.begin_read(operation).await?;
-        let result = self
-            .txn_get_dentry(&mut txn, parent, name, false, operation)
-            .await
-            .map(|dentry| dentry.map(|dentry| dentry.ino));
-        Self::rollback_best_effort(&mut txn, operation).await;
-        result
+        let name = name.to_string();
+        self.read_txn(operation, |store, txn| {
+            let name = name.clone();
+            Box::pin(async move {
+                store
+                    .txn_get_dentry(txn, parent, &name, false, operation)
+                    .await
+                    .map(|dentry| dentry.map(|dentry| dentry.ino))
+            })
+        })
+        .await
     }
 
     async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError> {
@@ -600,150 +676,158 @@ impl MetaStore for TiKvMetaStore {
         }
 
         let operation = "lookup_path";
-        let mut txn = self.begin_read(operation).await?;
-        let result = async {
-            let mut current = ROOT_INODE;
-            for segment in path.split('/').filter(|part| !part.is_empty()) {
-                let Some(dentry) = self
-                    .txn_get_dentry(&mut txn, current, segment, false, operation)
-                    .await?
-                else {
-                    return Ok(None);
-                };
-                current = dentry.ino;
-            }
+        let path = path.to_string();
+        self.read_txn(operation, |store, txn| {
+            let path = path.clone();
+            Box::pin(async move {
+                let mut current = ROOT_INODE;
+                for segment in path.split('/').filter(|part| !part.is_empty()) {
+                    let Some(dentry) = store
+                        .txn_get_dentry(txn, current, segment, false, operation)
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    current = dentry.ino;
+                }
 
-            Ok(self
-                .txn_get_node(&mut txn, current, false, operation)
-                .await?
-                .map(|node| (node.ino, node.kind.into())))
-        }
-        .await;
-        Self::rollback_best_effort(&mut txn, operation).await;
-        result
+                Ok(store
+                    .txn_get_node(txn, current, false, operation)
+                    .await?
+                    .map(|node| (node.ino, node.kind.into())))
+            })
+        })
+        .await
     }
 
     async fn readdir(&self, ino: i64) -> Result<Vec<DirEntry>, MetaError> {
         let operation = "readdir";
-        let mut txn = self.begin_read(operation).await?;
-        let result = async {
-            let node = self
-                .txn_get_node(&mut txn, ino, false, operation)
-                .await?
-                .ok_or(MetaError::NotFound(ino))?;
-            if node.kind != StoredNodeKind::Dir {
-                return Err(MetaError::NotDirectory(ino));
-            }
+        self.read_txn(operation, |store, txn| {
+            Box::pin(async move {
+                let node = store
+                    .txn_get_node(txn, ino, false, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(ino))?;
+                if node.kind != StoredNodeKind::Dir {
+                    return Err(MetaError::NotDirectory(ino));
+                }
 
-            let prefix = self.dentry_prefix(ino);
-            let pairs = Self::txn_scan_prefix(&mut txn, prefix.clone(), None, operation).await?;
-            let mut out = Vec::with_capacity(pairs.len());
-            for pair in pairs {
-                let (key, value): (Key, Vec<u8>) = pair.into();
-                let key: Vec<u8> = key.into();
-                let name = String::from_utf8(key[prefix.len()..].to_vec()).map_err(|e| {
-                    MetaError::Serialization(format!("TiKV dentry key is not UTF-8: {e}"))
-                })?;
-                let dentry = Self::decode_dentry(&value)?;
-                out.push(DirEntry {
-                    name,
-                    ino: dentry.ino,
-                    kind: dentry.kind.into(),
-                });
-            }
-            Ok(out)
-        }
-        .await;
-        Self::rollback_best_effort(&mut txn, operation).await;
-        result
+                let prefix = store.dentry_prefix(ino);
+                let pairs = Self::txn_scan_prefix(txn, prefix.clone(), None, operation).await?;
+                let mut out = Vec::with_capacity(pairs.len());
+                for pair in pairs {
+                    let (key, value): (Key, Vec<u8>) = pair.into();
+                    let key: Vec<u8> = key.into();
+                    let name = String::from_utf8(key[prefix.len()..].to_vec()).map_err(|e| {
+                        MetaError::Serialization(format!("TiKV dentry key is not UTF-8: {e}"))
+                    })?;
+                    let dentry = Self::decode_dentry(&value)?;
+                    out.push(DirEntry {
+                        name,
+                        ino: dentry.ino,
+                        kind: dentry.kind.into(),
+                    });
+                }
+                Ok(out)
+            })
+        })
+        .await
     }
 
     async fn mkdir(&self, parent: i64, name: String) -> Result<i64, MetaError> {
         let operation = "mkdir";
-        let mut txn = self.begin_write(operation).await?;
-        let result = self
-            .txn_create_node(&mut txn, parent, name, StoredNodeKind::Dir, operation)
-            .await;
-        self.finish_write(&mut txn, operation, result).await
+        self.write_txn(operation, |store, txn| {
+            let name = name.clone();
+            Box::pin(async move {
+                store
+                    .txn_create_node(txn, parent, name, StoredNodeKind::Dir, operation)
+                    .await
+            })
+        })
+        .await
     }
 
     async fn rmdir(&self, parent: i64, name: &str) -> Result<(), MetaError> {
         let operation = "rmdir";
-        let mut txn = self.begin_write(operation).await?;
-        let result = async {
-            let mut parent_node = self
-                .txn_require_dir(&mut txn, parent, true, operation)
-                .await?;
-            let dentry = self
-                .txn_get_dentry(&mut txn, parent, name, true, operation)
-                .await?
-                .ok_or(MetaError::NotFound(parent))?;
-            if dentry.kind != StoredNodeKind::Dir {
-                return Err(MetaError::NotDirectory(dentry.ino));
-            }
-            let dir_node = self
-                .txn_get_node(&mut txn, dentry.ino, true, operation)
-                .await?
-                .ok_or(MetaError::NotFound(dentry.ino))?;
-            if dir_node.kind != StoredNodeKind::Dir {
-                return Err(MetaError::NotDirectory(dentry.ino));
-            }
+        let name = name.to_string();
+        self.write_txn(operation, |store, txn| {
+            let name = name.clone();
+            Box::pin(async move {
+                let mut parent_node = store.txn_require_dir(txn, parent, true, operation).await?;
+                let dentry = store
+                    .txn_get_dentry(txn, parent, &name, true, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(parent))?;
+                if dentry.kind != StoredNodeKind::Dir {
+                    return Err(MetaError::NotDirectory(dentry.ino));
+                }
+                let dir_node = store
+                    .txn_get_node(txn, dentry.ino, true, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(dentry.ino))?;
+                if dir_node.kind != StoredNodeKind::Dir {
+                    return Err(MetaError::NotDirectory(dentry.ino));
+                }
 
-            let child_prefix = self.dentry_prefix(dentry.ino);
-            if !Self::txn_scan_prefix(&mut txn, child_prefix, Some(1), operation)
-                .await?
-                .is_empty()
-            {
-                return Err(MetaError::DirectoryNotEmpty(dentry.ino));
-            }
+                let child_prefix = store.dentry_prefix(dentry.ino);
+                if !Self::txn_scan_prefix(txn, child_prefix, Some(1), operation)
+                    .await?
+                    .is_empty()
+                {
+                    return Err(MetaError::DirectoryNotEmpty(dentry.ino));
+                }
 
-            let now = Self::now();
-            parent_node.nlink = parent_node.nlink.saturating_sub(1);
-            parent_node.mtime = now;
-            parent_node.ctime = now;
-            self.txn_put_node(&mut txn, &parent_node, operation).await?;
-            Self::txn_delete_raw(&mut txn, self.dentry_key(parent, name), operation).await?;
-            Self::txn_delete_raw(&mut txn, self.inode_key(dentry.ino), operation).await
-        }
-        .await;
-        self.finish_write(&mut txn, operation, result).await
+                let now = Self::now();
+                parent_node.nlink = parent_node.nlink.saturating_sub(1);
+                parent_node.mtime = now;
+                parent_node.ctime = now;
+                store.txn_put_node(txn, &parent_node, operation).await?;
+                Self::txn_delete_raw(txn, store.dentry_key(parent, &name), operation).await?;
+                Self::txn_delete_raw(txn, store.inode_key(dentry.ino), operation).await
+            })
+        })
+        .await
     }
 
     async fn create_file(&self, parent: i64, name: String) -> Result<i64, MetaError> {
         let operation = "create_file";
-        let mut txn = self.begin_write(operation).await?;
-        let result = self
-            .txn_create_node(&mut txn, parent, name, StoredNodeKind::File, operation)
-            .await;
-        self.finish_write(&mut txn, operation, result).await
+        self.write_txn(operation, |store, txn| {
+            let name = name.clone();
+            Box::pin(async move {
+                store
+                    .txn_create_node(txn, parent, name, StoredNodeKind::File, operation)
+                    .await
+            })
+        })
+        .await
     }
 
     async fn unlink(&self, parent: i64, name: &str) -> Result<(), MetaError> {
         let operation = "unlink";
-        let mut txn = self.begin_write(operation).await?;
-        let result = async {
-            let mut parent_node = self
-                .txn_require_dir(&mut txn, parent, true, operation)
-                .await?;
-            let dentry = self
-                .txn_get_dentry(&mut txn, parent, name, true, operation)
-                .await?
-                .ok_or(MetaError::NotFound(parent))?;
-            if dentry.kind == StoredNodeKind::Dir {
-                return Err(MetaError::NotSupported(
-                    "TiKV unlink for directories is not supported; use rmdir".to_string(),
-                ));
-            }
+        let name = name.to_string();
+        self.write_txn(operation, |store, txn| {
+            let name = name.clone();
+            Box::pin(async move {
+                let mut parent_node = store.txn_require_dir(txn, parent, true, operation).await?;
+                let dentry = store
+                    .txn_get_dentry(txn, parent, &name, true, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(parent))?;
+                if dentry.kind == StoredNodeKind::Dir {
+                    return Err(MetaError::NotSupported(
+                        "TiKV unlink for directories is not supported; use rmdir".to_string(),
+                    ));
+                }
 
-            let now = Self::now();
-            parent_node.mtime = now;
-            parent_node.ctime = now;
-            self.txn_put_node(&mut txn, &parent_node, operation).await?;
-            Self::txn_delete_raw(&mut txn, self.dentry_key(parent, name), operation).await?;
-            Self::txn_delete_raw(&mut txn, self.inode_key(dentry.ino), operation).await
-        }
-        .await;
-        self.finish_write(&mut txn, operation, result).await
+                let now = Self::now();
+                parent_node.mtime = now;
+                parent_node.ctime = now;
+                store.txn_put_node(txn, &parent_node, operation).await?;
+                Self::txn_delete_raw(txn, store.dentry_key(parent, &name), operation).await?;
+                Self::txn_delete_raw(txn, store.inode_key(dentry.ino), operation).await
+            })
+        })
+        .await
     }
 
     async fn rename(
@@ -758,68 +842,70 @@ impl MetaStore for TiKvMetaStore {
         }
 
         let operation = "rename";
-        let mut txn = self.begin_write(operation).await?;
-        let result = async {
-            let mut old_parent_node = self
-                .txn_require_dir(&mut txn, old_parent, true, operation)
-                .await?;
-            let mut new_parent_node = if old_parent == new_parent {
-                old_parent_node.clone()
-            } else {
-                self.txn_require_dir(&mut txn, new_parent, true, operation)
+        let old_name = old_name.to_string();
+        self.write_txn(operation, |store, txn| {
+            let old_name = old_name.clone();
+            let new_name = new_name.clone();
+            Box::pin(async move {
+                let mut old_parent_node = store
+                    .txn_require_dir(txn, old_parent, true, operation)
+                    .await?;
+                let mut new_parent_node = if old_parent == new_parent {
+                    old_parent_node.clone()
+                } else {
+                    store
+                        .txn_require_dir(txn, new_parent, true, operation)
+                        .await?
+                };
+                let dentry = store
+                    .txn_get_dentry(txn, old_parent, &old_name, true, operation)
                     .await?
-            };
-            let dentry = self
-                .txn_get_dentry(&mut txn, old_parent, old_name, true, operation)
-                .await?
-                .ok_or(MetaError::NotFound(old_parent))?;
-            if self
-                .txn_get_dentry(&mut txn, new_parent, &new_name, true, operation)
-                .await?
-                .is_some()
-            {
-                return Err(MetaError::AlreadyExists {
-                    parent: new_parent,
-                    name: new_name,
-                });
-            }
+                    .ok_or(MetaError::NotFound(old_parent))?;
+                if store
+                    .txn_get_dentry(txn, new_parent, &new_name, true, operation)
+                    .await?
+                    .is_some()
+                {
+                    return Err(MetaError::AlreadyExists {
+                        parent: new_parent,
+                        name: new_name,
+                    });
+                }
 
-            let mut node = self
-                .txn_get_node(&mut txn, dentry.ino, true, operation)
-                .await?
-                .ok_or(MetaError::NotFound(dentry.ino))?;
-            let now = Self::now();
-            node.parent = new_parent;
-            node.name = new_name.clone();
-            node.ctime = now;
-            node.mtime = now;
+                let mut node = store
+                    .txn_get_node(txn, dentry.ino, true, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(dentry.ino))?;
+                let now = Self::now();
+                node.parent = new_parent;
+                node.name = new_name.clone();
+                node.ctime = now;
+                node.mtime = now;
 
-            old_parent_node.mtime = now;
-            old_parent_node.ctime = now;
-            new_parent_node.mtime = now;
-            new_parent_node.ctime = now;
-            if dentry.kind == StoredNodeKind::Dir && old_parent != new_parent {
-                old_parent_node.nlink = old_parent_node.nlink.saturating_sub(1);
-                new_parent_node.nlink = new_parent_node.nlink.saturating_add(1);
-            }
+                old_parent_node.mtime = now;
+                old_parent_node.ctime = now;
+                new_parent_node.mtime = now;
+                new_parent_node.ctime = now;
+                if dentry.kind == StoredNodeKind::Dir && old_parent != new_parent {
+                    old_parent_node.nlink = old_parent_node.nlink.saturating_sub(1);
+                    new_parent_node.nlink = new_parent_node.nlink.saturating_add(1);
+                }
 
-            Self::txn_delete_raw(&mut txn, self.dentry_key(old_parent, old_name), operation)
-                .await?;
-            self.txn_put_node(&mut txn, &node, operation).await?;
-            if old_parent == new_parent {
-                self.txn_put_node(&mut txn, &old_parent_node, operation)
+                Self::txn_delete_raw(txn, store.dentry_key(old_parent, &old_name), operation)
                     .await?;
-            } else {
-                self.txn_put_node(&mut txn, &old_parent_node, operation)
-                    .await?;
-                self.txn_put_node(&mut txn, &new_parent_node, operation)
-                    .await?;
-            }
-            self.txn_put_dentry(&mut txn, new_parent, &new_name, &dentry, operation)
-                .await
-        }
-        .await;
-        self.finish_write(&mut txn, operation, result).await
+                store.txn_put_node(txn, &node, operation).await?;
+                if old_parent == new_parent {
+                    store.txn_put_node(txn, &old_parent_node, operation).await?;
+                } else {
+                    store.txn_put_node(txn, &old_parent_node, operation).await?;
+                    store.txn_put_node(txn, &new_parent_node, operation).await?;
+                }
+                store
+                    .txn_put_dentry(txn, new_parent, &new_name, &dentry, operation)
+                    .await
+            })
+        })
+        .await
     }
 
     async fn rename_exchange(
@@ -835,26 +921,54 @@ impl MetaStore for TiKvMetaStore {
 
     async fn set_file_size(&self, ino: i64, size: u64) -> Result<(), MetaError> {
         let operation = "set_file_size";
-        let mut txn = self.begin_write(operation).await?;
-        let result = async {
-            let mut node = self
-                .txn_get_node(&mut txn, ino, true, operation)
-                .await?
-                .ok_or(MetaError::NotFound(ino))?;
-            if node.kind != StoredNodeKind::File {
-                return Err(MetaError::NotSupported(
-                    "TiKV set_file_size currently supports only regular files".to_string(),
-                ));
-            }
-            let now = Self::now();
-            node.size = size;
-            node.blocks = size.div_ceil(512);
-            node.mtime = now;
-            node.ctime = now;
-            self.txn_put_node(&mut txn, &node, operation).await
-        }
-        .await;
-        self.finish_write(&mut txn, operation, result).await
+        self.write_txn(operation, |store, txn| {
+            Box::pin(async move {
+                let mut node = store
+                    .txn_get_node(txn, ino, true, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(ino))?;
+                if node.kind != StoredNodeKind::File {
+                    return Err(MetaError::NotSupported(
+                        "TiKV set_file_size currently supports only regular files".to_string(),
+                    ));
+                }
+                let now = Self::now();
+                node.size = size;
+                node.blocks = size.div_ceil(512);
+                node.mtime = now;
+                node.ctime = now;
+                store.txn_put_node(txn, &node, operation).await
+            })
+        })
+        .await
+    }
+
+    async fn extend_file_size(&self, ino: i64, size: u64) -> Result<(), MetaError> {
+        let operation = "extend_file_size";
+        self.write_txn(operation, |store, txn| {
+            Box::pin(async move {
+                let mut node = store
+                    .txn_get_node(txn, ino, true, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(ino))?;
+                if node.kind != StoredNodeKind::File {
+                    return Err(MetaError::NotSupported(
+                        "TiKV extend_file_size currently supports only regular files".to_string(),
+                    ));
+                }
+
+                if size > node.size {
+                    let now = Self::now();
+                    node.size = size;
+                    node.blocks = size.div_ceil(512);
+                    node.mtime = now;
+                    node.ctime = now;
+                    store.txn_put_node(txn, &node, operation).await?;
+                }
+                Ok(())
+            })
+        })
+        .await
     }
 
     async fn get_names(&self, ino: i64) -> Result<Vec<(Option<i64>, String)>, MetaError> {
@@ -863,16 +977,18 @@ impl MetaStore for TiKvMetaStore {
         }
 
         let operation = "get_names";
-        let mut txn = self.begin_read(operation).await?;
-        let result = self
-            .txn_get_node(&mut txn, ino, false, operation)
-            .await
-            .map(|node| {
-                node.map(|node| vec![(Some(node.parent), node.name)])
-                    .unwrap_or_default()
-            });
-        Self::rollback_best_effort(&mut txn, operation).await;
-        result
+        self.read_txn(operation, |store, txn| {
+            Box::pin(async move {
+                store
+                    .txn_get_node(txn, ino, false, operation)
+                    .await
+                    .map(|node| {
+                        node.map(|node| vec![(Some(node.parent), node.name)])
+                            .unwrap_or_default()
+                    })
+            })
+        })
+        .await
     }
 
     async fn get_paths(&self, ino: i64) -> Result<Vec<String>, MetaError> {
@@ -881,30 +997,29 @@ impl MetaStore for TiKvMetaStore {
         }
 
         let operation = "get_paths";
-        let mut txn = self.begin_read(operation).await?;
-        let result = async {
-            let Some(node) = self.txn_get_node(&mut txn, ino, false, operation).await? else {
-                return Ok(Vec::new());
-            };
-
-            let mut parts = vec![node.name];
-            let mut current_parent = node.parent;
-            while current_parent != ROOT_INODE {
-                let Some(parent) = self
-                    .txn_get_node(&mut txn, current_parent, false, operation)
-                    .await?
-                else {
+        self.read_txn(operation, |store, txn| {
+            Box::pin(async move {
+                let Some(node) = store.txn_get_node(txn, ino, false, operation).await? else {
                     return Ok(Vec::new());
                 };
-                parts.push(parent.name);
-                current_parent = parent.parent;
-            }
-            parts.reverse();
-            Ok(vec![format!("/{}", parts.join("/"))])
-        }
-        .await;
-        Self::rollback_best_effort(&mut txn, operation).await;
-        result
+
+                let mut parts = vec![node.name];
+                let mut current_parent = node.parent;
+                while current_parent != ROOT_INODE {
+                    let Some(parent) = store
+                        .txn_get_node(txn, current_parent, false, operation)
+                        .await?
+                    else {
+                        return Ok(Vec::new());
+                    };
+                    parts.push(parent.name);
+                    current_parent = parent.parent;
+                }
+                parts.reverse();
+                Ok(vec![format!("/{}", parts.join("/"))])
+            })
+        })
+        .await
     }
 
     fn root_ino(&self) -> i64 {
@@ -913,49 +1028,55 @@ impl MetaStore for TiKvMetaStore {
 
     async fn initialize(&self) -> Result<(), MetaError> {
         let operation = "initialize";
-        let mut txn = self.begin_read(operation).await?;
-        let root_exists = self
-            .txn_get_node(&mut txn, ROOT_INODE, false, operation)
-            .await?
-            .is_some();
-        let counter_exists =
-            Self::txn_get_raw(&mut txn, self.counter_key(INODE_ID_KEY), false, operation)
-                .await?
-                .is_some();
-        Self::rollback_best_effort(&mut txn, operation).await;
+        let (root_exists, counter_exists) = self
+            .read_txn(operation, |store, txn| {
+                Box::pin(async move {
+                    let root_exists = store
+                        .txn_get_node(txn, ROOT_INODE, false, operation)
+                        .await?
+                        .is_some();
+                    let counter_exists =
+                        Self::txn_get_raw(txn, store.counter_key(INODE_ID_KEY), false, operation)
+                            .await?
+                            .is_some();
+                    Ok((root_exists, counter_exists))
+                })
+            })
+            .await?;
 
         if root_exists && counter_exists {
             return Ok(());
         }
 
-        let mut txn = self.begin_write(operation).await?;
-        let result = async {
-            if self
-                .txn_get_node(&mut txn, ROOT_INODE, true, operation)
-                .await?
-                .is_none()
-            {
-                self.txn_put_node(&mut txn, &Self::root_node(), operation)
-                    .await?;
-            }
+        self.write_txn(operation, |store, txn| {
+            Box::pin(async move {
+                if store
+                    .txn_get_node(txn, ROOT_INODE, true, operation)
+                    .await?
+                    .is_none()
+                {
+                    store
+                        .txn_put_node(txn, &Self::root_node(), operation)
+                        .await?;
+                }
 
-            let counter_key = self.counter_key(INODE_ID_KEY);
-            if Self::txn_get_raw(&mut txn, counter_key.clone(), true, operation)
-                .await?
-                .is_none()
-            {
-                Self::txn_put_raw(
-                    &mut txn,
-                    counter_key,
-                    Self::encode(&FIRST_ALLOCATED_INODE)?,
-                    operation,
-                )
-                .await?;
-            }
-            Ok(())
-        }
-        .await;
-        self.finish_write(&mut txn, operation, result).await
+                let counter_key = store.counter_key(INODE_ID_KEY);
+                if Self::txn_get_raw(txn, counter_key.clone(), true, operation)
+                    .await?
+                    .is_none()
+                {
+                    Self::txn_put_raw(
+                        txn,
+                        counter_key,
+                        Self::encode(&FIRST_ALLOCATED_INODE)?,
+                        operation,
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
     }
 
     async fn get_deleted_files(&self) -> Result<Vec<i64>, MetaError> {
@@ -964,22 +1085,27 @@ impl MetaStore for TiKvMetaStore {
 
     async fn remove_file_metadata(&self, ino: i64) -> Result<(), MetaError> {
         let operation = "remove_file_metadata";
-        let mut txn = self.begin_write(operation).await?;
-        let result = Self::txn_delete_raw(&mut txn, self.inode_key(ino), operation).await;
-        self.finish_write(&mut txn, operation, result).await
+        self.write_txn(operation, |store, txn| {
+            Box::pin(
+                async move { Self::txn_delete_raw(txn, store.inode_key(ino), operation).await },
+            )
+        })
+        .await
     }
 
     async fn get_slices(&self, chunk_id: u64) -> Result<Vec<SliceDesc>, MetaError> {
         let operation = "get_slices";
-        let mut txn = self.begin_read(operation).await?;
-        let result = Self::txn_get_raw(&mut txn, self.chunk_key(chunk_id), false, operation)
-            .await?
-            .as_deref()
-            .map(Self::decode_slices)
-            .transpose()
-            .map(|slices| slices.unwrap_or_default());
-        Self::rollback_best_effort(&mut txn, operation).await;
-        result
+        self.read_txn(operation, |store, txn| {
+            Box::pin(async move {
+                Self::txn_get_raw(txn, store.chunk_key(chunk_id), false, operation)
+                    .await?
+                    .as_deref()
+                    .map(Self::decode_slices)
+                    .transpose()
+                    .map(|slices| slices.unwrap_or_default())
+            })
+        })
+        .await
     }
 
     async fn list_chunk_ids(&self, limit: usize) -> Result<Vec<u64>, MetaError> {
@@ -988,44 +1114,43 @@ impl MetaStore for TiKvMetaStore {
         }
 
         let operation = "list_chunk_ids";
-        let mut txn = self.begin_read(operation).await?;
-        let result = async {
-            let prefix = self.chunk_prefix();
-            let pairs =
-                Self::txn_scan_prefix(&mut txn, prefix.clone(), Some(limit), operation).await?;
-            let mut out = Vec::with_capacity(pairs.len());
-            for pair in pairs {
-                let key: Vec<u8> = pair.into_key().into();
-                let suffix = std::str::from_utf8(&key[prefix.len()..]).map_err(|e| {
-                    MetaError::Serialization(format!("TiKV chunk key is not UTF-8: {e}"))
-                })?;
-                if let Ok(chunk_id) = suffix.parse::<u64>() {
-                    out.push(chunk_id);
+        self.read_txn(operation, |store, txn| {
+            Box::pin(async move {
+                let prefix = store.chunk_prefix();
+                let pairs =
+                    Self::txn_scan_prefix(txn, prefix.clone(), Some(limit), operation).await?;
+                let mut out = Vec::with_capacity(pairs.len());
+                for pair in pairs {
+                    let key: Vec<u8> = pair.into_key().into();
+                    let suffix = std::str::from_utf8(&key[prefix.len()..]).map_err(|e| {
+                        MetaError::Serialization(format!("TiKV chunk key is not UTF-8: {e}"))
+                    })?;
+                    if let Ok(chunk_id) = suffix.parse::<u64>() {
+                        out.push(chunk_id);
+                    }
                 }
-            }
-            Ok(out)
-        }
-        .await;
-        Self::rollback_best_effort(&mut txn, operation).await;
-        result
+                Ok(out)
+            })
+        })
+        .await
     }
 
     async fn append_slice(&self, chunk_id: u64, slice: SliceDesc) -> Result<(), MetaError> {
         let operation = "append_slice";
-        let mut txn = self.begin_write(operation).await?;
-        let result = async {
-            let chunk_key = self.chunk_key(chunk_id);
-            let mut slices = Self::txn_get_raw(&mut txn, chunk_key.clone(), true, operation)
-                .await?
-                .as_deref()
-                .map(Self::decode_slices)
-                .transpose()?
-                .unwrap_or_default();
-            slices.push(slice);
-            Self::txn_put_raw(&mut txn, chunk_key, Self::encode(&slices)?, operation).await
-        }
-        .await;
-        self.finish_write(&mut txn, operation, result).await
+        self.write_txn(operation, |store, txn| {
+            Box::pin(async move {
+                let chunk_key = store.chunk_key(chunk_id);
+                let mut slices = Self::txn_get_raw(txn, chunk_key.clone(), true, operation)
+                    .await?
+                    .as_deref()
+                    .map(Self::decode_slices)
+                    .transpose()?
+                    .unwrap_or_default();
+                slices.push(slice);
+                Self::txn_put_raw(txn, chunk_key, Self::encode(&slices)?, operation).await
+            })
+        })
+        .await
     }
 
     async fn write(
@@ -1036,44 +1161,50 @@ impl MetaStore for TiKvMetaStore {
         new_size: u64,
     ) -> Result<(), MetaError> {
         let operation = "write";
-        let mut txn = self.begin_write(operation).await?;
-        let result = async {
-            let mut node = self
-                .txn_get_node(&mut txn, ino, true, operation)
-                .await?
-                .ok_or(MetaError::NotFound(ino))?;
-            if node.kind != StoredNodeKind::File {
-                return Err(MetaError::NotSupported(
-                    "TiKV write currently supports only regular files".to_string(),
-                ));
-            }
+        self.write_txn(operation, |store, txn| {
+            Box::pin(async move {
+                let mut node = store
+                    .txn_get_node(txn, ino, true, operation)
+                    .await?
+                    .ok_or(MetaError::NotFound(ino))?;
+                if node.kind != StoredNodeKind::File {
+                    return Err(MetaError::NotSupported(
+                        "TiKV write currently supports only regular files".to_string(),
+                    ));
+                }
 
-            let chunk_key = self.chunk_key(chunk_id);
-            let mut slices = Self::txn_get_raw(&mut txn, chunk_key.clone(), true, operation)
-                .await?
-                .as_deref()
-                .map(Self::decode_slices)
-                .transpose()?
-                .unwrap_or_default();
-            slices.push(slice);
-            Self::txn_put_raw(&mut txn, chunk_key, Self::encode(&slices)?, operation).await?;
+                let chunk_key = store.chunk_key(chunk_id);
+                let mut slices = Self::txn_get_raw(txn, chunk_key.clone(), true, operation)
+                    .await?
+                    .as_deref()
+                    .map(Self::decode_slices)
+                    .transpose()?
+                    .unwrap_or_default();
+                slices.push(slice);
+                Self::txn_put_raw(txn, chunk_key, Self::encode(&slices)?, operation).await?;
 
-            let now = Self::now();
-            node.size = new_size;
-            node.blocks = new_size.div_ceil(512);
-            node.mtime = now;
-            node.ctime = now;
-            self.txn_put_node(&mut txn, &node, operation).await
-        }
-        .await;
-        self.finish_write(&mut txn, operation, result).await
+                if new_size > node.size {
+                    let now = Self::now();
+                    node.size = new_size;
+                    node.blocks = new_size.div_ceil(512);
+                    node.mtime = now;
+                    node.ctime = now;
+                    store.txn_put_node(txn, &node, operation).await?;
+                }
+                Ok(())
+            })
+        })
+        .await
     }
 
     async fn next_id(&self, key: &str) -> Result<i64, MetaError> {
         let operation = "next_id";
-        let mut txn = self.begin_write(operation).await?;
-        let result = self.txn_next_counter(&mut txn, key, 1, operation).await;
-        self.finish_write(&mut txn, operation, result).await
+        let key = key.to_string();
+        self.write_txn(operation, |store, txn| {
+            let key = key.clone();
+            Box::pin(async move { store.txn_next_counter(txn, &key, 1, operation).await })
+        })
+        .await
     }
 
     fn as_any(&self) -> &dyn Any {

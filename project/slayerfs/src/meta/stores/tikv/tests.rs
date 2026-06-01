@@ -249,6 +249,35 @@ async fn tikv_transactional_file_data_schema() {
     assert_eq!(store.list_chunk_ids(10).await.unwrap(), vec![42]);
     assert_eq!(store.stat(file).await.unwrap().unwrap().size, 128);
 
+    store
+        .write(
+            file,
+            43,
+            SliceDesc {
+                slice_id: 9,
+                chunk_id: 43,
+                offset: 0,
+                length: 32,
+            },
+            32,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.stat(file).await.unwrap().unwrap().size,
+        128,
+        "write should not shrink file size when commits arrive out of order"
+    );
+
+    store.extend_file_size(file, 256).await.unwrap();
+    assert_eq!(store.stat(file).await.unwrap().unwrap().size, 256);
+    store.extend_file_size(file, 64).await.unwrap();
+    assert_eq!(
+        store.stat(file).await.unwrap().unwrap().size,
+        256,
+        "extend_file_size should be monotonic"
+    );
+
     store.set_file_size(file, 64).await.unwrap();
     assert_eq!(store.stat(file).await.unwrap().unwrap().size, 64);
 }
