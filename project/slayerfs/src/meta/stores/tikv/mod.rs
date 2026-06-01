@@ -17,6 +17,7 @@ use chrono::Utc;
 use rand::{RngCore, rng};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
+use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::ops::Bound;
@@ -30,6 +31,12 @@ const ROOT_SIZE: u64 = 4096;
 const FIRST_ALLOCATED_INODE: i64 = 2;
 const SCAN_BATCH_LIMIT: u32 = 1024;
 const TXN_MAX_RETRIES: usize = 10;
+const DELAYED_PENDING_PREFIX: &str = "gc/delayed/pending/";
+const DELAYED_META_DELETED_PREFIX: &str = "gc/delayed/meta_deleted/";
+const UNCOMMITTED_PENDING_PREFIX: &str = "gc/uncommitted/pending/";
+const UNCOMMITTED_ORPHAN_PREFIX: &str = "gc/uncommitted/orphan/";
+const DELAYED_ID_COUNTER: &str = "gc/delayed/id";
+const UNCOMMITTED_ID_COUNTER: &str = "gc/uncommitted/id";
 
 type TiKvTxnFuture<'txn, T> = Pin<Box<dyn Future<Output = Result<T, MetaError>> + Send + 'txn>>;
 
@@ -142,6 +149,38 @@ impl TiKvMetaStore {
         self.key_bytes(&format!("link_parent/{ino}"))
     }
 
+    fn delayed_pending_key(&self, id: i64) -> Vec<u8> {
+        self.key_bytes(&format!("{DELAYED_PENDING_PREFIX}{id}"))
+    }
+
+    fn delayed_pending_prefix(&self) -> Vec<u8> {
+        self.key_bytes(DELAYED_PENDING_PREFIX)
+    }
+
+    fn delayed_meta_deleted_key(&self, id: i64) -> Vec<u8> {
+        self.key_bytes(&format!("{DELAYED_META_DELETED_PREFIX}{id}"))
+    }
+
+    fn delayed_meta_deleted_prefix(&self) -> Vec<u8> {
+        self.key_bytes(DELAYED_META_DELETED_PREFIX)
+    }
+
+    fn uncommitted_pending_key(&self, slice_id: u64) -> Vec<u8> {
+        self.key_bytes(&format!("{UNCOMMITTED_PENDING_PREFIX}{slice_id}"))
+    }
+
+    fn uncommitted_pending_prefix(&self) -> Vec<u8> {
+        self.key_bytes(UNCOMMITTED_PENDING_PREFIX)
+    }
+
+    fn uncommitted_orphan_key(&self, slice_id: u64) -> Vec<u8> {
+        self.key_bytes(&format!("{UNCOMMITTED_ORPHAN_PREFIX}{slice_id}"))
+    }
+
+    fn uncommitted_orphan_prefix(&self) -> Vec<u8> {
+        self.key_bytes(UNCOMMITTED_ORPHAN_PREFIX)
+    }
+
     pub(crate) fn counter_key(&self, name: &str) -> Vec<u8> {
         self.key_bytes(&format!("counter/{name}"))
     }
@@ -227,7 +266,10 @@ impl TiKvMetaStore {
                     Self::rollback_best_effort(&mut txn, operation).await;
                     return Ok(value);
                 }
-                (TiKvTxnMode::Read, Err(MetaError::ContinueRetry(_))) => {
+                (
+                    TiKvTxnMode::Read,
+                    Err(MetaError::ContinueRetry(RetryReason::TransactionConflict)),
+                ) => {
                     Self::rollback_best_effort(&mut txn, operation).await;
                 }
                 (TiKvTxnMode::Read, Err(err)) => {
@@ -237,11 +279,14 @@ impl TiKvMetaStore {
                 (TiKvTxnMode::Write, Ok(value)) => {
                     match self.commit_write(&mut txn, operation).await {
                         Ok(()) => return Ok(value),
-                        Err(MetaError::ContinueRetry(_)) => {}
+                        Err(MetaError::ContinueRetry(RetryReason::TransactionConflict)) => {}
                         Err(err) => return Err(err),
                     }
                 }
-                (TiKvTxnMode::Write, Err(MetaError::ContinueRetry(_))) => {
+                (
+                    TiKvTxnMode::Write,
+                    Err(MetaError::ContinueRetry(RetryReason::TransactionConflict)),
+                ) => {
                     Self::rollback_best_effort(&mut txn, operation).await;
                 }
                 (TiKvTxnMode::Write, Err(err)) => {
@@ -274,6 +319,10 @@ impl TiKvMetaStore {
 
     fn now() -> i64 {
         Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    }
+
+    fn now_secs() -> i64 {
+        Utc::now().timestamp()
     }
 
     fn root_node() -> StoredNode {
@@ -320,6 +369,18 @@ impl TiKvMetaStore {
     fn decode_link_parents(bytes: &[u8]) -> Result<Vec<StoredLinkParent>, MetaError> {
         serde_json::from_slice(bytes)
             .map_err(|e| MetaError::Serialization(format!("TiKV link parent decode failed: {e}")))
+    }
+
+    fn decode_delayed_slice(bytes: &[u8]) -> Result<StoredDelayedSliceRecord, MetaError> {
+        serde_json::from_slice(bytes).map_err(|e| {
+            MetaError::Serialization(format!("TiKV delayed slice record decode failed: {e}"))
+        })
+    }
+
+    fn decode_uncommitted_slice(bytes: &[u8]) -> Result<StoredUncommittedSliceRecord, MetaError> {
+        serde_json::from_slice(bytes).map_err(|e| {
+            MetaError::Serialization(format!("TiKV uncommitted slice record decode failed: {e}"))
+        })
     }
 
     fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, MetaError> {
@@ -557,6 +618,82 @@ impl TiKvMetaStore {
             .await
     }
 
+    async fn txn_get_slices(
+        &self,
+        txn: &mut Transaction,
+        chunk_id: u64,
+        lock: bool,
+        operation: &str,
+    ) -> Result<Vec<SliceDesc>, MetaError> {
+        Self::txn_get_raw(txn, self.chunk_key(chunk_id), lock, operation)
+            .await?
+            .as_deref()
+            .map(Self::decode_slices)
+            .transpose()
+            .map(|slices| slices.unwrap_or_default())
+    }
+
+    async fn txn_put_slices_or_delete(
+        &self,
+        txn: &mut Transaction,
+        chunk_id: u64,
+        slices: &[SliceDesc],
+        operation: &str,
+    ) -> Result<(), MetaError> {
+        let chunk_key = self.chunk_key(chunk_id);
+        if slices.is_empty() {
+            Self::txn_delete_raw(txn, chunk_key, operation).await
+        } else {
+            Self::txn_put_raw(txn, chunk_key, Self::encode(&slices)?, operation).await
+        }
+    }
+
+    async fn txn_stage_delayed_slice_records(
+        &self,
+        txn: &mut Transaction,
+        chunk_id: u64,
+        delayed_slices: &[(u64, u64, u32)],
+        now: i64,
+        operation: &str,
+    ) -> Result<(), MetaError> {
+        if delayed_slices.is_empty() {
+            return Ok(());
+        }
+
+        let counter_key = self.counter_key(DELAYED_ID_COUNTER);
+        let mut next_id = Self::txn_get_raw(txn, counter_key.clone(), true, operation)
+            .await?
+            .as_deref()
+            .map(Self::decode_counter)
+            .transpose()?
+            .unwrap_or(0);
+
+        for (slice_id, offset, size) in delayed_slices {
+            next_id = next_id
+                .checked_add(1)
+                .ok_or_else(|| MetaError::Internal("TiKV delayed slice id overflow".to_string()))?;
+            let record = StoredDelayedSliceRecord {
+                id: next_id,
+                slice_id: *slice_id,
+                chunk_id,
+                offset: *offset,
+                size: u64::from(*size),
+                created_at: now,
+                reason: "compact".to_string(),
+                status: "pending".to_string(),
+            };
+            Self::txn_put_raw(
+                txn,
+                self.delayed_pending_key(next_id),
+                Self::encode(&record)?,
+                operation,
+            )
+            .await?;
+        }
+
+        Self::txn_put_raw(txn, counter_key, Self::encode(&next_id)?, operation).await
+    }
+
     async fn txn_create_node(
         &self,
         txn: &mut Transaction,
@@ -777,6 +914,29 @@ struct StoredLinkParent {
     name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredDelayedSliceRecord {
+    id: i64,
+    slice_id: u64,
+    chunk_id: u64,
+    offset: u64,
+    size: u64,
+    created_at: i64,
+    reason: String,
+    status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredUncommittedSliceRecord {
+    id: i64,
+    slice_id: u64,
+    chunk_id: u64,
+    size: u64,
+    created_at: i64,
+    operation: String,
+    status: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredNode {
     ino: i64,
@@ -840,6 +1000,7 @@ impl MetaStore for TiKvMetaStore {
             symlinks: true,
             rename_exchange: true,
             stat_fs: false,
+            compaction: true,
             ..MetaStoreCapabilities::default()
         }
     }
@@ -1839,14 +2000,7 @@ impl MetaStore for TiKvMetaStore {
     async fn get_slices(&self, chunk_id: u64) -> Result<Vec<SliceDesc>, MetaError> {
         let operation = "get_slices";
         self.read_txn(operation, |store, txn| {
-            Box::pin(async move {
-                Self::txn_get_raw(txn, store.chunk_key(chunk_id), false, operation)
-                    .await?
-                    .as_deref()
-                    .map(Self::decode_slices)
-                    .transpose()
-                    .map(|slices| slices.unwrap_or_default())
-            })
+            Box::pin(async move { store.txn_get_slices(txn, chunk_id, false, operation).await })
         })
         .await
     }
@@ -1878,19 +2032,452 @@ impl MetaStore for TiKvMetaStore {
         .await
     }
 
+    async fn replace_slices_for_compact(
+        &self,
+        chunk_id: u64,
+        new_slices: &[SliceDesc],
+        old_slices_to_delay: &[u8],
+    ) -> Result<(), MetaError> {
+        if !old_slices_to_delay.is_empty() && !old_slices_to_delay.len().is_multiple_of(20) {
+            return Err(MetaError::Internal(
+                "Invalid delayed data length".to_string(),
+            ));
+        }
+
+        let delayed_slices = SliceDesc::decode_delayed_data(old_slices_to_delay)
+            .ok_or_else(|| MetaError::Internal("Invalid delayed data length".to_string()))?;
+        let delayed_ids: HashSet<u64> = delayed_slices
+            .iter()
+            .map(|(slice_id, _, _)| *slice_id)
+            .collect();
+        let new_slices = new_slices.to_vec();
+        let now = Self::now_secs();
+        let operation = "replace_slices_for_compact";
+
+        self.write_txn(operation, |store, txn| {
+            let delayed_slices = delayed_slices.clone();
+            let delayed_ids = delayed_ids.clone();
+            let new_slices = new_slices.clone();
+            Box::pin(async move {
+                let mut updated = store.txn_get_slices(txn, chunk_id, true, operation).await?;
+                if !delayed_ids.is_empty() {
+                    updated.retain(|slice| !delayed_ids.contains(&slice.slice_id));
+                }
+                updated.extend(new_slices);
+                store
+                    .txn_put_slices_or_delete(txn, chunk_id, &updated, operation)
+                    .await?;
+                store
+                    .txn_stage_delayed_slice_records(txn, chunk_id, &delayed_slices, now, operation)
+                    .await
+            })
+        })
+        .await
+    }
+
+    async fn replace_slices_for_compact_with_version(
+        &self,
+        chunk_id: u64,
+        new_slices: &[SliceDesc],
+        old_slices_to_delay: &[u8],
+        expected_slices: &[SliceDesc],
+    ) -> Result<(), MetaError> {
+        if !old_slices_to_delay.is_empty() && !old_slices_to_delay.len().is_multiple_of(20) {
+            return Err(MetaError::Internal(
+                "Invalid delayed data length".to_string(),
+            ));
+        }
+
+        let delayed_slices = SliceDesc::decode_delayed_data(old_slices_to_delay)
+            .ok_or_else(|| MetaError::Internal("Invalid delayed data length".to_string()))?;
+        let new_slices = new_slices.to_vec();
+        let expected_slices = expected_slices.to_vec();
+        let now = Self::now_secs();
+        let operation = "replace_slices_for_compact_with_version";
+
+        self.write_txn(operation, |store, txn| {
+            let delayed_slices = delayed_slices.clone();
+            let new_slices = new_slices.clone();
+            let expected_slices = expected_slices.clone();
+            Box::pin(async move {
+                let current = store.txn_get_slices(txn, chunk_id, true, operation).await?;
+                if current != expected_slices {
+                    return Err(MetaError::ContinueRetry(RetryReason::CompactConflict));
+                }
+
+                store
+                    .txn_put_slices_or_delete(txn, chunk_id, &new_slices, operation)
+                    .await?;
+
+                for slice in &new_slices {
+                    Self::txn_delete_raw(
+                        txn,
+                        store.uncommitted_pending_key(slice.slice_id),
+                        operation,
+                    )
+                    .await?;
+                    Self::txn_delete_raw(
+                        txn,
+                        store.uncommitted_orphan_key(slice.slice_id),
+                        operation,
+                    )
+                    .await?;
+                }
+
+                store
+                    .txn_stage_delayed_slice_records(txn, chunk_id, &delayed_slices, now, operation)
+                    .await
+            })
+        })
+        .await
+    }
+
+    async fn record_uncommitted_slice(
+        &self,
+        slice_id: u64,
+        chunk_id: u64,
+        size: u64,
+        operation_name: &str,
+    ) -> Result<i64, MetaError> {
+        let operation = "record_uncommitted_slice";
+        let operation_name = operation_name.to_string();
+        let now = Self::now_secs();
+
+        self.write_txn(operation, |store, txn| {
+            let operation_name = operation_name.clone();
+            Box::pin(async move {
+                let pending_key = store.uncommitted_pending_key(slice_id);
+                if let Some(existing) =
+                    Self::txn_get_raw(txn, pending_key.clone(), true, operation).await?
+                {
+                    return Ok(Self::decode_uncommitted_slice(&existing)?.id);
+                }
+
+                let orphan_key = store.uncommitted_orphan_key(slice_id);
+                let existing_orphan =
+                    Self::txn_get_raw(txn, orphan_key.clone(), true, operation).await?;
+
+                let id = match existing_orphan.as_deref() {
+                    Some(bytes) => Self::decode_uncommitted_slice(bytes)?.id,
+                    None => {
+                        let counter_key = store.counter_key(UNCOMMITTED_ID_COUNTER);
+                        let next_id = Self::txn_get_raw(txn, counter_key.clone(), true, operation)
+                            .await?
+                            .as_deref()
+                            .map(Self::decode_counter)
+                            .transpose()?
+                            .unwrap_or(0)
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                MetaError::Internal(
+                                    "TiKV uncommitted slice id overflow".to_string(),
+                                )
+                            })?;
+                        Self::txn_put_raw(txn, counter_key, Self::encode(&next_id)?, operation)
+                            .await?;
+                        next_id
+                    }
+                };
+
+                let record = StoredUncommittedSliceRecord {
+                    id,
+                    slice_id,
+                    chunk_id,
+                    size,
+                    created_at: now,
+                    operation: operation_name,
+                    status: "pending".to_string(),
+                };
+
+                Self::txn_delete_raw(txn, orphan_key, operation).await?;
+                Self::txn_put_raw(txn, pending_key, Self::encode(&record)?, operation).await?;
+                Ok(id)
+            })
+        })
+        .await
+    }
+
+    async fn confirm_slice_committed(&self, slice_id: u64) -> Result<(), MetaError> {
+        let operation = "confirm_slice_committed";
+        self.write_txn(operation, |store, txn| {
+            Box::pin(async move {
+                Self::txn_delete_raw(txn, store.uncommitted_pending_key(slice_id), operation)
+                    .await?;
+                Self::txn_delete_raw(txn, store.uncommitted_orphan_key(slice_id), operation).await
+            })
+        })
+        .await
+    }
+
+    async fn process_delayed_slices(
+        &self,
+        batch_size: usize,
+        max_age_secs: i64,
+    ) -> Result<Vec<(u64, u64, u64, i64)>, MetaError> {
+        if batch_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let cutoff_time = Self::now_secs() - max_age_secs;
+        let operation = "process_delayed_slices";
+        let mut records = self
+            .read_txn(operation, |store, txn| {
+                Box::pin(async move {
+                    let mut records = Vec::new();
+                    for prefix in [
+                        store.delayed_pending_prefix(),
+                        store.delayed_meta_deleted_prefix(),
+                    ] {
+                        let pairs = Self::txn_scan_prefix(txn, prefix, None, operation).await?;
+                        for pair in pairs {
+                            let record = Self::decode_delayed_slice(pair.value())?;
+                            if (record.status == "pending" || record.status == "meta_deleted")
+                                && record.created_at <= cutoff_time
+                            {
+                                records.push(record);
+                            }
+                        }
+                    }
+                    records.sort_by_key(|record| record.id);
+                    records.truncate(batch_size);
+                    Ok(records)
+                })
+            })
+            .await?;
+
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut ready = Vec::new();
+        for record in records.drain(..) {
+            if record.status == "meta_deleted" {
+                ready.push((record.slice_id, record.offset, record.size, record.id));
+                continue;
+            }
+
+            let processed = self
+                .write_txn(operation, |store, txn| {
+                    let record = record.clone();
+                    Box::pin(async move {
+                        let pending_key = store.delayed_pending_key(record.id);
+                        let meta_deleted_key = store.delayed_meta_deleted_key(record.id);
+                        let Some(current_bytes) =
+                            Self::txn_get_raw(txn, pending_key.clone(), true, operation).await?
+                        else {
+                            return Ok(None);
+                        };
+                        let current = Self::decode_delayed_slice(&current_bytes)?;
+                        if current.status != "pending" || current.created_at > cutoff_time {
+                            return Ok(None);
+                        }
+
+                        let mut slices = store
+                            .txn_get_slices(txn, current.chunk_id, true, operation)
+                            .await?;
+                        slices.retain(|slice| slice.slice_id != current.slice_id);
+                        store
+                            .txn_put_slices_or_delete(txn, current.chunk_id, &slices, operation)
+                            .await?;
+
+                        let mut updated = current.clone();
+                        updated.status = "meta_deleted".to_string();
+                        Self::txn_delete_raw(txn, pending_key, operation).await?;
+                        Self::txn_put_raw(
+                            txn,
+                            meta_deleted_key,
+                            Self::encode(&updated)?,
+                            operation,
+                        )
+                        .await?;
+                        Ok(Some((
+                            current.slice_id,
+                            current.offset,
+                            current.size,
+                            current.id,
+                        )))
+                    })
+                })
+                .await?;
+
+            if let Some(entry) = processed {
+                ready.push(entry);
+            }
+        }
+
+        Ok(ready)
+    }
+
+    async fn confirm_delayed_deleted(&self, delayed_ids: &[i64]) -> Result<(), MetaError> {
+        if delayed_ids.is_empty() {
+            return Ok(());
+        }
+
+        let operation = "confirm_delayed_deleted";
+        let delayed_ids = delayed_ids.to_vec();
+        self.write_txn(operation, |store, txn| {
+            let delayed_ids = delayed_ids.clone();
+            Box::pin(async move {
+                for delayed_id in delayed_ids {
+                    Self::txn_delete_raw(txn, store.delayed_pending_key(delayed_id), operation)
+                        .await?;
+                    Self::txn_delete_raw(
+                        txn,
+                        store.delayed_meta_deleted_key(delayed_id),
+                        operation,
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    async fn cleanup_orphan_uncommitted_slices(
+        &self,
+        max_age_secs: i64,
+        batch_size: usize,
+    ) -> Result<Vec<(u64, u64)>, MetaError> {
+        if batch_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let cutoff_time = Self::now_secs() - max_age_secs;
+        let operation = "cleanup_orphan_uncommitted_slices";
+        let (pending_records, orphan_records) = self
+            .read_txn(operation, |store, txn| {
+                Box::pin(async move {
+                    let mut pending_records = Vec::new();
+                    let pending_pairs = Self::txn_scan_prefix(
+                        txn,
+                        store.uncommitted_pending_prefix(),
+                        None,
+                        operation,
+                    )
+                    .await?;
+                    for pair in pending_pairs {
+                        let record = Self::decode_uncommitted_slice(pair.value())?;
+                        if record.status == "pending" && record.created_at < cutoff_time {
+                            pending_records.push(record);
+                        }
+                    }
+                    pending_records.sort_by_key(|record| record.id);
+                    pending_records.truncate(batch_size);
+
+                    let mut orphan_records = Vec::new();
+                    let orphan_pairs = Self::txn_scan_prefix(
+                        txn,
+                        store.uncommitted_orphan_prefix(),
+                        None,
+                        operation,
+                    )
+                    .await?;
+                    for pair in orphan_pairs {
+                        let record = Self::decode_uncommitted_slice(pair.value())?;
+                        if record.status == "orphan" {
+                            orphan_records.push(record);
+                        }
+                    }
+                    orphan_records.sort_by_key(|record| record.id);
+                    orphan_records.truncate(batch_size);
+
+                    Ok((pending_records, orphan_records))
+                })
+            })
+            .await?;
+
+        if pending_records.is_empty() && orphan_records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut cleaned = Vec::new();
+        let mut seen = HashSet::new();
+        for record in pending_records {
+            let transition = self
+                .write_txn(operation, |store, txn| {
+                    let record = record.clone();
+                    Box::pin(async move {
+                        let pending_key = store.uncommitted_pending_key(record.slice_id);
+                        let orphan_key = store.uncommitted_orphan_key(record.slice_id);
+                        let Some(current_bytes) =
+                            Self::txn_get_raw(txn, pending_key.clone(), true, operation).await?
+                        else {
+                            return Ok(None);
+                        };
+                        let current = Self::decode_uncommitted_slice(&current_bytes)?;
+                        if current.status != "pending" || current.created_at >= cutoff_time {
+                            return Ok(None);
+                        }
+
+                        let slices = store
+                            .txn_get_slices(txn, current.chunk_id, true, operation)
+                            .await?;
+                        if slices
+                            .iter()
+                            .any(|slice| slice.slice_id == current.slice_id)
+                        {
+                            Self::txn_delete_raw(txn, pending_key, operation).await?;
+                            return Ok(None);
+                        }
+
+                        let mut orphan = current.clone();
+                        orphan.status = "orphan".to_string();
+                        Self::txn_delete_raw(txn, pending_key, operation).await?;
+                        Self::txn_put_raw(txn, orphan_key, Self::encode(&orphan)?, operation)
+                            .await?;
+                        Ok(Some((current.slice_id, current.size)))
+                    })
+                })
+                .await?;
+
+            if let Some((slice_id, size)) = transition
+                && seen.insert(slice_id)
+            {
+                cleaned.push((slice_id, size));
+            }
+        }
+
+        for record in orphan_records {
+            if seen.insert(record.slice_id) {
+                cleaned.push((record.slice_id, record.size));
+            }
+        }
+
+        Ok(cleaned)
+    }
+
+    async fn delete_uncommitted_slices(&self, slice_ids: &[u64]) -> Result<(), MetaError> {
+        if slice_ids.is_empty() {
+            return Ok(());
+        }
+
+        let operation = "delete_uncommitted_slices";
+        let slice_ids = slice_ids.to_vec();
+        self.write_txn(operation, |store, txn| {
+            let slice_ids = slice_ids.clone();
+            Box::pin(async move {
+                for slice_id in slice_ids {
+                    Self::txn_delete_raw(txn, store.uncommitted_pending_key(slice_id), operation)
+                        .await?;
+                    Self::txn_delete_raw(txn, store.uncommitted_orphan_key(slice_id), operation)
+                        .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
+
     async fn append_slice(&self, chunk_id: u64, slice: SliceDesc) -> Result<(), MetaError> {
         let operation = "append_slice";
         self.write_txn(operation, |store, txn| {
             Box::pin(async move {
-                let chunk_key = store.chunk_key(chunk_id);
-                let mut slices = Self::txn_get_raw(txn, chunk_key.clone(), true, operation)
-                    .await?
-                    .as_deref()
-                    .map(Self::decode_slices)
-                    .transpose()?
-                    .unwrap_or_default();
+                let mut slices = store.txn_get_slices(txn, chunk_id, true, operation).await?;
                 slices.push(slice);
-                Self::txn_put_raw(txn, chunk_key, Self::encode(&slices)?, operation).await
+                store
+                    .txn_put_slices_or_delete(txn, chunk_id, &slices, operation)
+                    .await
             })
         })
         .await
@@ -1916,15 +2503,11 @@ impl MetaStore for TiKvMetaStore {
                     ));
                 }
 
-                let chunk_key = store.chunk_key(chunk_id);
-                let mut slices = Self::txn_get_raw(txn, chunk_key.clone(), true, operation)
-                    .await?
-                    .as_deref()
-                    .map(Self::decode_slices)
-                    .transpose()?
-                    .unwrap_or_default();
+                let mut slices = store.txn_get_slices(txn, chunk_id, true, operation).await?;
                 slices.push(slice);
-                Self::txn_put_raw(txn, chunk_key, Self::encode(&slices)?, operation).await?;
+                store
+                    .txn_put_slices_or_delete(txn, chunk_id, &slices, operation)
+                    .await?;
 
                 if new_size > node.size {
                     let now = Self::now();

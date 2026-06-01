@@ -156,6 +156,40 @@ fn link_parent_values_round_trip() {
 }
 
 #[test]
+fn gc_record_values_round_trip() {
+    let delayed = StoredDelayedSliceRecord {
+        id: 1,
+        slice_id: 101,
+        chunk_id: 11,
+        offset: 64,
+        size: 4096,
+        created_at: 1000,
+        reason: "compact".to_string(),
+        status: "pending".to_string(),
+    };
+    let encoded = TiKvMetaStore::encode(&delayed).unwrap();
+    assert_eq!(
+        TiKvMetaStore::decode_delayed_slice(&encoded).unwrap(),
+        delayed
+    );
+
+    let uncommitted = StoredUncommittedSliceRecord {
+        id: 2,
+        slice_id: 202,
+        chunk_id: 22,
+        size: 2048,
+        created_at: 1001,
+        operation: "write".to_string(),
+        status: "pending".to_string(),
+    };
+    let encoded = TiKvMetaStore::encode(&uncommitted).unwrap();
+    assert_eq!(
+        TiKvMetaStore::decode_uncommitted_slice(&encoded).unwrap(),
+        uncommitted
+    );
+}
+
+#[test]
 fn nlink_delta_saturates() {
     assert_eq!(apply_nlink_delta(2, -1), 1);
     assert_eq!(apply_nlink_delta(0, -1), 0);
@@ -330,6 +364,74 @@ async fn tikv_transactional_file_data_schema() {
 
     store.set_file_size(file, 64).await.unwrap();
     assert_eq!(store.stat(file).await.unwrap().unwrap().size, 64);
+}
+
+#[tokio::test]
+#[ignore = "requires a running TiKV/PD cluster; set SLAYERFS_TIKV_PD_ENDPOINTS"]
+async fn tikv_compaction_gc_workflow() {
+    let store = TiKvMetaStore::from_config(integration_config("gc"))
+        .await
+        .expect("tikv store should connect");
+    store.initialize().await.unwrap();
+
+    let initial = SliceDesc {
+        slice_id: 101,
+        chunk_id: 11,
+        offset: 0,
+        length: 4096,
+    };
+    let replacement = SliceDesc {
+        slice_id: 102,
+        chunk_id: 11,
+        offset: 0,
+        length: 2048,
+    };
+    store.append_slice(11, initial).await.unwrap();
+
+    let delayed = SliceDesc::encode_delayed_data(&[initial], &[initial.slice_id]);
+    store
+        .replace_slices_for_compact(11, &[replacement], &delayed)
+        .await
+        .unwrap();
+    assert_eq!(store.get_slices(11).await.unwrap(), vec![replacement]);
+
+    let pending = store.process_delayed_slices(10, -1).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0, initial.slice_id);
+    assert_eq!(pending[0].1, initial.offset);
+    assert_eq!(pending[0].2, initial.length);
+    store
+        .confirm_delayed_deleted(&[pending[0].3])
+        .await
+        .unwrap();
+    assert!(
+        store
+            .process_delayed_slices(10, -1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let uncommitted_id = store
+        .record_uncommitted_slice(9001, 11, 8192, "compact_heavy")
+        .await
+        .unwrap();
+    assert!(uncommitted_id > 0);
+    assert_eq!(
+        store
+            .cleanup_orphan_uncommitted_slices(-1, 10)
+            .await
+            .unwrap(),
+        vec![(9001, 8192)]
+    );
+    store.delete_uncommitted_slices(&[9001]).await.unwrap();
+    assert!(
+        store
+            .cleanup_orphan_uncommitted_slices(-1, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
