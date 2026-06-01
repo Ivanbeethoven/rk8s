@@ -265,6 +265,10 @@ impl DatabaseMetaStore {
                 "Redis backend not supported by DatabaseMetaStore. Use RedisMetaStore instead."
                     .to_string(),
             )),
+            DatabaseType::TiKv { .. } => Err(MetaError::Config(
+                "TiKV backend not supported by DatabaseMetaStore. Use TiKvMetaStore instead."
+                    .to_string(),
+            )),
         }
     }
 

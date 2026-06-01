@@ -42,8 +42,9 @@ pub use crate::meta::store::{
     DirEntry as VfsDirEntry, FileAttr as VfsFileAttr, FileType as VfsFileType, SetAttrFlags,
     SetAttrRequest, StatFsSnapshot,
 };
-pub use crate::meta::stores::{DatabaseMetaStore, EtcdMetaStore, RedisMetaStore};
+pub use crate::meta::stores::{DatabaseMetaStore, EtcdMetaStore, RedisMetaStore, TiKvMetaStore};
 pub use crate::meta::{
     MetaHandle, MetaStore, create_meta_store_from_url, create_redis_meta_store_from_url,
+    create_tikv_meta_store_from_pd_endpoints,
 };
 pub use crate::vfs::fs::{RenameFlags, VFS};

@@ -47,10 +47,23 @@ pub enum DatabaseType {
     Etcd { urls: Vec<String> },
     #[serde(rename = "redis")]
     Redis { url: String },
+    #[serde(rename = "tikv")]
+    TiKv {
+        /// TiKV Placement Driver endpoints used by the future transactional client.
+        #[serde(default)]
+        pd_endpoints: Vec<String>,
+        /// Logical key prefix for isolating SlayerFS metadata inside a TiKV cluster.
+        #[serde(default = "default_tikv_namespace")]
+        namespace: String,
+    },
 }
 
 fn default_sqlite_url() -> String {
     "sqlite:///tmp/slayerfs/metadata.db".to_string()
+}
+
+pub fn default_tikv_namespace() -> String {
+    "slayerfs".to_string()
 }
 
 impl Config {
@@ -105,6 +118,7 @@ impl DatabaseConfig {
             DatabaseType::Postgres { .. } => "postgres",
             DatabaseType::Etcd { .. } => "etcd",
             DatabaseType::Redis { .. } => "redis",
+            DatabaseType::TiKv { .. } => "tikv",
         }
     }
 }
@@ -247,6 +261,7 @@ impl CacheTtl {
             "postgres" => Self::for_postgres(),
             "etcd" => Self::for_etcd(),
             "redis" => Self::for_redis(),
+            "tikv" => Self::for_tikv(),
             _ => Self::for_sqlite(),
         }
     }
@@ -280,6 +295,14 @@ impl CacheTtl {
         Self {
             inode_ttl: Duration::from_millis(500),
             path_ttl: Duration::from_millis(500),
+        }
+    }
+
+    /// TiKV backend defaults (distributed KV latency expectations).
+    pub fn for_tikv() -> Self {
+        Self {
+            inode_ttl: Duration::from_secs(1),
+            path_ttl: Duration::from_secs(1),
         }
     }
 
@@ -379,6 +402,7 @@ impl DatabaseType {
             DatabaseType::Postgres { .. } => "postgres",
             DatabaseType::Etcd { .. } => "etcd",
             DatabaseType::Redis { .. } => "redis",
+            DatabaseType::TiKv { .. } => "tikv",
         }
     }
 }

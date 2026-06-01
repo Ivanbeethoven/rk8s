@@ -55,7 +55,7 @@ use crate::meta::config::{
 };
 use crate::meta::factory::MetaStoreFactory;
 use crate::meta::layer::MetaLayer;
-use crate::meta::stores::{DatabaseMetaStore, EtcdMetaStore, RedisMetaStore};
+use crate::meta::stores::{DatabaseMetaStore, EtcdMetaStore, RedisMetaStore, TiKvMetaStore};
 use crate::vfs::fs::VFS;
 
 #[tokio::main]
@@ -700,6 +700,28 @@ async fn create_meta_store(args: &MountConfig) -> anyhow::Result<Arc<dyn MetaSto
                 compact,
             };
             let handle = MetaStoreFactory::<RedisMetaStore>::create_from_config(config).await?;
+            Ok(handle.store() as Arc<dyn MetaStore>)
+        }
+        MetaBackendKind::TiKv => {
+            if args.meta_tikv_pd_endpoints.is_empty() {
+                anyhow::bail!("tikv PD endpoints must be set when meta backend is tikv");
+            }
+
+            let client = ClientOptions::default();
+            let compact = CompactConfig::default();
+
+            let config = Config {
+                database: DatabaseConfig {
+                    db_config: DatabaseType::TiKv {
+                        pd_endpoints: args.meta_tikv_pd_endpoints.clone(),
+                        namespace: args.meta_tikv_namespace.clone(),
+                    },
+                },
+                cache: MetaCacheConfig::default(),
+                client,
+                compact,
+            };
+            let handle = MetaStoreFactory::<TiKvMetaStore>::create_from_config(config).await?;
             Ok(handle.store() as Arc<dyn MetaStore>)
         }
     }

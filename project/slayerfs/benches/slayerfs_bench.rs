@@ -18,7 +18,8 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use slayerfs::{
     BlockKey, BlockStore, CacheConfig, ChunkLayout, ClientOptions, Config, DatabaseConfig,
     DatabaseMetaStore, DatabaseType, EtcdMetaStore, LocalFsBackend, MetaClient, MetaStore,
-    MetaStoreFactory, ObjectBlockStore, ObjectClient, RedisMetaStore, S3Backend, S3Config, VFS,
+    MetaStoreFactory, ObjectBlockStore, ObjectClient, RedisMetaStore, S3Backend, S3Config,
+    TiKvMetaStore, VFS,
 };
 
 const MB: usize = 1024 * 1024;
@@ -89,6 +90,14 @@ struct BenchArgs {
     meta_url: String,
     #[arg(long, env = "SLAYERFS_BENCH_META_ETCD_URLS")]
     meta_etcd_urls: Option<String>,
+    #[arg(long, env = "SLAYERFS_BENCH_META_TIKV_PD_ENDPOINTS")]
+    meta_tikv_pd_endpoints: Option<String>,
+    #[arg(
+        long,
+        env = "SLAYERFS_BENCH_META_TIKV_NAMESPACE",
+        default_value = "slayerfs"
+    )]
+    meta_tikv_namespace: String,
     #[arg(long, env = "SLAYERFS_BENCH_DATA_DIR")]
     data_dir: Option<PathBuf>,
     #[arg(long, env = "SLAYERFS_BENCH_BACKEND", value_enum, default_value_t = BackendKind::Local)]
@@ -118,6 +127,8 @@ enum MetaBackendKind {
     Sqlx,
     Redis,
     Etcd,
+    #[value(name = "tikv", alias = "ti-kv")]
+    TiKv,
 }
 
 #[derive(Clone)]
@@ -151,9 +162,19 @@ struct S3BackendOpts {
 
 #[derive(Clone)]
 enum MetaBackend {
-    Sqlx { url: String },
-    Redis { url: String },
-    Etcd { urls: Vec<String> },
+    Sqlx {
+        url: String,
+    },
+    Redis {
+        url: String,
+    },
+    Etcd {
+        urls: Vec<String>,
+    },
+    TiKv {
+        pd_endpoints: Vec<String>,
+        namespace: String,
+    },
 }
 
 impl BenchConfig {
@@ -211,6 +232,22 @@ impl BenchConfig {
                     panic!("SLAYERFS_BENCH_META_ETCD_URLS must be set when meta backend is etcd");
                 }
                 MetaBackend::Etcd { urls }
+            }
+            MetaBackendKind::TiKv => {
+                let pd_endpoints = args
+                    .meta_tikv_pd_endpoints
+                    .as_deref()
+                    .map(parse_csv_urls)
+                    .unwrap_or_default();
+                if pd_endpoints.is_empty() {
+                    panic!(
+                        "SLAYERFS_BENCH_META_TIKV_PD_ENDPOINTS must be set when meta backend is tikv"
+                    );
+                }
+                MetaBackend::TiKv {
+                    pd_endpoints,
+                    namespace: args.meta_tikv_namespace,
+                }
             }
         };
 
@@ -451,6 +488,30 @@ async fn create_meta_store(cfg: &BenchConfig) -> Result<Arc<dyn MetaStore>> {
             let handle = MetaStoreFactory::<EtcdMetaStore>::create_from_config(config)
                 .await
                 .context("create etcd meta store")?;
+            Ok(handle.store() as Arc<dyn MetaStore>)
+        }
+        MetaBackend::TiKv {
+            pd_endpoints,
+            namespace,
+        } => {
+            let client = ClientOptions {
+                no_background_jobs: true,
+                ..ClientOptions::default()
+            };
+            let config = Config {
+                database: DatabaseConfig {
+                    db_config: DatabaseType::TiKv {
+                        pd_endpoints: pd_endpoints.clone(),
+                        namespace: namespace.clone(),
+                    },
+                },
+                cache: CacheConfig::default(),
+                client,
+                compact: Default::default(),
+            };
+            let handle = MetaStoreFactory::<TiKvMetaStore>::create_from_config(config)
+                .await
+                .context("create tikv meta store")?;
             Ok(handle.store() as Arc<dyn MetaStore>)
         }
     }

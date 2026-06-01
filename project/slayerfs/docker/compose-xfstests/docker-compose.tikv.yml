@@ -1,0 +1,178 @@
+services:
+  pd:
+    image: pingcap/pd:v8.5.0
+    command:
+      - /pd-server
+      - --name=pd
+      - --data-dir=/data/pd
+      - --client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://pd:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-peer-urls=http://pd:2380
+      - --initial-cluster=pd=http://pd:2380
+      - --log-level=warn
+    volumes:
+      - pd-data-tikv:/data/pd
+    networks:
+      - slayerfs-xfstests
+
+  tikv:
+    image: pingcap/tikv:v8.5.0
+    depends_on:
+      pd:
+        condition: service_started
+    command:
+      - /tikv-server
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv:20160
+      - --status-addr=0.0.0.0:20180
+      - --pd=pd:2379
+      - --data-dir=/data/tikv
+      - --log-level=warn
+    volumes:
+      - tikv-data:/data/tikv
+    networks:
+      - slayerfs-xfstests
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  tikv-ready:
+    image: curlimages/curl:8.10.1
+    depends_on:
+      pd:
+        condition: service_started
+      tikv:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        timeout 180 sh -ec '
+          while true; do
+            body="$(curl -fsS http://pd:2379/pd/api/v1/stores 2>/dev/null || true)"
+            echo "$body" | grep -q "\"state_name\":\"Up\"" && exit 0
+            sleep 2
+          done
+        '
+    networks:
+      - slayerfs-xfstests
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    expose:
+      - "9000"
+      - "9001"
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      RUSTFS_CONSOLE_ENABLE: ${RUSTFS_CONSOLE_ENABLE:-true}
+      RUSTFS_SERVER_DOMAINS: ${RUSTFS_SERVER_DOMAINS:-rustfs}
+    command:
+      - --address
+      - :9000
+      - --console-enable
+      - --server-domains
+      - ${RUSTFS_SERVER_DOMAINS:-rustfs}
+      - --access-key
+      - ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      - --secret-key
+      - ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - /data
+    volumes:
+      - rustfs-data-tikv:/data
+    networks:
+      - slayerfs-xfstests
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  rustfs-init:
+    image: amazon/aws-cli:latest
+    depends_on:
+      rustfs:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mkdir -p /root/.aws
+        printf '[default]\ns3 =\n  addressing_style = path\n' > /root/.aws/config
+        timeout 180 sh -ec '
+          while true; do
+            aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket ${SLAYERFS_S3_BUCKET:-slayerfs-data} >/dev/null 2>&1 && exit 0
+            aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket ${SLAYERFS_S3_BUCKET:-slayerfs-data} >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+        '
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-rustfsadmin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-rustfsadmin}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_EC2_METADATA_DISABLED: ${AWS_EC2_METADATA_DISABLED:-true}
+    networks:
+      - slayerfs-xfstests
+
+  xfstests:
+    image: slayerfs-xfstests:local
+    build:
+      context: ../../..
+      dockerfile: slayerfs/docker/compose-xfstests/Dockerfile
+    depends_on:
+      tikv-ready:
+        condition: service_completed_successfully
+      rustfs-init:
+        condition: service_completed_successfully
+    environment:
+      SLAYERFS_META_BACKEND: tikv
+      SLAYERFS_META_TIKV_PD_ENDPOINTS: pd:2379
+      SLAYERFS_META_TIKV_NAMESPACE: ${SLAYERFS_META_TIKV_NAMESPACE:-slayerfs}
+      SLAYERFS_DATA_BACKEND: ${SLAYERFS_DATA_BACKEND:-s3}
+      SLAYERFS_DATA_DIR: /var/lib/slayerfs/data
+      SLAYERFS_S3_BUCKET: ${SLAYERFS_S3_BUCKET:-slayerfs-data}
+      SLAYERFS_S3_ENDPOINT: ${SLAYERFS_S3_ENDPOINT:-http://rustfs:9000}
+      SLAYERFS_S3_REGION: ${SLAYERFS_S3_REGION:-us-east-1}
+      SLAYERFS_S3_FORCE_PATH_STYLE: ${SLAYERFS_S3_FORCE_PATH_STYLE:-true}
+      SLAYERFS_CONFIG_PATH: /run/slayerfs/config.yaml
+      SLAYERFS_LOG_FILE: /artifacts/slayerfs.log
+      SLAYERFS_FUSE_OP_LOG: ${SLAYERFS_FUSE_OP_LOG:-0}
+      SLAYERFS_MOUNT_WAIT_SECS: ${SLAYERFS_MOUNT_WAIT_SECS:-60}
+      SLAYERFS_PRE_MOUNT_WAIT_SECS: ${SLAYERFS_PRE_MOUNT_WAIT_SECS:-10}
+      SLAYERFS_MOUNT_READY_DELAY_SECS: ${SLAYERFS_MOUNT_READY_DELAY_SECS:-1}
+      SLAYERFS_FUSE_LOG_FILE: /artifacts/slayerfs_fuse_ops.log
+      SLAYERFS_ARTIFACT_DIR: ${SLAYERFS_ARTIFACT_DIR:-}
+      SLAYERFS_ARTIFACT_ROOT: /artifacts
+      XFSTESTS_CASES: ${XFSTESTS_CASES:-}
+      XFSTESTS_SKIP_CASES: ${XFSTESTS_SKIP_CASES:-0}
+      XFSTESTS_CHECK_ARGS: ${XFSTESTS_CHECK_ARGS:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-rustfsadmin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-rustfsadmin}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_EC2_METADATA_DISABLED: ${AWS_EC2_METADATA_DISABLED:-true}
+    privileged: true
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
+    volumes:
+      - ./artifacts:/artifacts
+      - ./run_xfstests_in_container.sh:/usr/local/bin/run_xfstests_in_container.sh:ro
+      - slayerfs-state-tikv:/var/lib/slayerfs
+    networks:
+      - slayerfs-xfstests
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+networks:
+  slayerfs-xfstests:
+    driver: bridge
+
+volumes:
+  slayerfs-state-tikv:
+  pd-data-tikv:
+  tikv-data:
+  rustfs-data-tikv:
