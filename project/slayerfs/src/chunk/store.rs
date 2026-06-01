@@ -1,7 +1,6 @@
 //! Storage backends: asynchronous block-level IO traits and in-memory implementations.
 
 use crate::chunk::bandwidth::BandwidthLimiter;
-// use crate::vfs::stats::FsStats;
 use crate::chunk::compress::{Compression, compress, decompress};
 use crate::chunk::page_cache::{PageKey, ReadPageCache};
 use crate::chunk::singleflight::SingleFlight;
@@ -19,8 +18,13 @@ use hex::encode;
 use moka::{Entry, ops::compute::Op};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap, fs, io::SeekFrom, path::PathBuf, sync::Arc, sync::LazyLock,
-    sync::atomic::AtomicU64,
+    collections::HashMap,
+    fs,
+    io::SeekFrom,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, LazyLock},
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -77,9 +81,69 @@ pub trait BlockStore {
     fn cache_counters(&self) -> (Option<Arc<AtomicU64>>, Option<Arc<AtomicU64>>) {
         (None, None)
     }
+
+    /// Returns object-store request counters for diagnostics.
+    /// Default returns None; ObjectBlockStore overrides.
+    fn object_store_metrics(&self) -> Option<Arc<ObjectStoreMetrics>> {
+        None
+    }
 }
 
 pub type BlockKey = (u64 /*slice_id*/, u32 /*block_index*/);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObjectStoreStatsSnapshot {
+    pub get_ops: u64,
+    pub get_bytes: u64,
+    pub get_lat_us: u64,
+    pub put_ops: u64,
+    pub put_bytes: u64,
+    pub put_lat_us: u64,
+    pub del_ops: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct ObjectStoreMetrics {
+    get_ops: AtomicU64,
+    get_bytes: AtomicU64,
+    get_lat_us: AtomicU64,
+    put_ops: AtomicU64,
+    put_bytes: AtomicU64,
+    put_lat_us: AtomicU64,
+    del_ops: AtomicU64,
+}
+
+impl ObjectStoreMetrics {
+    pub fn snapshot(&self) -> ObjectStoreStatsSnapshot {
+        ObjectStoreStatsSnapshot {
+            get_ops: self.get_ops.load(Ordering::Relaxed),
+            get_bytes: self.get_bytes.load(Ordering::Relaxed),
+            get_lat_us: self.get_lat_us.load(Ordering::Relaxed),
+            put_ops: self.put_ops.load(Ordering::Relaxed),
+            put_bytes: self.put_bytes.load(Ordering::Relaxed),
+            put_lat_us: self.put_lat_us.load(Ordering::Relaxed),
+            del_ops: self.del_ops.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_get(&self, bytes: u64, duration: Duration) {
+        self.get_ops.fetch_add(1, Ordering::Relaxed);
+        self.get_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.get_lat_us
+            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    fn record_put(&self, bytes: u64, duration: Duration) {
+        self.put_ops.fetch_add(1, Ordering::Relaxed);
+        self.put_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.put_lat_us
+            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    fn record_delete(&self) {
+        self.del_ops.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Simple in-memory implementation for local development/testing.
 #[derive(Default)]
@@ -165,6 +229,8 @@ pub struct ObjectBlockStore<B: ObjectBackend> {
     config: BlockStoreConfig,
     /// Network bandwidth rate limiter for uploads/downloads
     bandwidth: BandwidthLimiter,
+    /// Object store request counters exposed through VFS `.stats`.
+    object_metrics: Arc<ObjectStoreMetrics>,
 }
 
 /// Configuration for ObjectBlockStore read strategy
@@ -241,6 +307,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             range_prefetch_limit: Arc::new(Semaphore::new(8)),
             config,
             bandwidth: BandwidthLimiter::unlimited(),
+            object_metrics: Arc::new(ObjectStoreMetrics::default()),
         }
     }
 
@@ -286,6 +353,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             range_prefetch_limit: Arc::new(Semaphore::new(8)),
             config: store_config,
             bandwidth: BandwidthLimiter::unlimited(),
+            object_metrics: Arc::new(ObjectStoreMetrics::default()),
         })
     }
 
@@ -310,6 +378,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             range_prefetch_limit: Arc::new(Semaphore::new(8)),
             config: store_config,
             bandwidth: BandwidthLimiter::unlimited(),
+            object_metrics: Arc::new(ObjectStoreMetrics::default()),
         })
     }
 
@@ -381,6 +450,7 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
         let bandwidth = self.bandwidth.clone();
         let compression = self.config.compression;
         let block_size = self.config.block_size;
+        let object_metrics = self.object_metrics.clone();
 
         tokio::spawn(async move {
             if cache.get(&key_str).await.is_some() {
@@ -397,12 +467,19 @@ impl<B: ObjectBackend + 'static> ObjectBlockStore<B> {
             let block_data = read_flight
                 .execute(key, || async move {
                     bandwidth.acquire_download(block_size).await;
+                    let started = Instant::now();
                     let raw = client.get_object(&key_str).await.map_err(|e| {
                         anyhow::anyhow!("object store get failed: {key_str}, {e:?}")
                     })?;
                     let raw_bytes = match raw {
-                        Some(data) => data,
-                        None => return Ok(Bytes::new()), // Block doesn't exist (sparse)
+                        Some(data) => {
+                            object_metrics.record_get(data.len() as u64, started.elapsed());
+                            data
+                        }
+                        None => {
+                            object_metrics.record_get(0, started.elapsed());
+                            return Ok(Bytes::new());
+                        }
                     };
                     let decompressed = if !matches!(compression, Compression::None) {
                         decompress(&raw_bytes)
@@ -466,10 +543,14 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         };
         // Rate limit upload bandwidth
         self.bandwidth.acquire_upload(upload_bytes.len()).await;
+        let upload_len = upload_bytes.len() as u64;
+        let started = Instant::now();
         self.client
             .put_object_vectored(&key_str, vec![upload_bytes])
             .await
             .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
+        self.object_metrics
+            .record_put(upload_len, started.elapsed());
 
         self.populate_write_cache_after_upload(key_str, full_block)
             .await;
@@ -511,10 +592,14 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         };
         // Rate limit upload bandwidth
         self.bandwidth.acquire_upload(upload_bytes.len()).await;
+        let upload_len = upload_bytes.len() as u64;
+        let started = Instant::now();
         self.client
             .put_object_vectored(&key_str, vec![upload_bytes])
             .await
             .map_err(|e| anyhow::anyhow!("object store put failed: {key_str}, {e:?}"))?;
+        self.object_metrics
+            .record_put(upload_len, started.elapsed());
 
         self.populate_write_cache_after_upload(key_str, full_block)
             .await;
@@ -581,6 +666,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
 
             let client = &self.client;
             let page_cache = &self.page_cache;
+            let object_metrics = self.object_metrics.clone();
             let mut pos: usize = 0;
             let mut total_read: usize = 0;
             let mut range_missed = false;
@@ -600,6 +686,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                     let range_offset = page_start as u64;
                     let range_len = page_end - page_start;
                     let page_key_str = key_str.clone();
+                    let page_object_metrics = object_metrics.clone();
                     let page = self
                         .page_flight
                         .execute(cache_key, || async move {
@@ -609,6 +696,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
 
                             let mut page_buf = vec![0u8; range_len];
                             self.bandwidth.acquire_download(range_len).await;
+                            let started = Instant::now();
                             let read_len = client
                                 .get_object_range(&page_key_str, range_offset, &mut page_buf)
                                 .await
@@ -617,6 +705,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                                         "object store range read failed: {page_key_str}, {e:?}"
                                     )
                                 })?;
+                            page_object_metrics.record_get(read_len as u64, started.elapsed());
                             page_buf.truncate(read_len);
                             let page_bytes = Bytes::from(page_buf);
                             page_cache.insert(cache_key, page_bytes.clone()).await;
@@ -660,6 +749,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
         tracing::Span::current().record("strategy", "coalesced_full");
         let client = &self.client;
         let compression = self.config.compression;
+        let object_metrics = self.object_metrics.clone();
 
         let block_data =
             self.read_flight
@@ -668,12 +758,19 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                     self.bandwidth
                         .acquire_download(self.config.block_size)
                         .await;
+                    let started = Instant::now();
                     let raw = client.get_object(&key_str).await.map_err(|e| {
                         anyhow::anyhow!("object store get failed: {key_str}, {e:?}")
                     })?;
                     let raw_bytes = match raw {
-                        Some(data) => data,
-                        None => return Ok(Bytes::new()), // Block doesn't exist (sparse)
+                        Some(data) => {
+                            object_metrics.record_get(data.len() as u64, started.elapsed());
+                            data
+                        }
+                        None => {
+                            object_metrics.record_get(0, started.elapsed());
+                            return Ok(Bytes::new());
+                        }
                     };
                     // Decompress if compression is enabled (auto-detects from header)
                     let decompressed = if !matches!(compression, Compression::None) {
@@ -723,6 +820,7 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
                 .delete_object(&key_str)
                 .await
                 .map_err(|e| anyhow::anyhow!("object store delete failed: {key_str}, {e:?}"))?;
+            self.object_metrics.record_delete();
         }
         Ok(())
     }
@@ -739,6 +837,10 @@ impl<B: ObjectBackend + Send + Sync + 'static> BlockStore for ObjectBlockStore<B
             Some(self.block_cache.cache_hits.clone()),
             Some(self.block_cache.cache_misses.clone()),
         )
+    }
+
+    fn object_store_metrics(&self) -> Option<Arc<ObjectStoreMetrics>> {
+        Some(self.object_metrics.clone())
     }
 }
 
@@ -1218,6 +1320,112 @@ mod tests {
             store.block_cache.get(&"chunks/123/0".to_string()).await,
             Some(data.into())
         );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_object_store_metrics_record_backend_ops() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::cadapter::client::{ObjectBackend, ObjectClient};
+        use async_trait::async_trait;
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+        };
+
+        #[derive(Clone, Default)]
+        struct MockBackend {
+            data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        }
+
+        #[async_trait]
+        impl ObjectBackend for MockBackend {
+            async fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+                self.data
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), data.to_vec());
+                Ok(())
+            }
+
+            async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(self.data.lock().unwrap().get(key).cloned())
+            }
+
+            async fn get_object_range(
+                &self,
+                key: &str,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<usize> {
+                if let Some(data) = self.data.lock().unwrap().get(key) {
+                    let offset = offset as usize;
+                    let end = (offset + buf.len()).min(data.len());
+                    if offset < data.len() {
+                        let copy_len = end - offset;
+                        buf[..copy_len].copy_from_slice(&data[offset..end]);
+                        return Ok(copy_len);
+                    }
+                }
+                Ok(0)
+            }
+
+            async fn get_etag(&self, _key: &str) -> anyhow::Result<String> {
+                Ok("test_etag".to_string())
+            }
+
+            async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+                self.data.lock().unwrap().remove(key);
+                Ok(())
+            }
+        }
+
+        let backend = MockBackend::default();
+        let cache_dir = tempfile::tempdir()?;
+        let store = ObjectBlockStore::new_with_configs_async(
+            ObjectClient::new(backend.clone()),
+            ChunksCacheConfig::with_budgets(
+                16 * 1024 * 1024,
+                16 * 1024 * 1024,
+                cache_dir.path().to_path_buf(),
+            ),
+            BlockStoreConfig {
+                block_size: 64 * 1024,
+                page_size: 4 * 1024,
+                compression: Compression::None,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let metrics = store
+            .object_store_metrics()
+            .expect("ObjectBlockStore exposes object metrics");
+
+        let uploaded = vec![5u8; 8 * 1024];
+        store.write_fresh_range((10, 0), 0, &uploaded).await?;
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.put_ops, 1);
+        assert_eq!(snapshot.put_bytes, uploaded.len() as u64);
+        assert_eq!(snapshot.get_ops, 0);
+
+        let full_block = vec![7u8; 64 * 1024];
+        backend
+            .data
+            .lock()
+            .unwrap()
+            .insert("chunks/11/0".to_string(), full_block.clone());
+        let mut out = vec![0u8; 4096];
+        store.read_range((11, 0), 0, &mut out).await?;
+        assert_eq!(out, vec![7u8; 4096]);
+
+        store.delete_range((11, 0), 1).await?;
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.get_ops, 1);
+        assert_eq!(snapshot.get_bytes, full_block.len() as u64);
+        assert_eq!(snapshot.put_ops, 1);
+        assert_eq!(snapshot.del_ops, 1);
 
         Ok(())
     }

@@ -265,6 +265,7 @@ where
     append_locks: DashMap<i64, Arc<Mutex<()>>>,
     posix_lock_owners: DashMap<(i64, i64), ()>,
     pub(crate) stats: Arc<crate::vfs::stats::FsStats>,
+    memory_budget: Option<MemoryBudget>,
     vfs_timing_enabled: bool,
 }
 
@@ -358,7 +359,7 @@ where
 
         let mut writer_builder =
             DataWriter::new(config.write.clone(), backend, reader.clone(), write_back);
-        if let Some(memory_budget) = memory_budget {
+        if let Some(memory_budget) = memory_budget.clone() {
             writer_builder = writer_builder.with_memory_budget(memory_budget);
         }
         let writer = Arc::new(writer_builder);
@@ -373,6 +374,7 @@ where
             append_locks: DashMap::new(),
             posix_lock_owners: DashMap::new(),
             stats: Arc::new(crate::vfs::stats::FsStats::new()),
+            memory_budget,
             vfs_timing_enabled: vfs_timing_enabled_from_env(),
         }
     }
@@ -736,7 +738,14 @@ where
 
         // Background statistics logger — JuiceFS-stats equivalent.
         let fuse_stats = state.stats.clone();
-        if let (Some(hits), Some(misses)) = store.cache_counters() {
+        let (cache_hits, cache_misses) = store.cache_counters();
+        let object_metrics = store.object_store_metrics();
+        let memory_budget = state.memory_budget.clone();
+        if cache_hits.is_some()
+            || cache_misses.is_some()
+            || object_metrics.is_some()
+            || memory_budget.is_some()
+        {
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(100));
                 let mut prev_reads: u64 = 0;
@@ -744,23 +753,35 @@ where
                 let mut prev_lat_us: u64 = 0;
                 loop {
                     interval.tick().await;
-                    let h = hits.load(std::sync::atomic::Ordering::Relaxed);
-                    let m = misses.load(std::sync::atomic::Ordering::Relaxed);
-                    let total = h + m;
-                    let rate = if total > 0 {
-                        (h as f64 / total as f64) * 100.0
-                    } else {
-                        0.0
-                    };
-                    let reads = fuse_stats
-                        .fuse_read_ops
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let bytes = fuse_stats
-                        .fuse_read_bytes
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let lat_us = fuse_stats
-                        .fuse_read_lat_us
-                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if let (Some(hits), Some(misses)) = (&cache_hits, &cache_misses) {
+                        fuse_stats.sync_cache_counters(
+                            hits.load(std::sync::atomic::Ordering::Relaxed),
+                            misses.load(std::sync::atomic::Ordering::Relaxed),
+                        );
+                    }
+                    if let Some(memory_budget) = &memory_budget {
+                        fuse_stats.sync_buffer_bytes(
+                            memory_budget.writer_bytes(),
+                            memory_budget.reader_bytes(),
+                        );
+                    }
+                    if let Some(object_metrics) = &object_metrics {
+                        let object = object_metrics.snapshot();
+                        fuse_stats.sync_object_store_metrics(
+                            object.get_ops,
+                            object.get_bytes,
+                            object.get_lat_us,
+                            object.put_ops,
+                            object.put_bytes,
+                            object.put_lat_us,
+                            object.del_ops,
+                        );
+                    }
+
+                    let snapshot = fuse_stats.snapshot();
+                    let reads = snapshot.fuse_read_ops;
+                    let bytes = snapshot.fuse_read_bytes;
+                    let lat_us = snapshot.fuse_read_lat_us;
                     let reads_delta = reads.saturating_sub(prev_reads);
                     let bytes_delta = bytes.saturating_sub(prev_bytes);
                     let lat_delta = lat_us.saturating_sub(prev_lat_us);
@@ -778,10 +799,15 @@ where
                     prev_bytes = bytes;
                     prev_lat_us = lat_us;
                     tracing::info!(
-                        hits = h,
-                        misses = m,
-                        total,
-                        hit_pct = rate,
+                        hits = snapshot.cache_hits,
+                        misses = snapshot.cache_misses,
+                        total = snapshot.cache_requests(),
+                        hit_pct = snapshot.cache_hit_ratio() * 100.0,
+                        dirty_bytes = snapshot.buf_dirty_bytes,
+                        read_buffer_bytes = snapshot.buf_read_bytes,
+                        s3_get_ops = snapshot.s3_get_ops,
+                        s3_put_ops = snapshot.s3_put_ops,
+                        s3_del_ops = snapshot.s3_del_ops,
                         fuse_reads = reads,
                         fuse_rd_bytes = bytes,
                         avg_read_sz = avg_sz,
