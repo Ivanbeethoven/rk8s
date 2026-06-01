@@ -86,7 +86,7 @@ pub struct MountArgs {
     #[arg(long)]
     pub s3_disable_payload_checksum: Option<bool>,
 
-    /// Metadata backend (sqlx, etcd or redis).
+    /// Metadata backend (sqlx, etcd, redis or tikv).
     #[arg(long, value_enum)]
     pub meta_backend: Option<MetaBackendKind>,
 
@@ -97,6 +97,14 @@ pub struct MountArgs {
     /// Etcd endpoint URLs (comma-separated).
     #[arg(long, value_name = "URLS", value_delimiter = ',')]
     pub meta_etcd_urls: Option<Vec<String>>,
+
+    /// TiKV PD endpoint URLs (comma-separated).
+    #[arg(long, value_name = "URLS", value_delimiter = ',')]
+    pub meta_tikv_pd_endpoints: Option<Vec<String>>,
+
+    /// TiKV metadata key namespace.
+    #[arg(long, value_name = "NAMESPACE")]
+    pub meta_tikv_namespace: Option<String>,
 
     /// Chunk size in bytes.
     #[arg(long)]
@@ -151,6 +159,9 @@ pub enum MetaBackendKind {
     Sqlx,
     Etcd,
     Redis,
+    #[value(name = "tikv", alias = "ti-kv")]
+    #[serde(rename = "tikv", alias = "ti-kv")]
+    TiKv,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -192,6 +203,7 @@ pub struct MetaFileConfig {
     pub sqlx: Option<UrlBackedMetaFileConfig>,
     pub redis: Option<UrlBackedMetaFileConfig>,
     pub etcd: Option<EtcdMetaFileConfig>,
+    pub tikv: Option<TiKvMetaFileConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -202,6 +214,12 @@ pub struct UrlBackedMetaFileConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct EtcdMetaFileConfig {
     pub urls: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TiKvMetaFileConfig {
+    pub pd_endpoints: Option<Vec<String>>,
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -257,6 +275,8 @@ pub struct MountConfig {
     pub meta_backend: MetaBackendKind,
     pub meta_url: String,
     pub meta_etcd_urls: Vec<String>,
+    pub meta_tikv_pd_endpoints: Vec<String>,
+    pub meta_tikv_namespace: String,
     pub chunk_size: u64,
     pub block_size: u32,
     pub fuse_workers: usize,
@@ -282,6 +302,7 @@ impl MountConfig {
         let sqlx_cfg = meta_cfg.sqlx.unwrap_or_default();
         let redis_cfg = meta_cfg.redis.unwrap_or_default();
         let etcd_cfg = meta_cfg.etcd.unwrap_or_default();
+        let tikv_cfg = meta_cfg.tikv.unwrap_or_default();
         let layout_cfg = file_cfg.layout.unwrap_or_default();
         let fuse_cfg = file_cfg.fuse.unwrap_or_default();
         let cache_cfg = file_cfg.cache.unwrap_or_default();
@@ -300,6 +321,7 @@ impl MountConfig {
             MetaBackendKind::Sqlx => sqlx_cfg.url,
             MetaBackendKind::Redis => redis_cfg.url,
             MetaBackendKind::Etcd => None,
+            MetaBackendKind::TiKv => None,
         };
 
         Ok(Self {
@@ -337,6 +359,14 @@ impl MountConfig {
                 .or(meta_url_from_file)
                 .unwrap_or_else(|| DEFAULT_META_URL.to_string()),
             meta_etcd_urls: args.meta_etcd_urls.or(etcd_cfg.urls).unwrap_or_default(),
+            meta_tikv_pd_endpoints: args
+                .meta_tikv_pd_endpoints
+                .or(tikv_cfg.pd_endpoints)
+                .unwrap_or_default(),
+            meta_tikv_namespace: args
+                .meta_tikv_namespace
+                .or(tikv_cfg.namespace)
+                .unwrap_or_else(crate::meta::config::default_tikv_namespace),
             chunk_size: args
                 .chunk_size
                 .or(layout_cfg.chunk_size)
@@ -442,6 +472,8 @@ mod tests {
             meta_backend: None,
             meta_url: None,
             meta_etcd_urls: None,
+            meta_tikv_pd_endpoints: None,
+            meta_tikv_namespace: None,
             chunk_size: None,
             block_size: None,
             fuse_workers: None,
@@ -501,6 +533,8 @@ mod tests {
             meta_backend: None,
             meta_url: None,
             meta_etcd_urls: None,
+            meta_tikv_pd_endpoints: None,
+            meta_tikv_namespace: None,
             chunk_size: None,
             block_size: None,
             fuse_workers: None,
@@ -530,6 +564,8 @@ mod tests {
             meta_backend: None,
             meta_url: None,
             meta_etcd_urls: None,
+            meta_tikv_pd_endpoints: None,
+            meta_tikv_namespace: None,
             chunk_size: None,
             block_size: None,
             fuse_workers: None,
@@ -540,6 +576,39 @@ mod tests {
 
         assert_eq!(config.s3_max_concurrency, DEFAULT_S3_MAX_CONCURRENCY);
         assert_eq!(config.s3_max_concurrency, 32);
+    }
+
+    #[test]
+    fn mount_config_parses_tikv_meta_section() {
+        let path = std::env::temp_dir().join(format!(
+            "slayerfs-tikv-meta-config-{}-{}.yaml",
+            std::process::id(),
+            "parse"
+        ));
+        std::fs::write(
+            &path,
+            r#"
+mount_point: /mnt/slayer
+meta:
+  backend: tikv
+  tikv:
+    pd_endpoints:
+      - 127.0.0.1:2379
+      - 127.0.0.1:2380
+    namespace: tenant-a
+"#,
+        )
+        .unwrap();
+
+        let config = MountConfig::from_sources(empty_mount_args(Some(path.clone()), None)).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert!(matches!(config.meta_backend, MetaBackendKind::TiKv));
+        assert_eq!(
+            config.meta_tikv_pd_endpoints,
+            vec!["127.0.0.1:2379", "127.0.0.1:2380"]
+        );
+        assert_eq!(config.meta_tikv_namespace, "tenant-a");
     }
 
     #[test]

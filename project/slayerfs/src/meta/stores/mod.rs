@@ -5,10 +5,12 @@
 //!
 //! - `DatabaseMetaStore`: SQL databases (PostgreSQL, SQLite)
 //! - `EtcdMetaStore`: Distributed etcd cluster
+//! - `TiKvMetaStore`: TiKV metadata backend skeleton
 pub mod database;
 pub mod etcd;
 pub(crate) mod pool;
 pub mod redis;
+pub mod tikv;
 
 // Re-export main types for convenience
 pub use database::DatabaseMetaStore;
@@ -16,6 +18,7 @@ pub use etcd::EtcdMetaStore;
 pub(crate) use etcd::watch::{CacheInvalidationEvent, EtcdWatchWorker, WatchConfig};
 pub use redis::RedisMetaStore;
 use std::future::Future;
+pub use tikv::TiKvMetaStore;
 
 pub(crate) async fn build_paths_from_names<E, F, FR>(
     root_ino: i64,

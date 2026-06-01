@@ -11,7 +11,7 @@ use crate::meta::config::{
 };
 use crate::meta::layer::MetaLayer;
 use crate::meta::store::{MetaError, MetaStore};
-use crate::meta::stores::{DatabaseMetaStore, EtcdMetaStore, RedisMetaStore};
+use crate::meta::stores::{DatabaseMetaStore, EtcdMetaStore, RedisMetaStore, TiKvMetaStore};
 
 /// Combined handles for raw stores and cached meta layers.
 pub struct MetaHandle<M: MetaStore> {
@@ -148,4 +148,24 @@ pub async fn create_etcd_meta_store_from_urls(
     };
 
     MetaStoreFactory::<EtcdMetaStore>::create_from_config(config).await
+}
+
+/// Convenience function to create a TiKV MetaStore from PD endpoints.
+#[allow(dead_code)]
+pub async fn create_tikv_meta_store_from_pd_endpoints(
+    pd_endpoints: Vec<String>,
+) -> Result<MetaHandle<TiKvMetaStore>, MetaError> {
+    let config = Config {
+        database: DatabaseConfig {
+            db_config: DatabaseType::TiKv {
+                pd_endpoints,
+                namespace: crate::meta::config::default_tikv_namespace(),
+            },
+        },
+        cache: CacheConfig::default(),
+        client: ClientOptions::default(),
+        compact: CompactConfig::default(),
+    };
+
+    MetaStoreFactory::<TiKvMetaStore>::create_from_config(config).await
 }
