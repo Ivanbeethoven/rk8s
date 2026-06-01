@@ -112,6 +112,54 @@ fn stored_values_round_trip_through_json() {
     assert_eq!(decoded.ino, ROOT_INODE);
     assert_eq!(decoded.kind, StoredNodeKind::Dir);
     assert_eq!(decoded.nlink, 2);
+    assert!(!decoded.deleted);
+    assert_eq!(decoded.symlink_target, None);
+}
+
+#[test]
+fn stored_node_decodes_legacy_json_defaults() {
+    let json = br#"{
+        "ino": 2,
+        "parent": 1,
+        "name": "legacy",
+        "kind": "File",
+        "size": 0,
+        "blocks": 0,
+        "mode": 33188,
+        "uid": 0,
+        "gid": 0,
+        "atime": 1,
+        "mtime": 1,
+        "ctime": 1,
+        "nlink": 1
+    }"#;
+    let decoded = TiKvMetaStore::decode_node(json).unwrap();
+    assert!(!decoded.deleted);
+    assert_eq!(decoded.symlink_target, None);
+}
+
+#[test]
+fn link_parent_values_round_trip() {
+    let parents = vec![
+        StoredLinkParent {
+            parent: 1,
+            name: "a".to_string(),
+        },
+        StoredLinkParent {
+            parent: 2,
+            name: "b:c".to_string(),
+        },
+    ];
+    let encoded = TiKvMetaStore::encode(&parents).unwrap();
+    let decoded = TiKvMetaStore::decode_link_parents(&encoded).unwrap();
+    assert_eq!(decoded, parents);
+}
+
+#[test]
+fn nlink_delta_saturates() {
+    assert_eq!(apply_nlink_delta(2, -1), 1);
+    assert_eq!(apply_nlink_delta(0, -1), 0);
+    assert_eq!(apply_nlink_delta(u32::MAX, 1), u32::MAX);
 }
 
 #[tokio::test]
@@ -194,7 +242,9 @@ async fn tikv_transactional_namespace_schema() {
     );
 
     store.unlink(root, "moved").await.unwrap();
-    assert!(store.stat(file).await.unwrap().is_none());
+    let tombstone = store.stat(file).await.unwrap().unwrap();
+    assert_eq!(tombstone.nlink, 0);
+    assert!(store.get_deleted_files().await.unwrap().contains(&file));
 }
 
 #[tokio::test]
@@ -263,4 +313,77 @@ async fn tikv_allocates_generic_counters_transactionally() {
 
     assert_eq!(store.next_id("custom").await.unwrap(), 1);
     assert_eq!(store.next_id("custom").await.unwrap(), 2);
+}
+
+#[tokio::test]
+#[ignore = "requires a running TiKV/PD cluster; set SLAYERFS_TIKV_PD_ENDPOINTS"]
+async fn tikv_rename_overwrites_file_and_tombstones_destination() {
+    let store = TiKvMetaStore::from_config(integration_config("rename-overwrite"))
+        .await
+        .expect("tikv store should connect");
+    store.initialize().await.unwrap();
+    let root = store.root_ino();
+    let src = store.create_file(root, "src".to_string()).await.unwrap();
+    let dst = store.create_file(root, "dst".to_string()).await.unwrap();
+
+    store
+        .rename(root, "src", root, "dst".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(store.lookup(root, "src").await.unwrap(), None);
+    assert_eq!(store.lookup(root, "dst").await.unwrap(), Some(src));
+    let dst_attr = store.stat(dst).await.unwrap().unwrap();
+    assert_eq!(dst_attr.nlink, 0);
+    assert!(store.get_deleted_files().await.unwrap().contains(&dst));
+}
+
+#[tokio::test]
+#[ignore = "requires a running TiKV/PD cluster; set SLAYERFS_TIKV_PD_ENDPOINTS"]
+async fn tikv_rename_exchange_swaps_entries() {
+    let store = TiKvMetaStore::from_config(integration_config("rename-exchange"))
+        .await
+        .expect("tikv store should connect");
+    store.initialize().await.unwrap();
+    let root = store.root_ino();
+    let a = store.create_file(root, "a".to_string()).await.unwrap();
+    let b = store.create_file(root, "b".to_string()).await.unwrap();
+
+    store.rename_exchange(root, "a", root, "b").await.unwrap();
+
+    assert_eq!(store.lookup(root, "a").await.unwrap(), Some(b));
+    assert_eq!(store.lookup(root, "b").await.unwrap(), Some(a));
+    assert_eq!(store.get_paths(a).await.unwrap(), vec!["/b".to_string()]);
+    assert_eq!(store.get_paths(b).await.unwrap(), vec!["/a".to_string()]);
+}
+
+#[tokio::test]
+#[ignore = "requires a running TiKV/PD cluster; set SLAYERFS_TIKV_PD_ENDPOINTS"]
+async fn tikv_link_and_symlink_extensions() {
+    let store = TiKvMetaStore::from_config(integration_config("links"))
+        .await
+        .expect("tikv store should connect");
+    store.initialize().await.unwrap();
+    let root = store.root_ino();
+    let file = store.create_file(root, "origin".to_string()).await.unwrap();
+
+    let linked_attr = store.link(file, root, "hard").await.unwrap();
+    assert_eq!(linked_attr.nlink, 2);
+    assert_eq!(store.lookup(root, "hard").await.unwrap(), Some(file));
+    assert_eq!(
+        store.get_paths(file).await.unwrap(),
+        vec!["/hard".to_string(), "/origin".to_string()]
+    );
+
+    let (link_ino, link_attr) = store.symlink(root, "sym", "/origin").await.unwrap();
+    assert_eq!(link_attr.kind, FileType::Symlink);
+    assert_eq!(store.read_symlink(link_ino).await.unwrap(), "/origin");
+
+    store.unlink(root, "origin").await.unwrap();
+    let remaining = store.stat(file).await.unwrap().unwrap();
+    assert_eq!(remaining.nlink, 1);
+    assert_eq!(
+        store.get_paths(file).await.unwrap(),
+        vec!["/hard".to_string()]
+    );
 }
