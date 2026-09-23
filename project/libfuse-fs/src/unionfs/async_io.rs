@@ -573,6 +573,12 @@ impl Filesystem for OverlayFs {
                         hd.handle.load(Ordering::Relaxed)
                     );
                 }
+                // NOTE: no release here even though this may be a reconstructed
+                // handle (kernel fh=0): the same HandleData serves later reads
+                // of the file, and in no_open style there is no kernel RELEASE
+                // to close it — the layer's fd is intentionally kept for the
+                // lifetime of the mount entry (bounded by distinct files
+                // touched; the backing File drops with the handle data).
                 result
             }
         };
