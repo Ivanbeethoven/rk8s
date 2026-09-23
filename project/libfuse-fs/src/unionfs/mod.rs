@@ -3221,12 +3221,12 @@ impl OverlayFs {
         let no_open = self.no_open.load(Ordering::Relaxed);
         if !no_open
             && let Some(h) = handle
-                && let Some(v) = self.handles.lock().await.get(&h)
-                && v.node.inode == inode
-            {
-                // trace!("get_data: found handle");
-                return Ok(Arc::clone(v));
-            }
+            && let Some(v) = self.handles.lock().await.get(&h)
+            && v.node.inode == inode
+        {
+            // trace!("get_data: found handle");
+            return Ok(Arc::clone(v));
+        }
 
         let readonly: bool = flags
             & (libc::O_APPEND | libc::O_CREAT | libc::O_TRUNC | libc::O_RDWR | libc::O_WRONLY)
