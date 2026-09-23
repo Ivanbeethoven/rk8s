@@ -1,0 +1,9 @@
+[package]
+name = "slayerfs-stats"
+version = "0.1.0"
+edition = "2024"
+description = "Real-time performance stats viewer for SlayerFS (like juicefs stats)"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+crossterm = "0.28"

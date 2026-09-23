@@ -253,7 +253,11 @@ impl LocalClient {
             .await
             .map_err(io::Error::other)?;
         let meta_layer = meta_handle.layer();
-        let store = Arc::new(ObjectBlockStore::new(client));
+        let store = Arc::new(
+            ObjectBlockStore::new_async(client)
+                .await
+                .map_err(io::Error::other)?,
+        );
         let fs = FileSystem::from_components(
             layout,
             Arc::clone(&store),
@@ -274,7 +278,11 @@ impl LocalClient {
             .await
             .map_err(io::Error::other)?;
         let meta_layer = meta_handle.layer();
-        let store = Arc::new(ObjectBlockStore::new(client));
+        let store = Arc::new(
+            ObjectBlockStore::new_async(client)
+                .await
+                .map_err(io::Error::other)?,
+        );
         let fs = FileSystem::from_components(layout, Arc::clone(&store), meta_layer, config)?;
         Ok(VfsClient { fs })
     }

@@ -1,32 +1,83 @@
-# SlayerFS SDK 使用说明
+# SDK 与 API
 
-本文档介绍基于 `VfsClient` 的应用接口，便于在不挂载 FUSE 的情况下直接以“路径”读写文件。
+SlayerFS 提供两种使用方式：FUSE 挂载（POSIX 文件系统）和 SDK（编程接口）。SDK 允许在不挂载 FUSE 的情况下直接通过路径操作文件。
 
-## 设计目标
-- 提供接近 POSIX 的基础路径 API：
-  - 目录：`mkdir_p`、`readdir`、`rmdir`
-- 文件：`create_file`、`write_at`、`read_at`、`stat`、`unlink`、`rename`、`truncate`
-- 后端可插拔：
-  - 数据由 `BlockStore`（本地目录/对象存储）承载
-  - 元数据由 `MetaStore` 承载（当前内存实现 InMemory，用于单机/开发）
-- 读写语义：按 Chunk/Block 分片；读遇到“洞”返回 0 填充；写完再聚合一次性更新文件大小
+## 公开 API
 
-## 快速开始（本地目录后端）
+`src/lib.rs` 的 `pub use` 导出了以下公共 API。
+
+### 核心类型
+
 ```rust
-use slayerfs::ChunkLayout;
-use slayerfs::LocalClient;
+// 数据布局
+pub use slayerfs::ChunkLayout;
 
-#[tokio::main(flavor = "current_thread")]
+// 对象存储后端
+pub use slayerfs::cadapter::localfs::LocalFsBackend;
+pub use slayerfs::cadapter::s3::{S3Backend, S3Config};
+pub use slayerfs::cadapter::client::{ObjectBackend, ObjectClient};
+
+// Block 存储
+pub use slayerfs::chunk::store::{BlockKey, BlockStore, InMemoryBlockStore, ObjectBlockStore};
+
+// Compaction / GC
+pub use slayerfs::chunk::{BlockGcConfig, BlockStoreGC};
+pub use slayerfs::chunk::{CompactResult, Compactor, CompactorError};
+
+// 元数据
+pub use slayerfs::meta::MetaStore;
+pub use slayerfs::meta::MetaHandle;
+pub use slayerfs::meta::client::MetaClient;
+pub use slayerfs::meta::factory::MetaStoreFactory;
+pub use slayerfs::meta::stores::{DatabaseMetaStore, EtcdMetaStore, RedisMetaStore};
+pub use slayerfs::meta::config::{
+    CacheConfig, ClientOptions, CompactConfig, Config, DatabaseConfig, DatabaseType,
+};
+pub use slayerfs::meta::store::{
+    DirEntry as VfsDirEntry, FileAttr as VfsFileAttr, FileType as VfsFileType,
+    SetAttrFlags, SetAttrRequest, StatFsSnapshot,
+};
+pub use slayerfs::meta::file_lock::{
+    FileLockInfo, FileLockQuery, FileLockRange, FileLockType,
+};
+pub use slayerfs::meta::{create_meta_store_from_url, create_redis_meta_store_from_url};
+
+// VFS
+pub use slayerfs::vfs::fs::{RenameFlags, VFS};
+
+// SDK 客户端
+pub use slayerfs::vfs::sdk::{LocalClient, VfsClient};
+```
+
+### SDK 类型
+
+```rust
+pub use slayerfs::sdk_fs::{
+    AccessMode, Client, ClientBackend, DirEntry as SdkDirEntry,
+    File, FileType as SdkFileType, Metadata, OpenOptions, ReadDir,
+};
+```
+
+## VfsClient（推荐使用方式）
+
+`VfsClient<S, M>` 是一个泛型结构体，参数化为 `BlockStore` 和 `MetaClient`。使用时通过 `LocalClient` 便捷构造器创建。
+
+### LocalClient
+
+```rust
+use slayerfs::{ChunkLayout, LocalClient};
+
+#[tokio::main]
 async fn main() {
-    let layout = ChunkLayout::default(); // 默认 64MiB chunk / 4MiB block
-    let root = "/tmp/slayerfs-objstore"; // 用一个本地目录模拟对象存储
+    let layout = ChunkLayout::default();       // 64 MiB chunk / 4 MiB block
+    let root = "/tmp/slayerfs-objroot";
     let mut cli = LocalClient::new_local(root, layout).await.unwrap();
 
-    // 目录 + 文件
+    // 创建目录和文件
     cli.mkdir_p("/a/b").await.unwrap();
     cli.create_file("/a/b/hello.txt", false).await.unwrap();
 
-    // 写入跨块数据
+    // 跨块写入
     let half = (layout.block_size / 2) as usize;
     let len = layout.block_size as usize + half;
     let mut data = vec![0u8; len];
@@ -36,45 +87,135 @@ async fn main() {
     // 读取并校验
     let out = cli.read_at("/a/b/hello.txt", half as u64, len).await.unwrap();
     assert_eq!(out, data);
-
-    // 目录与属性
-    let entries = cli.readdir("/a/b").await.unwrap();
-    assert!(entries.iter().any(|e| e.name == "hello.txt"));
-    let st = cli.stat("/a/b/hello.txt").await.unwrap();
-    println!("size={} kind={:?}", st.size, st.kind);
 }
 ```
 
+### 自定义后端
+
+```rust
+use slayerfs::{
+    LocalFsBackend, ObjectClient, ObjectBlockStore,
+    DatabaseMetaStore, MetaClient, VfsClient, ChunkLayout,
+};
+
+let layout = ChunkLayout::default();
+
+// 对象后端
+let backend = LocalFsBackend::new("/tmp/data");
+let client = ObjectClient::new(backend);
+let store = ObjectBlockStore::new_with_configs(client, cache_cfg, store_cfg).await?;
+
+// 元数据后端
+let meta_store = DatabaseMetaStore::from_config(db_config).await?;
+let meta_client = MetaClient::new(meta_store, ...);
+
+// VFS 客户端
+let vfs = VfsClient::new(layout, store, meta_client)?;
+```
+
 ## API 速览
-- `mkdir_p(path) -> io::Result<()>`：递归创建目录；中间段为文件时报错 `"not a directory"`
-- `create_file(path, create_new) -> io::Result<()>`：创建文件；若同名目录存在报错 `"is a directory"`；`create_new=true` 时已存在会报错
-- `write_at(path, offset, data) -> io::Result<usize>`：按文件偏移写入，跨 Chunk/Block 自动拆分
-- `read_at(path, offset, len) -> io::Result<Vec<u8>>`：按文件偏移读取；对未写入区域 0 填充
-- `readdir(path) -> io::Result<Vec<VfsDirEntry>>`：列目录；不包含 "." 与 ".."
-- `stat(path) -> io::Result<VfsFileAttr>`：获取 kind/size；size 来自元数据层
-- `unlink(path) -> io::Result<()>`：删除文件；目录会报错 `"is a directory"`
-- `rmdir(path) -> io::Result<()>`：删除空目录；根目录不可删除；非空报错 `"directory not empty"`
-- `rename(old, new) -> io::Result<()>`：仅文件；目标不得存在；目标父目录缺失会自动创建
-- `truncate(path, size) -> io::Result<()>`：仅更新文件 size；收缩不立即清理块数据
 
-类型摘录：
-- `VfsDirEntry { name: String, ino: i64, kind: VfsFileType }`
-- `VfsFileAttr { ino: i64, size: u64, kind: VfsFileType }`
+所有路径 API 返回 `io::Result`，错误映射到标准 errno（ENOENT、EEXIST、ENOTDIR、EISDIR、ENOTEMPTY 等）。
 
-## 后端与布局
-- 布局：`ChunkLayout { chunk_size: u64, block_size: u32 }`，默认 64MiB/4MiB，可自定义传入
-- 本地目录后端：`LocalClient::new_local(root, layout)`
-- 对象后端：以 `ObjectBlockStore<B>` 对接 `ObjectBackend`（如 S3）；可自行构造 `VfsClient<S, M>`
+| 方法 | 说明 |
+|---|---|
+| `mkdir_p(path)` | 递归创建目录。中间路径若是文件 → `ENOTDIR` |
+| `create_file(path, create_new)` | 创建文件。`create_new=true` 时已存在 → `EEXIST` |
+| `write_at(path, offset, &[u8])` | 按文件偏移写入，跨 Chunk/Block 自动拆分，返回写入字节数 |
+| `read_at(path, offset, len)` | 按偏移读取。未写入区域 → 零填充（稀疏文件语义） |
+| `readdir(path)` | 列目录，不含 `.` 和 `..` |
+| `stat(path)` | 获取文件属性（ino、size、kind、mode、uid、gid、时间戳） |
+| `unlink(path)` | 删除文件。目录 → `EISDIR` |
+| `rmdir(path)` | 删除空目录。根目录不可删除。非空 → `ENOTEMPTY` |
+| `rename(old, new)` | 重命名文件。目标父目录不存在时自动创建 |
+| `rename_with_flags(old, new, flags)` | 带标志的重命名（`RENAME_NOREPLACE` / `RENAME_EXCHANGE`） |
+| `truncate(path, size)` | 截断文件。收缩不立即清理块数据（由 GC 回收） |
 
-## 语义与注意事项
-- 错误返回为 `io::Error`，建议上层按需映射到 errno（ENOENT/EEXIST/ENOTDIR/EISDIR/ENOTEMPTY 等）
-- 读零填充：读取未写入范围会返回 0 字节（JuiceFS 类似体验）
-- 原子性：一次 `write_at` 的 size 更新在末尾聚合提交；跨多个 chunk 的强原子性后续可引入更细粒度事务
-- GC：`unlink/rmdir` 仅更新命名空间与元数据，底层块/切片回收将由后续实现补充
+### RenameFlags
 
-## 测试与演示
-- 本仓库内含端到端测试（`VfsClient`/VFS 层）与一个本地演示入口（`demo-localfs`）
-- 你可以运行测试或示例来验证行为（见根目录 README）
+```rust
+pub struct RenameFlags {
+    pub noreplace: bool,    // RENAME_NOREPLACE: 目标存在时失败
+    pub exchange: bool,     // RENAME_EXCHANGE: 原子交换两个文件
+}
+```
 
----
-如需在 README 中加入更多高级示例（如 S3 后端或并发写读场景），可以在此文档基础上继续扩展。
+### 类型定义
+
+```rust
+// 目录项
+pub struct VfsDirEntry {
+    pub name: String,
+    pub ino: i64,
+    pub kind: VfsFileType,   // File / Dir / Symlink
+}
+
+// 文件属性
+pub struct VfsFileAttr {
+    pub ino: i64,
+    pub size: u64,
+    pub blocks: u64,     // 分配的 512-byte 块数
+    pub kind: VfsFileType,
+    pub mode: u32,       // 权限位 (0o777)
+    pub uid: u32,
+    pub gid: u32,
+    pub atime: i64,      // Unix 时间戳
+    pub mtime: i64,
+    pub ctime: i64,
+    pub nlink: u32,      // 硬链接计数
+}
+```
+
+## FS 层（内部使用）
+
+`src/fs.rs` 实现了一个基础的基于路径的 FileSystem（非 pub），提供了 `mkdir`、`mkdir_all`、`create`、`read`、`write`、`readdir`、`stat`、`unlink`、`rmdir`、`rename`、`truncate` 等操作。它使用单个互斥锁保护命名空间，避免多锁死锁。VFS 层（`src/vfs/fs.rs`）在此基础上实现了完整的 POSIX 语义和 FUSE 集成。
+
+## Daemon
+
+`src/daemon/` 提供了 daemon 进程管理：
+
+- `supervisor.rs` — 进程监控和生命周期管理
+- `worker.rs` — 后台 worker 任务管理
+
+## VFS 构造
+
+VFS 的完整构造链在 `main.rs:mount_with_store` 函数中：
+
+1. 创建 `BlockStore`（`ObjectBlockStore` 或 `InMemoryBlockStore`）
+2. 创建 `MetaStore`（根据后端类型）
+3. 创建 `MetaClient`（包裹 MetaStore，带缓存层）
+4. 调用 `MetaClient::initialize()` 初始化根 inode
+5. 调用 `MetaClient::start_control_plane()` 启动控制面
+6. 构造 `VFS::with_meta_layer_with_cache_config(layout, store, meta_client, compact_config, cache_config)`
+7. 通过 FUSE 挂载（`mount_vfs_privileged` 或 `mount_vfs_unprivileged`）
+
+```rust
+let fs = VFS::with_meta_layer_with_cache_config(
+    layout,
+    store,
+    meta_client.clone(),
+    compact_config,
+    cache_config,
+)?;
+```
+
+内部创建的组件：
+- `MetaLayer`（包装 MetaClient，提供高层语义）
+- `FileWriter`（写路径，Slice 状态机）
+- `FileReader`（读路径，预读管理）
+- `MemoryBudget`（全局内存预算）
+- `FileHandles`（句柄管理）
+- `Stats`（.stats 虚拟文件）
+
+## Posix 层
+
+`src/posix.rs` 提供 POSIX 标准的辅助实现（如路径解析、特殊文件名处理等）。
+
+## 工具模块
+
+`src/utils/` 包含通用工具：
+
+- `intervals.rs` — 区间集合，支持 cut/add/merge 操作，用于读路径的 Slice 覆盖计算
+- `num.rs` — 数值转换辅助
+- `usage.rs` — 磁盘使用量统计
+- `zero.rs` — 零填充优化（检测全零缓冲区，跳过写入）

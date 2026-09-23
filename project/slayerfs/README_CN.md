@@ -45,6 +45,31 @@ cargo run -q --bin sdk_demo -- /tmp/slayerfs-objroot
 - 执行重命名、截断（收缩/扩展）、列目录与删除；
 - 打印预期错误场景，并输出 "sdk demo: OK"。
 
+### FUSE 挂载并发配置
+
+`slayerfs mount` 默认会启用 `rfuse3` 的 worker pool，也支持显式覆盖：
+
+```bash
+slayerfs mount /mnt/slayer \
+  --meta-url sqlite:///tmp/slayerfs.db \
+  --data-dir /tmp/slayerfs-data \
+  --fuse-workers 4 \
+  --fuse-max-background 64
+```
+
+说明：
+- 默认会按机器可用并发度自动选择 worker 数，且至少为 `2`
+- `--fuse-workers 0` 或 `1`：保持 `rfuse3` 旧的 legacy session dispatch
+- `--fuse-workers > 1`：启用 `rfuse3` worker pool
+- `--fuse-max-background`：限制排队中和执行中的 FUSE 请求总数
+- YAML 配置也支持：
+
+```yaml
+fuse:
+  workers: 4
+  max_background: 64
+```
+
 ---
 
 ## 🌟 当前能力（MVP）

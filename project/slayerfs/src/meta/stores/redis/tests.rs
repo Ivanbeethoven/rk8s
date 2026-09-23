@@ -1,15 +1,78 @@
-use crate::meta::MetaStore;
+use crate::meta::client::MetaClient;
 use crate::meta::config::Config;
 use crate::meta::config::{
-    CacheConfig, ClientOptions, CompactConfig, DatabaseConfig, DatabaseType,
+    CacheCapacity, CacheConfig, CacheTtl, ClientOptions, CompactConfig, DatabaseConfig,
+    DatabaseType,
 };
 use crate::meta::file_lock::{FileLockQuery, FileLockRange, FileLockType};
 use crate::meta::store::{LockName, MetaError, SetAttrFlags, SetAttrRequest};
 use crate::meta::stores::RedisMetaStore;
+use crate::meta::{MetaLayer, MetaStore};
+use crate::vfs::fs::VFS;
+use crate::{chunk::layout::ChunkLayout, chunk::store::InMemoryBlockStore};
+use redis::AsyncCommands;
 use serial_test::serial;
 use std::sync::Arc;
-use tokio::time;
+use tokio::time::{self, Duration};
 use uuid::Uuid;
+
+#[test]
+fn local_txlock_slot_is_stable_for_same_key() {
+    assert_eq!(
+        super::RedisMetaStore::local_lock_slot_for_key("c42_0"),
+        super::RedisMetaStore::local_lock_slot_for_key("c42_0")
+    );
+    assert!(
+        super::RedisMetaStore::local_lock_slot_for_key("c42_0") < super::REDIS_TXN_LOCK_STRIPES
+    );
+}
+
+#[tokio::test]
+async fn local_txlock_serializes_same_primary_key() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+
+    let first_active = active.clone();
+    let first_max = max_active.clone();
+    let first_started = started.clone();
+    let first_release = release.clone();
+    let first = tokio::spawn(async move {
+        super::RedisMetaStore::with_local_lock_for_key("cserialized_0", async move {
+            let now = first_active.fetch_add(1, Ordering::SeqCst) + 1;
+            first_max.fetch_max(now, Ordering::SeqCst);
+            first_started.notify_one();
+            first_release.notified().await;
+            first_active.fetch_sub(1, Ordering::SeqCst);
+        })
+        .await;
+    });
+
+    started.notified().await;
+
+    let second_active = active.clone();
+    let second_max = max_active.clone();
+    let second = tokio::spawn(async move {
+        super::RedisMetaStore::with_local_lock_for_key("cserialized_0", async move {
+            let now = second_active.fetch_add(1, Ordering::SeqCst) + 1;
+            second_max.fetch_max(now, Ordering::SeqCst);
+            second_active.fetch_sub(1, Ordering::SeqCst);
+        })
+        .await;
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(max_active.load(Ordering::SeqCst), 1);
+
+    release.notify_one();
+    first.await.unwrap();
+    second.await.unwrap();
+    assert_eq!(max_active.load(Ordering::SeqCst), 1);
+}
 
 async fn cleanup_test_data() -> Result<(), MetaError> {
     let url = "redis://127.0.0.1:6379/0";
@@ -70,10 +133,54 @@ async fn new_test_store() -> RedisMetaStore {
         .expect("Failed to create test database store")
 }
 
+async fn reset_redis_commandstats(store: &RedisMetaStore) {
+    let _: () = redis::cmd("CONFIG")
+        .arg("RESETSTAT")
+        .query_async(&mut store.conn.clone())
+        .await
+        .expect("failed to reset Redis command stats");
+}
+
+async fn redis_command_calls(store: &RedisMetaStore, command: &str) -> u64 {
+    let info: String = redis::cmd("INFO")
+        .arg("commandstats")
+        .query_async(&mut store.conn.clone())
+        .await
+        .expect("failed to read Redis command stats");
+    let needle = format!("cmdstat_{}:", command.to_ascii_lowercase());
+    info.lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix(&needle)?;
+            let calls = rest.strip_prefix("calls=")?.split(',').next()?;
+            calls.parse::<u64>().ok()
+        })
+        .unwrap_or(0)
+}
+
+async fn redis_script_calls(store: &RedisMetaStore) -> u64 {
+    redis_command_calls(store, "eval").await + redis_command_calls(store, "evalsha").await
+}
+
 /// Create a new test store with pre-configured session ID
 async fn new_test_store_with_session(session_id: Uuid) -> RedisMetaStore {
     let store = new_test_store().await;
-    store.set_sid(session_id).expect("Failed to set session ID");
+    store.set_sid(session_id);
+    store
+}
+
+/// Create a fully-initialized test store with both session ID and plating epoch.
+/// This is required for any lock-related tests.
+async fn new_test_store_with_epoch() -> RedisMetaStore {
+    let store = new_test_store().await;
+    // Initialize the fencing-token epoch via INCR (same as start_session does)
+    let mut conn = store.conn.clone();
+    let epoch: i64 = conn
+        .incr("plock_epoch", 1)
+        .await
+        .expect("Failed to incr plock epoch");
+    store.set_epoch(epoch);
+    let session_id = Uuid::now_v7();
+    store.set_sid(session_id);
     store
 }
 
@@ -112,9 +219,7 @@ impl TestSessionManager {
             .expect("Failed to create shared test database store");
 
         let first_session_id = Uuid::now_v7();
-        first_store
-            .set_sid(first_session_id)
-            .expect("Failed to set session ID");
+        first_store.set_sid(first_session_id);
 
         stores.push(first_store);
         session_ids.push(first_session_id);
@@ -125,7 +230,7 @@ impl TestSessionManager {
                 .expect("Failed to create shared test database store");
 
             let session_id = Uuid::now_v7();
-            store.set_sid(session_id).expect("Failed to set session ID");
+            store.set_sid(session_id);
 
             stores.push(store);
             session_ids.push(session_id);
@@ -245,7 +350,7 @@ async fn test_basic_read_lock() {
     let owner: i64 = 1001;
 
     // Set session
-    store.set_sid(session_id).unwrap();
+    store.set_sid(session_id);
 
     // Create a file first
     let parent = store.root_ino();
@@ -1040,6 +1145,30 @@ async fn test_create_entry_lua_already_exists() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn test_unlink_last_reference_updates_parent_and_deleted_child_atomically() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+    let ino = store
+        .create_file(root, "atomic_unlink.txt".to_string())
+        .await
+        .unwrap();
+
+    store.unlink(root, "atomic_unlink.txt").await.unwrap();
+
+    let parent = store.get_node(root).await.unwrap().unwrap();
+    let deleted = store.get_node(ino).await.unwrap().unwrap();
+    assert!(deleted.deleted);
+    assert_eq!(deleted.attr.nlink, 0);
+    assert_eq!(
+        parent.attr.mtime, deleted.attr.ctime,
+        "last unlink should update parent and deleted child with one atomic timestamp"
+    );
+    assert_eq!(parent.attr.ctime, deleted.attr.ctime);
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_create_entry_lua_parent_not_found() {
     let store = new_test_store().await;
 
@@ -1157,30 +1286,32 @@ async fn test_rename_lua_source_not_found() {
 #[serial]
 #[tokio::test]
 #[ignore]
-async fn test_rename_lua_target_exists() {
+async fn test_rename_lua_existing_file_target_is_replaced() {
     let store = new_test_store().await;
     let root = store.root_ino();
 
-    store
+    let src_ino = store
         .create_file(root, "file1.txt".to_string())
         .await
         .unwrap();
-    store
+    let dst_ino = store
         .create_file(root, "file2.txt".to_string())
         .await
         .unwrap();
 
-    let result = store
+    store
         .rename(root, "file1.txt", root, "file2.txt".to_string())
-        .await;
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        MetaError::AlreadyExists { parent, name } => {
-            assert_eq!(parent, root);
-            assert_eq!(name, "file2.txt");
-        }
-        other => panic!("expected AlreadyExists error, got {:?}", other),
-    }
+        .await
+        .unwrap();
+
+    assert_eq!(store.lookup(root, "file1.txt").await.unwrap(), None);
+    assert_eq!(
+        store.lookup(root, "file2.txt").await.unwrap(),
+        Some(src_ino)
+    );
+    let replaced = store.get_node(dst_ino).await.unwrap().unwrap();
+    assert!(replaced.deleted);
+    assert_eq!(replaced.attr.nlink, 0);
 }
 
 #[serial]
@@ -1409,6 +1540,62 @@ async fn test_rename_lua_same_name() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn test_rename_uses_lua_dentry_lookup_without_rust_prelookups() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let src_ino = store
+        .create_file(root, "src.txt".to_string())
+        .await
+        .unwrap();
+
+    reset_redis_commandstats(&store).await;
+    store
+        .rename(root, "src.txt", root, "dst.txt".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(store.lookup(root, "dst.txt").await.unwrap(), Some(src_ino));
+    let hget_calls = redis_command_calls(&store, "hget").await;
+    assert!(
+        hget_calls <= 3,
+        "rename should avoid Rust-side dentry prelookups; observed {hget_calls} Redis HGET calls"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_rename_same_dir_skips_redundant_parent_get_set() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    store
+        .create_file(root, "src.txt".to_string())
+        .await
+        .unwrap();
+
+    reset_redis_commandstats(&store).await;
+    store
+        .rename(root, "src.txt", root, "dst.txt".to_string())
+        .await
+        .unwrap();
+
+    let get_calls = redis_command_calls(&store, "get").await;
+    let set_calls = redis_command_calls(&store, "set").await;
+    assert!(
+        get_calls <= 2,
+        "same-dir rename should fetch parent once and child once; observed {get_calls} Redis GET calls"
+    );
+    assert!(
+        set_calls <= 2,
+        "same-dir rename should save child and parent once; observed {set_calls} Redis SET calls"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_rename_lua_hardlink() {
     let store = new_test_store().await;
     let root = store.root_ino();
@@ -1447,6 +1634,41 @@ async fn test_rename_lua_hardlink() {
     assert!(link_parents_after.contains(&(root, "renamed.txt".to_string())));
     assert!(link_parents_after.contains(&(root, "link.txt".to_string())));
     assert!(!link_parents_after.contains(&(root, "file.txt".to_string())));
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_rename_lua_hardlink_same_inode_target_is_noop() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let file_ino = store
+        .create_file(root, "file.txt".to_string())
+        .await
+        .unwrap();
+    store.link(file_ino, root, "link.txt").await.unwrap();
+
+    store
+        .rename(root, "file.txt", root, "link.txt".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.lookup(root, "file.txt").await.unwrap(),
+        Some(file_ino)
+    );
+    assert_eq!(
+        store.lookup(root, "link.txt").await.unwrap(),
+        Some(file_ino)
+    );
+
+    let node_after = store.get_node(file_ino).await.unwrap().unwrap();
+    assert_eq!(node_after.attr.nlink, 2);
+    let link_parents_after = store.load_link_parents(file_ino).await.unwrap();
+    assert_eq!(link_parents_after.len(), 2);
+    assert!(link_parents_after.contains(&(root, "file.txt".to_string())));
+    assert!(link_parents_after.contains(&(root, "link.txt".to_string())));
 }
 
 #[serial]
@@ -1983,6 +2205,467 @@ async fn test_batch_stat_mixed_flow() {
     assert!(results[1].is_some(), "f1 should exist");
     assert!(results[2].is_some(), "f2 should exist");
     assert!(results[3].is_none(), "999999 should not exist");
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_get_node_cache_expires_after_ttl() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let original = store.get_node(root).await.unwrap().unwrap();
+    let mut mutated = original.clone();
+    mutated.attr.mode = 0o040700;
+
+    let data = serde_json::to_vec(&mutated).unwrap();
+    let mut conn = store.conn.clone();
+    let _: () = conn.set(store.node_key(root), data).await.unwrap();
+
+    let cached = store.get_node(root).await.unwrap().unwrap();
+    assert_eq!(cached.attr.mode, original.attr.mode);
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let refreshed = store.get_node(root).await.unwrap().unwrap();
+    assert_eq!(refreshed.attr.mode, mutated.attr.mode);
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_create_entry_updates_parent_node_cache() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    let root_before = store.get_node(root).await.unwrap().unwrap();
+    assert!(store.node_cache.get(&root).await.is_some());
+
+    store.mkdir(root, "cache_dir".to_string()).await.unwrap();
+
+    let root_after = store
+        .node_cache
+        .get(&root)
+        .await
+        .expect("parent cache should stay warm after create")
+        .expect("parent node should be cached");
+    assert_eq!(root_after.attr.nlink, root_before.attr.nlink + 1);
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_create_entry_uses_lua_parent_lookup_without_rust_prelookup() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    store.node_cache.invalidate(&root).await;
+    reset_redis_commandstats(&store).await;
+    let ino = store
+        .create_file(root, "hot.txt".to_string())
+        .await
+        .unwrap();
+
+    let get_calls = redis_command_calls(&store, "get").await;
+    assert!(
+        get_calls <= 1,
+        "create_file should let Lua fetch the parent once; observed {get_calls} Redis GET calls"
+    );
+    assert_eq!(store.lookup(root, "hot.txt").await.unwrap(), Some(ino));
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_meta_client_create_file_avoids_parent_stat_after_lua_create() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+
+    store.node_cache.invalidate(&root).await;
+    reset_redis_commandstats(&store).await;
+
+    let ino = client
+        .create_file(root, "client_hot.txt".to_string())
+        .await
+        .unwrap();
+
+    let get_calls = redis_command_calls(&store, "get").await;
+    assert!(
+        get_calls <= 1,
+        "MetaClient create_file should not stat the parent after Lua already loaded it; observed {get_calls} Redis GET calls"
+    );
+    assert_eq!(
+        client.lookup(root, "client_hot.txt").await.unwrap(),
+        Some(ino)
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_meta_client_mkdir_avoids_parent_stat_after_lua_create() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+
+    store.node_cache.invalidate(&root).await;
+    reset_redis_commandstats(&store).await;
+
+    let ino = client.mkdir(root, "client_dir".to_string()).await.unwrap();
+
+    let get_calls = redis_command_calls(&store, "get").await;
+    assert!(
+        get_calls <= 1,
+        "MetaClient mkdir should not stat the parent after Lua already loaded it; observed {get_calls} Redis GET calls"
+    );
+    assert_eq!(client.lookup(root, "client_dir").await.unwrap(), Some(ino));
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_meta_client_new_directory_negative_lookup_stays_local() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+
+    let dir = client.mkdir(root, "empty_dir".to_string()).await.unwrap();
+
+    reset_redis_commandstats(&store).await;
+    assert_eq!(client.lookup(dir, "missing.txt").await.unwrap(), None);
+
+    let hget_calls = redis_command_calls(&store, "hget").await;
+    assert_eq!(
+        hget_calls, 0,
+        "negative lookup in a freshly-created empty directory should stay local; observed {hget_calls} Redis HGET calls"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_meta_client_stat_fresh_uses_warm_store_node_cache() {
+    let store = Arc::new(new_test_store().await);
+    let root = store.root_ino();
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+
+    let ino = client
+        .create_file(root, "fresh_hot.txt".to_string())
+        .await
+        .unwrap();
+    client.stat_fresh(ino).await.unwrap().unwrap();
+
+    reset_redis_commandstats(&store).await;
+    for _ in 0..10 {
+        client.stat_fresh(ino).await.unwrap().unwrap();
+    }
+
+    let get_calls = redis_command_calls(&store, "get").await;
+    assert_eq!(
+        get_calls, 0,
+        "hot stat_fresh should reuse RedisMetaStore node_cache instead of issuing Redis GET calls"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_vfs_deleted_inode_timestamp_setattr_stays_local() {
+    let store = Arc::new(new_test_store().await);
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+    client.initialize().await.unwrap();
+
+    let fs = VFS::with_meta_layer_with_default_background(
+        ChunkLayout::default(),
+        Arc::new(InMemoryBlockStore::new()),
+        client,
+    )
+    .unwrap();
+    let root = fs.root_ino();
+    let ino = fs
+        .create_file_at(root, "deleted_setattr.txt", true)
+        .await
+        .unwrap();
+    fs.unlink_at(root, "deleted_setattr.txt").await.unwrap();
+
+    reset_redis_commandstats(&store).await;
+    let attr = fs
+        .set_attr(
+            ino,
+            &SetAttrRequest {
+                mtime: Some(123),
+                ctime: Some(456),
+                ..Default::default()
+            },
+            SetAttrFlags::empty(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(attr.nlink, 0);
+    assert_eq!(attr.mtime, 123);
+    assert_eq!(attr.ctime, 456);
+    assert_eq!(
+        redis_command_calls(&store, "get").await,
+        0,
+        "timestamp-only setattr for a just-deleted inode should avoid Redis GET"
+    );
+    assert_eq!(
+        redis_command_calls(&store, "set").await,
+        0,
+        "timestamp-only setattr for a just-deleted inode should avoid Redis SET"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_vfs_close_without_write_skips_timestamp_metadata_update() {
+    let store = Arc::new(new_test_store().await);
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+    client.initialize().await.unwrap();
+
+    let fs = VFS::with_meta_layer_with_default_background(
+        ChunkLayout::default(),
+        Arc::new(InMemoryBlockStore::new()),
+        client,
+    )
+    .unwrap();
+    let root = fs.root_ino();
+    let ino = fs
+        .create_file_at(root, "empty_close.txt", true)
+        .await
+        .unwrap();
+    let attr = fs.stat_ino(ino).await.unwrap();
+    let fh = fs
+        .open_with_cached_attr(ino, attr, false, true, false)
+        .await
+        .unwrap();
+
+    reset_redis_commandstats(&store).await;
+    fs.close(fh).await.unwrap();
+
+    assert_eq!(
+        redis_command_calls(&store, "set").await,
+        0,
+        "closing a write-opened handle with no writes should avoid timestamp metadata SET"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_vfs_flush_without_write_skips_timestamp_metadata_update() {
+    let store = Arc::new(new_test_store().await);
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+    client.initialize().await.unwrap();
+
+    let fs = VFS::with_meta_layer_with_default_background(
+        ChunkLayout::default(),
+        Arc::new(InMemoryBlockStore::new()),
+        client,
+    )
+    .unwrap();
+    let root = fs.root_ino();
+    let ino = fs
+        .create_file_at(root, "empty_flush.txt", true)
+        .await
+        .unwrap();
+    let attr = fs.stat_ino(ino).await.unwrap();
+    let fh = fs
+        .open_with_cached_attr(ino, attr, false, true, false)
+        .await
+        .unwrap();
+
+    reset_redis_commandstats(&store).await;
+    fs.flush(fh).await.unwrap();
+
+    assert_eq!(
+        redis_command_calls(&store, "set").await,
+        0,
+        "flushing a write-opened handle with no writes should avoid timestamp metadata SET"
+    );
+    fs.close(fh).await.unwrap();
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_fuse_flush_without_posix_locks_skips_unlock_metadata() {
+    let store = Arc::new(new_test_store().await);
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+    client.initialize().await.unwrap();
+
+    let fs = VFS::with_meta_layer_with_default_background(
+        ChunkLayout::default(),
+        Arc::new(InMemoryBlockStore::new()),
+        client,
+    )
+    .unwrap();
+    let root = fs.root_ino();
+    let ino = fs
+        .create_file_at(root, "fuse_flush_no_lock.txt", true)
+        .await
+        .unwrap();
+    let fh = fs.open_fresh_ino(ino, false, true, false).await.unwrap();
+
+    reset_redis_commandstats(&store).await;
+    <VFS<InMemoryBlockStore, MetaClient<RedisMetaStore>> as rfuse3::raw::Filesystem>::flush(
+        &fs,
+        rfuse3::raw::Request {
+            unique: 1,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        },
+        ino as u64,
+        fh,
+        0xabc,
+    )
+    .await
+    .unwrap();
+
+    let script_calls = redis_script_calls(&store).await;
+    assert!(
+        script_calls <= 1,
+        "FUSE flush without any known POSIX locks should skip redundant Redis lock-cleanup scripts; observed {script_calls}"
+    );
+    fs.close(fh).await.unwrap();
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_fuse_flush_releases_known_posix_lock_owner() {
+    let store = Arc::new(new_test_store().await);
+    let client = MetaClient::new(
+        store.clone(),
+        CacheCapacity {
+            inode: 100,
+            path: 100,
+        },
+        CacheTtl::for_redis(),
+    );
+    client.initialize().await.unwrap();
+
+    let fs = VFS::with_meta_layer_with_default_background(
+        ChunkLayout::default(),
+        Arc::new(InMemoryBlockStore::new()),
+        client,
+    )
+    .unwrap();
+    let root = fs.root_ino();
+    let ino = fs
+        .create_file_at(root, "fuse_flush_lock.txt", true)
+        .await
+        .unwrap();
+    let fh = fs.open_fresh_ino(ino, true, true, false).await.unwrap();
+    let owner = 0_u64;
+    let range = FileLockRange { start: 0, end: 1 };
+    store
+        .set_plock(ino, owner as i64, false, FileLockType::Write, range, 1234)
+        .await
+        .unwrap();
+    fs.remember_posix_lock_owner(ino, owner as i64, FileLockType::Write);
+
+    let conflict = fs
+        .get_plock_ino(
+            ino,
+            &FileLockQuery {
+                owner: owner as i64,
+                lock_type: FileLockType::Write,
+                range,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(conflict.lock_type, FileLockType::Write);
+
+    <VFS<InMemoryBlockStore, MetaClient<RedisMetaStore>> as rfuse3::raw::Filesystem>::flush(
+        &fs,
+        rfuse3::raw::Request {
+            unique: 2,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        },
+        ino as u64,
+        fh,
+        owner,
+    )
+    .await
+    .unwrap();
+
+    let after_flush = fs
+        .get_plock_ino(
+            ino,
+            &FileLockQuery {
+                owner: owner as i64,
+                lock_type: FileLockType::Write,
+                range,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_flush.lock_type, FileLockType::UnLock);
+    fs.close(fh).await.unwrap();
 }
 
 #[serial]
@@ -2593,6 +3276,38 @@ async fn test_link_root_inode_rejected_fallback() {
 #[serial]
 #[tokio::test]
 #[ignore]
+async fn test_stat_fs_batches_node_fetches_with_mget() {
+    let store = new_test_store().await;
+    let root = store.root_ino();
+
+    for idx in 0..4 {
+        let ino = store
+            .create_file(root, format!("sf_batch_{idx}.txt"))
+            .await
+            .unwrap();
+        store.set_file_size(ino, 1024 + idx).await.unwrap();
+    }
+    store.mkdir(root, "sf_batch_dir".to_string()).await.unwrap();
+
+    reset_redis_commandstats(&store).await;
+    let snap = store.stat_fs().await.unwrap();
+
+    assert!(snap.used_inodes >= 6);
+    let get_calls = redis_command_calls(&store, "get").await;
+    let mget_calls = redis_command_calls(&store, "mget").await;
+    assert!(
+        get_calls <= 1,
+        "stat_fs should batch node loads instead of issuing one GET per inode; observed {get_calls} GET calls"
+    );
+    assert_eq!(
+        mget_calls, 1,
+        "stat_fs should fetch all node payloads with one Redis MGET"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
 async fn test_stat_fs_accounting_fallback() {
     let store = new_test_store().await;
     let root = store.root_ino();
@@ -2868,5 +3583,391 @@ async fn test_cleanup_orphan_uncommitted_slice_fallback() {
     assert!(
         orphans3.is_empty(),
         "should be fully cleaned after delete_uncommitted_slices"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent file lock tests — simulates generic/089 (t_mtab) scenario
+// ---------------------------------------------------------------------------
+
+/// Helper: acquire a write lock on the given file, optionally blocking.
+async fn acquire_write_lock(
+    store: &RedisMetaStore,
+    inode: i64,
+    owner: i64,
+    block: bool,
+    pid: u32,
+) -> Result<(), MetaError> {
+    store
+        .set_plock(
+            inode,
+            owner,
+            block,
+            FileLockType::Write,
+            FileLockRange { start: 0, end: 1 },
+            pid,
+        )
+        .await
+}
+
+/// Helper: release a lock on the given file.
+async fn release_lock(
+    store: &RedisMetaStore,
+    inode: i64,
+    owner: i64,
+    pid: u32,
+) -> Result<(), MetaError> {
+    store
+        .set_plock(
+            inode,
+            owner,
+            false,
+            FileLockType::UnLock,
+            FileLockRange { start: 0, end: 1 },
+            pid,
+        )
+        .await
+}
+
+/// Simulate the t_mtab lock pattern: N concurrent tasks each doing
+/// `iterations` lock-acquire-release cycles on the same file.
+async fn run_concurrent_lock_tasks(
+    store: Arc<RedisMetaStore>,
+    inode: i64,
+    num_tasks: usize,
+    iterations: usize,
+) -> Vec<usize> {
+    let mut handles = Vec::with_capacity(num_tasks);
+
+    for task_id in 0..num_tasks {
+        let store = store.clone();
+        let owner: i64 = 1001 + task_id as i64;
+        let pid: u32 = 500 + task_id as u32;
+
+        handles.push(tokio::spawn(async move {
+            let mut completed: usize = 0;
+            for _ in 0..iterations {
+                // Acquire write lock (blocking, like F_SETLKW)
+                acquire_write_lock(&store, inode, owner, true, pid)
+                    .await
+                    .expect("failed to acquire write lock");
+
+                // Simulate work: write temp file + rename
+                tokio::time::sleep(Duration::from_micros(50)).await;
+
+                // Release lock
+                release_lock(&store, inode, owner, pid)
+                    .await
+                    .expect("failed to release lock");
+
+                completed += 1;
+            }
+            completed
+        }));
+    }
+
+    let mut results = Vec::with_capacity(num_tasks);
+    for handle in handles {
+        match handle.await {
+            Ok(n) => results.push(n),
+            Err(e) => panic!("concurrent lock task panicked: {e}"),
+        }
+    }
+    results
+}
+
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_concurrent_write_lock_three_tasks_50_iterations() {
+    let store = Arc::new(new_test_store_with_epoch().await);
+    let parent = store.root_ino();
+    let file_ino = store
+        .create_file(parent, "lockfile_mtab".to_string())
+        .await
+        .expect("failed to create lock file");
+
+    // 3 tasks × 50 iterations each = t_mtab 50 pattern
+    let results = run_concurrent_lock_tasks(store, file_ino, 3, 50).await;
+
+    assert_eq!(results.len(), 3, "all 3 tasks must complete");
+    for (i, &completed) in results.iter().enumerate() {
+        assert_eq!(
+            completed, 50,
+            "task {i} completed {completed}/50 iterations"
+        );
+    }
+}
+
+/// Verify that after all locks are released, get_plock returns UnLock (no conflict).
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_write_lock_acquire_release_getlk() {
+    let store = Arc::new(new_test_store_with_epoch().await);
+    let parent = store.root_ino();
+    let file_ino = store
+        .create_file(parent, "lockfile_getlk".to_string())
+        .await
+        .expect("failed to create file");
+
+    // Acquire write lock
+    acquire_write_lock(&store, file_ino, 1001, false, 500)
+        .await
+        .expect("should acquire write lock");
+
+    // get_plock should see the lock
+    let query = FileLockQuery {
+        owner: 1001,
+        lock_type: FileLockType::Read,
+        range: FileLockRange { start: 0, end: 1 },
+    };
+    let info = store.get_plock(file_ino, &query).await.unwrap();
+    // Since the stored lock is a Write lock, querying with Read on the same
+    // range should report the Write lock holder.
+    assert_eq!(
+        info.lock_type,
+        FileLockType::Write,
+        "get_plock should see the write lock"
+    );
+    assert_eq!(info.pid, 500, "pid should match");
+
+    // Release
+    release_lock(&store, file_ino, 1001, 500)
+        .await
+        .expect("should release lock");
+
+    // After release, get_plock should return UnLock
+    let info2 = store.get_plock(file_ino, &query).await.unwrap();
+    assert_eq!(
+        info2.lock_type,
+        FileLockType::UnLock,
+        "no lock should remain after release"
+    );
+}
+
+/// Verify that write locks are mutually exclusive:
+/// Task B should not acquire the lock while Task A holds it.
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_write_lock_mutual_exclusion() {
+    let store = Arc::new(new_test_store_with_epoch().await);
+    let parent = store.root_ino();
+    let file_ino = store
+        .create_file(parent, "lockfile_mutex".to_string())
+        .await
+        .expect("failed to create file");
+
+    // Task A acquires write lock
+    acquire_write_lock(&store, file_ino, 1001, false, 500)
+        .await
+        .expect("task A should acquire write lock");
+
+    // Task B tries non-blocking write lock — must fail with conflict
+    let result = acquire_write_lock(&store, file_ino, 1002, false, 501).await;
+    assert!(
+        matches!(result, Err(MetaError::LockConflict { .. })),
+        "task B should get LockConflict but got: {result:?}"
+    );
+
+    // Task A releases
+    release_lock(&store, file_ino, 1001, 500)
+        .await
+        .expect("task A should release");
+
+    // Now Task B should succeed
+    acquire_write_lock(&store, file_ino, 1002, false, 501)
+        .await
+        .expect("task B should acquire after A releases");
+
+    release_lock(&store, file_ino, 1002, 501)
+        .await
+        .expect("task B should release");
+}
+
+/// Verify that read locks can be shared concurrently (read-read no conflict).
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_read_lock_shared() {
+    let store = Arc::new(new_test_store_with_epoch().await);
+    let parent = store.root_ino();
+    let file_ino = store
+        .create_file(parent, "lockfile_shared".to_string())
+        .await
+        .expect("failed to create file");
+
+    // Task A acquires read lock
+    store
+        .set_plock(
+            file_ino,
+            1001,
+            false,
+            FileLockType::Read,
+            FileLockRange { start: 0, end: 100 },
+            500,
+        )
+        .await
+        .expect("task A should acquire read lock");
+
+    // Task B acquires read lock on same range — should succeed (read-read OK)
+    store
+        .set_plock(
+            file_ino,
+            1002,
+            false,
+            FileLockType::Read,
+            FileLockRange { start: 0, end: 100 },
+            501,
+        )
+        .await
+        .expect("task B should also acquire read lock (read-read is shared)");
+
+    // Task C tries write lock — must fail (read-write conflict)
+    let result = store
+        .set_plock(
+            file_ino,
+            1003,
+            false,
+            FileLockType::Write,
+            FileLockRange { start: 0, end: 100 },
+            502,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(MetaError::LockConflict { .. })),
+        "write should conflict with held read locks"
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore = "requires Redis server"]
+async fn test_set_plock_succeeds_on_nonexistent_inode() {
+    let store = new_test_store_with_epoch().await;
+
+    // set_plock on a non-existent inode must succeed because POSIX
+    // advisory locks (plocks) are stored independently of node data.
+    // The Lua script only reads/writes plock keys; it never references
+    // the node.  Returning NotFound here would cause fcntl(F_SETLKW)
+    // to fail when a lock-file inode has been unlinked by the lock
+    // holder before a waiter can acquire the lock.
+    let result = store
+        .set_plock(
+            99999, // non-existent inode
+            1001,  // owner
+            false, // non-blocking
+            FileLockType::Write,
+            FileLockRange { start: 0, end: 100 },
+            1234,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "set_plock on non-existent inode should succeed (plocks are indep of node), got: {:?}",
+        result
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore = "requires Redis server"]
+async fn test_set_plock_succeeds_on_deleted_inode_via_unlink() {
+    let store = new_test_store_with_epoch().await;
+    let parent = store.root_ino();
+
+    // Create a file, then unlink it so nlink drops to 0 and the node
+    // is tombstoned.  set_plock on the tombstoned inode must still
+    // succeed — the Lua script for ReadLock/WriteLock only touches
+    // plock hashes.
+    let file_ino = store
+        .create_file(parent, "lockfile".to_string())
+        .await
+        .unwrap();
+    store.unlink(parent, "lockfile").await.unwrap();
+
+    let result = store
+        .set_plock(
+            file_ino,
+            1001,
+            false,
+            FileLockType::Write,
+            FileLockRange { start: 0, end: 100 },
+            1234,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "set_plock on unlinked (tombstoned) inode should succeed, got: {:?}",
+        result
+    );
+}
+
+#[serial]
+#[tokio::test]
+#[ignore = "requires Redis server"]
+async fn test_blocking_set_plock_succeeds_after_unlink_releases_lock() {
+    let store_a = new_test_store_with_epoch().await;
+    let parent = store_a.root_ino();
+
+    let file_ino = store_a
+        .create_file(parent, "lockfile".to_string())
+        .await
+        .unwrap();
+
+    // Session A acquires the write lock
+    store_a
+        .set_plock(
+            file_ino,
+            1001, // owner A
+            false,
+            FileLockType::Write,
+            FileLockRange { start: 0, end: 100 },
+            1234,
+        )
+        .await
+        .unwrap();
+
+    // A releases its lock via UnLock (simulating close(fd) → release → unlock_owner_locks)
+    store_a
+        .set_plock(
+            file_ino,
+            1001,
+            false,
+            FileLockType::UnLock,
+            FileLockRange {
+                start: 0,
+                end: u64::MAX,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+
+    // A unlinks the lock file (simulating unlock_mtab)
+    store_a.unlink(parent, "lockfile").await.unwrap();
+
+    // Session B now tries to acquire the lock on the tombstoned inode.
+    // This must succeed — the plock from A was cleared, and node
+    // existence is irrelevant for plock semantics.
+    let store_b = new_test_store_with_epoch().await;
+    let result = store_b
+        .set_plock(
+            file_ino,
+            2002, // owner B
+            false,
+            FileLockType::Write,
+            FileLockRange { start: 0, end: 100 },
+            5678,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "set_plock on tombstoned inode after unlock should succeed, got: {:?}",
+        result
     );
 }

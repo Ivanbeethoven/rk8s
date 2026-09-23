@@ -135,7 +135,7 @@ main() {
   prepare_fuse
   write_config
 
-  exec /usr/local/bin/slayerfs mount \
+  exec /usr/local/bin/slayerfs mount --privileged \
     --config "${SLAYERFS_CONFIG_PATH:-/run/slayerfs/config.yaml}" \
     "${SLAYERFS_MOUNT_POINT:-/mnt/slayerfs}"
 }

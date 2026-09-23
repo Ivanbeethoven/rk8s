@@ -1011,7 +1011,7 @@ async fn test_uncommitted_gc_and_version_conflict_etcd() {
         .replace_slices_for_compact_with_version(33, &[replacement], &delayed, &[])
         .await
         .unwrap_err();
-    assert!(matches!(err, MetaError::ContinueRetry));
+    assert!(matches!(err, MetaError::ContinueRetry(_)));
 
     store
         .record_uncommitted_slice(402, 33, 256, "compact_heavy")
@@ -1109,7 +1109,7 @@ async fn test_chunk_compact_lock_blocks_write_until_release_etcd() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(blocked, MetaError::ContinueRetry));
+    assert!(matches!(blocked, MetaError::ContinueRetry(_)));
 
     assert!(
         store

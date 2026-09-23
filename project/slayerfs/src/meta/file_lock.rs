@@ -2,15 +2,84 @@ use sea_orm::{
     TryGetError, Value,
     sea_query::{self, ValueTypeErr},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum FileLockType {
     Read = libc::F_RDLCK as u32,
     Write = libc::F_WRLCK as u32,
     UnLock = libc::F_UNLCK as u32,
+}
+
+/// Serialize as integer (0=Read, 1=Write, 2=UnLock) to match the
+/// format used by the Redis Lua lock scripts.
+impl Serialize for FileLockType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u32(self.as_u32())
+    }
+}
+
+/// Deserialize from either an integer (Lua script format) or a
+/// legacy string variant name for transparent compatibility.
+impl<'de> Deserialize<'de> for FileLockType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = FileLockType;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a file lock type (integer 0-2 or string)")
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<FileLockType, E>
+            where
+                E: serde::de::Error,
+            {
+                FileLockType::from_u32(v as u32).ok_or_else(|| {
+                    serde::de::Error::invalid_value(serde::de::Unexpected::Unsigned(v), &self)
+                })
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<FileLockType, E>
+            where
+                E: serde::de::Error,
+            {
+                if v < 0 {
+                    return Err(serde::de::Error::invalid_value(
+                        serde::de::Unexpected::Signed(v),
+                        &self,
+                    ));
+                }
+                FileLockType::from_u32(v as u32).ok_or_else(|| {
+                    serde::de::Error::invalid_value(serde::de::Unexpected::Signed(v), &self)
+                })
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<FileLockType, E>
+            where
+                E: serde::de::Error,
+            {
+                match v {
+                    "Read" => Ok(FileLockType::Read),
+                    "Write" => Ok(FileLockType::Write),
+                    "UnLock" => Ok(FileLockType::UnLock),
+                    _ => Err(serde::de::Error::unknown_variant(
+                        v,
+                        &["Read", "Write", "UnLock"],
+                    )),
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 impl FileLockType {
@@ -88,97 +157,79 @@ impl PlockRecord {
     }
 
     pub fn update_locks(mut ls: Vec<PlockRecord>, nl: PlockRecord) -> Vec<PlockRecord> {
-        let mut i = 0;
-        let mut nl = nl;
-        let mut new_records = Vec::new(); // records need to insert
+        let mut result = Vec::with_capacity(ls.len() + 1);
+        let mut inserted = false;
 
-        while i < ls.len() && nl.lock_range.end > nl.lock_range.start {
-            let l = ls[i];
-
-            match () {
-                _ if l.lock_range.end < nl.lock_range.start => {
-                    // skip
-                }
-                _ if l.lock_range.start < nl.lock_range.start => {
-                    // split the current lock
-                    let mut left = ls[i];
-                    left.lock_range.end = nl.lock_range.start;
-
-                    let middle = PlockRecord::new(
-                        nl.lock_type,
-                        nl.pid,
-                        nl.lock_range.start,
-                        l.lock_range.end,
-                    );
-                    new_records.push((i + 1, middle));
-
-                    ls[i] = left;
-                    nl.lock_range.start = l.lock_range.end;
-                    i += 1;
-                }
-                _ if l.lock_range.end > nl.lock_range.end
-                    && l.lock_range.start >= nl.lock_range.start =>
-                {
-                    // Exact or partial overlap from the right - shrink the current lock
-                    ls[i].lock_range.start = nl.lock_range.end;
-                    nl.lock_range.start = l.lock_range.end;
-                }
-                _ if l.lock_range.start < nl.lock_range.start
-                    && l.lock_range.end > nl.lock_range.end =>
-                {
-                    // Unlock range is inside current lock - split into two locks
-                    let mut left_part = ls[i];
-                    left_part.lock_range.end = nl.lock_range.start;
-
-                    let right_part =
-                        PlockRecord::new(l.lock_type, l.pid, nl.lock_range.end, l.lock_range.end);
-
-                    ls[i] = left_part;
-                    new_records.push((i + 1, right_part));
-                    i += 1;
-                }
-                _ => {
-                    // Exact match or unlock covers the current lock
-                    // Remove this lock completely
-                    ls.remove(i);
-                    nl.lock_range.start = l.lock_range.end;
-                    // Don't increment i since we want to process the next element (which shifted to current position)
-                    continue; // Skip the i += 1 at the end of this iteration
-                }
+        for lock in ls.drain(..) {
+            if lock.lock_range.end <= nl.lock_range.start {
+                result.push(lock);
+                continue;
             }
 
-            i += 1;
+            if lock.lock_range.start >= nl.lock_range.end {
+                if !inserted
+                    && nl.lock_type != FileLockType::UnLock
+                    && nl.lock_range.start < nl.lock_range.end
+                {
+                    result.push(nl);
+                    inserted = true;
+                }
+                result.push(lock);
+                continue;
+            }
+
+            if lock.lock_range.start < nl.lock_range.start {
+                result.push(PlockRecord::new(
+                    lock.lock_type,
+                    lock.pid,
+                    lock.lock_range.start,
+                    nl.lock_range.start,
+                ));
+            }
+
+            if !inserted
+                && nl.lock_type != FileLockType::UnLock
+                && nl.lock_range.start < nl.lock_range.end
+            {
+                result.push(nl);
+                inserted = true;
+            }
+
+            if lock.lock_range.end > nl.lock_range.end {
+                result.push(PlockRecord::new(
+                    lock.lock_type,
+                    lock.pid,
+                    nl.lock_range.end,
+                    lock.lock_range.end,
+                ));
+            }
         }
 
-        // Insert from back to front to avoid index shifting issues
-        for (pos, record) in new_records.into_iter().rev() {
-            ls.insert(pos, record);
-        }
-        if nl.lock_range.start < nl.lock_range.end {
-            ls.push(PlockRecord::new(
-                nl.lock_type,
-                nl.pid,
-                nl.lock_range.start,
-                nl.lock_range.end,
-            ));
+        if !inserted
+            && nl.lock_type != FileLockType::UnLock
+            && nl.lock_range.start < nl.lock_range.end
+        {
+            result.push(nl);
         }
 
-        // Cleanup and merge
-        ls.retain(|r| r.lock_type != FileLockType::UnLock && r.lock_range.start < r.lock_range.end);
+        result.retain(|r| {
+            r.lock_type != FileLockType::UnLock && r.lock_range.start < r.lock_range.end
+        });
 
-        let mut result: Vec<PlockRecord> = Vec::new();
-        for record in ls {
-            if let Some(last) = result.last_mut()
+        let mut merged: Vec<PlockRecord> = Vec::with_capacity(result.len());
+        for record in result {
+            if let Some(last) = merged.last_mut()
                 && last.lock_type == record.lock_type
+                && last.pid == record.pid
                 && last.lock_range.end == record.lock_range.start
             {
                 last.lock_range.end = record.lock_range.end;
                 continue;
             }
-            result.push(record);
+            merged.push(record);
         }
 
-        result
+        merged
     }
 
     pub fn check_conflict(

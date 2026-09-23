@@ -9,13 +9,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::chunk::cache_health::DiskHealth;
 use anyhow::anyhow;
+use dashmap::DashSet;
 use dirs::cache_dir;
 use sea_orm::sea_query::WindowSelectType;
 use sha2::{Digest, Sha256, digest::KeyInit};
 use tokio::fs;
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{debug, error, info, trace, warn};
+
+static DISK_CACHE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const DISK_CACHE_READ_CONCURRENCY: usize = 16;
+const DISK_CACHE_WRITE_CONCURRENCY: usize = 16;
 
 /// Configuration for the intelligent dual-layer cache system.
 ///
@@ -57,7 +63,7 @@ use tracing::{debug, error, info, trace, warn};
 /// ## Adaptive Threshold Logic
 ///
 /// - **High Load** (>0.8): Reduce threshold by 30% for aggressive promotion
-/// - **Low Hit Rate** (<0.6): Increase threshold by 30% to prevent cache pollution
+/// - **Low Hit Rate** (<0.6): Reduce threshold to accelerate cold-cache warmup
 /// - **High Hit Rate** (>0.8): Reduce threshold by 10% to maintain performance
 ///
 /// # Example Configurations
@@ -123,6 +129,20 @@ pub struct ChunksCacheConfig {
     ///         calculated dynamically based on window sizes.
     pub max_access_entries: usize,
 
+    /// Maximum bytes for the hot (in-memory) cache tier.
+    ///
+    /// **Default**: 1 GiB (maps to CacheConfig.read_memory_bytes)
+    /// **Impact**: Controls how much RAM is used for frequently-accessed blocks.
+    /// Uses moka's byte-weighted eviction (weigher returns entry byte size).
+    pub max_hot_bytes: u64,
+
+    /// Maximum bytes for on-disk cache storage.
+    ///
+    /// **Default**: 20 GiB (maps to CacheConfig.read_ssd_bytes)
+    /// **Impact**: Controls SSD usage for the persistent read cache.
+    /// When exceeded, oldest files (by access time) are evicted on insert.
+    pub max_disk_bytes: u64,
+
     /// Custom disk storage directory (optional)
     ///
     /// If None, uses system cache directory via `dirs::cache_dir()`
@@ -171,13 +191,15 @@ impl Default for ChunksCacheConfig {
         Self {
             hot_cache_size: 1024,
             cold_cache_size: 1024,
-            base_promotion_threshold: 10.0,
+            max_hot_bytes: 1024 * 1024 * 1024,       // 1 GiB
+            max_disk_bytes: 20 * 1024 * 1024 * 1024, // 20 GiB
+            base_promotion_threshold: 5.0,
             short_window_size: Duration::from_secs(10),
             medium_window_size: Duration::from_secs(60),
             max_access_entries: 100,
             disk_storage_dir: None,
-            short_window_weight: 0.7,
-            medium_window_weight: 0.3,
+            short_window_weight: 0.75,
+            medium_window_weight: 0.25,
             enable_adaptive_threshold: true,
             aggressive_promotion_load_threshold: 0.8,
             conservative_promotion_hit_rate_threshold: 0.6,
@@ -185,15 +207,39 @@ impl Default for ChunksCacheConfig {
     }
 }
 
+impl ChunksCacheConfig {
+    /// Create a config with explicit byte budgets and cache directory.
+    pub fn with_budgets(read_memory_bytes: u64, read_ssd_bytes: u64, cache_dir: PathBuf) -> Self {
+        Self {
+            max_hot_bytes: read_memory_bytes,
+            max_disk_bytes: read_ssd_bytes,
+            disk_storage_dir: Some(cache_dir),
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DiskStorage {
     base_dir: PathBuf,
+    health: Arc<DiskHealth>,
+    /// Current total bytes used on disk
+    bytes_used: Arc<AtomicU64>,
+    /// Maximum bytes allowed on disk (0 = unlimited)
+    max_bytes: u64,
+    /// Semaphore for read operations (higher priority, separate pool)
+    read_sem: Arc<Semaphore>,
+    /// Semaphore for write/store operations
+    write_sem: Arc<Semaphore>,
 }
 
 impl DiskStorage {
-    pub async fn new<P: AsRef<Path>>(base_dir: P) -> anyhow::Result<Self> {
+    pub async fn new<P: AsRef<Path>>(base_dir: P, max_bytes: u64) -> anyhow::Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
-        debug!("Initializing disk storage at: {:?}", base_dir);
+        debug!(
+            "Initializing disk storage at: {:?}, max_bytes: {}",
+            base_dir, max_bytes
+        );
 
         if !base_dir.exists() {
             info!("Creating cache directory: {:?}", base_dir);
@@ -202,7 +248,39 @@ impl DiskStorage {
             debug!("Cache directory already exists: {:?}", base_dir);
         }
 
-        Ok(Self { base_dir })
+        // Scan existing files to calculate initial bytes_used
+        let initial_bytes = Self::scan_dir_size(&base_dir).await;
+        debug!(
+            "Initial disk cache usage: {} bytes ({:.1} MiB)",
+            initial_bytes,
+            initial_bytes as f64 / 1048576.0
+        );
+
+        Ok(Self {
+            base_dir,
+            health: Arc::new(DiskHealth::new()),
+            bytes_used: Arc::new(AtomicU64::new(initial_bytes)),
+            max_bytes,
+            read_sem: Arc::new(Semaphore::new(DISK_CACHE_READ_CONCURRENCY)),
+            write_sem: Arc::new(Semaphore::new(DISK_CACHE_WRITE_CONCURRENCY)),
+        })
+    }
+
+    /// Scan directory to calculate total size of cached files
+    async fn scan_dir_size(dir: &Path) -> u64 {
+        let mut total = 0u64;
+        let mut entries = match tokio::fs::read_dir(dir).await {
+            Ok(e) => e,
+            Err(_) => return 0,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(meta) = entry.metadata().await {
+                if meta.is_file() {
+                    total += meta.len();
+                }
+            }
+        }
+        total
     }
 
     pub fn key_to_filename(key: &str) -> String {
@@ -213,50 +291,273 @@ impl DiskStorage {
         hex::encode(hash_result)
     }
 
+    /// Get current bytes used on disk
+    pub fn bytes_used(&self) -> u64 {
+        self.bytes_used.load(Ordering::Relaxed)
+    }
+
     pub async fn store(&self, key: &str, data: impl AsRef<[u8]>) -> anyhow::Result<()> {
+        let permit = self.write_sem.clone().acquire_owned().await?;
+        self.store_with_permit(key, bytes::Bytes::copy_from_slice(data.as_ref()), permit)
+            .await
+    }
+
+    pub async fn store_with_health(
+        &self,
+        key: &str,
+        data: impl AsRef<[u8]>,
+    ) -> anyhow::Result<bool> {
+        if self.health.is_bypassed() {
+            return Ok(false);
+        }
+
+        match self.store(key, data).await {
+            Ok(()) => {
+                self.health.record_success();
+                Ok(true)
+            }
+            Err(err) => {
+                self.health.record_error();
+                warn!(key, error = ?err, "disk cache store failed; treating as cache miss");
+                Ok(false)
+            }
+        }
+    }
+
+    async fn store_with_permit_health(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        permit: OwnedSemaphorePermit,
+    ) -> anyhow::Result<bool> {
+        if self.health.is_bypassed() {
+            return Ok(false);
+        }
+
+        match self.store_with_permit(key, data, permit).await {
+            Ok(()) => {
+                self.health.record_success();
+                Ok(true)
+            }
+            Err(err) => {
+                self.health.record_error();
+                warn!(key, error = ?err, "disk cache store failed; treating as cache miss");
+                Ok(false)
+            }
+        }
+    }
+
+    async fn store_with_permit(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        _permit: OwnedSemaphorePermit,
+    ) -> anyhow::Result<()> {
         let filename = Self::key_to_filename(key);
-        let filepath = self.base_dir.join(filename);
-        let data_bytes = data.as_ref();
+        let filepath = self.base_dir.join(&filename);
 
-        trace!(
-            "Storing {} bytes for key '{}' to file: {:?}",
-            data_bytes.len(),
-            key,
-            filepath
-        );
+        // Compute CRC32C framing without copying the data block
+        let (header, checksums) = super::cache_integrity::compute_framing(&data);
+        let total_len = (header.len() + data.len() + checksums.len()) as u64;
 
-        tokio::fs::write(filepath, data_bytes).await?;
-        debug!(
-            "Successfully stored data for key '{}', size: {} bytes",
-            key,
-            data_bytes.len()
-        );
+        // Atomically reserve space and trigger eviction if over budget.
+        // fetch_add is atomic — no race between multiple concurrent store() calls.
+        if self.max_bytes > 0 {
+            let prev = self.bytes_used.fetch_add(total_len, Ordering::Relaxed);
+            if prev + total_len > self.max_bytes {
+                self.evict_lru(total_len).await;
+            }
+        } else {
+            self.bytes_used.fetch_add(total_len, Ordering::Relaxed);
+        }
+
+        // If the file already exists, subtract its old size (we already added total_len)
+        if let Ok(meta) = tokio::fs::metadata(&filepath).await {
+            self.bytes_used.fetch_sub(meta.len(), Ordering::Relaxed);
+        }
+
+        // Write to a private temp file first, then atomically publish it with
+        // rename. Readers either see the previous complete file or the new
+        // complete file, never a partially-written cache entry.
+        let tmp_id = DISK_CACHE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = self.base_dir.join(format!(".{}.{}.tmp", filename, tmp_id));
+        let tmp_path_for_write = tmp_path.clone();
+        let write_result = match tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+
+            let mut file = std::fs::File::create(&tmp_path_for_write)?;
+            file.write_all(&header)?;
+            file.write_all(&data)?;
+            file.write_all(&checksums)?;
+            drop(file);
+            std::fs::rename(&tmp_path_for_write, &filepath)?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => Err(err.into()),
+        };
+
+        if let Err(e) = write_result {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            // Roll back the pre-reserved bytes on write failure
+            self.bytes_used.fetch_sub(total_len, Ordering::Relaxed);
+            return Err(e);
+        }
+
         Ok(())
+    }
+
+    fn try_io_permit(&self, key: &str) -> Option<OwnedSemaphorePermit> {
+        let Ok(permit) = self.write_sem.clone().try_acquire_owned() else {
+            trace!(
+                "Skipping disk cache store for key '{}' because IO is busy",
+                key
+            );
+            return None;
+        };
+        Some(permit)
+    }
+
+    /// Clone the write IO semaphore Arc for deferred disk cache writes.
+    fn io_sem_clone(&self) -> Arc<Semaphore> {
+        self.write_sem.clone()
+    }
+
+    /// Evict oldest files (by access time) to free at least `needed_bytes`
+    async fn evict_lru(&self, needed_bytes: u64) {
+        let target = self.max_bytes.saturating_sub(needed_bytes);
+        let current = self.bytes_used.load(Ordering::Relaxed);
+        if current <= target {
+            return;
+        }
+        let to_free = current - target;
+        debug!(
+            "Disk cache eviction: need to free {} bytes ({:.1} MiB)",
+            to_free,
+            to_free as f64 / 1048576.0
+        );
+
+        // Collect files with their access times
+        let mut files: Vec<(PathBuf, u64, u64)> = Vec::new(); // (path, size, atime_secs)
+        let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(meta) = entry.metadata().await {
+                if meta.is_file() {
+                    let atime = meta
+                        .accessed()
+                        .unwrap_or(SystemTime::UNIX_EPOCH)
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    files.push((entry.path(), meta.len(), atime));
+                }
+            }
+        }
+
+        // Sort by access time (oldest first)
+        files.sort_by_key(|f| f.2);
+
+        let mut freed = 0u64;
+        for (path, size, _) in &files {
+            if freed >= to_free {
+                break;
+            }
+            if tokio::fs::remove_file(path).await.is_ok() {
+                freed += size;
+                self.bytes_used.fetch_sub(*size, Ordering::Relaxed);
+                trace!("Evicted cache file: {:?} ({} bytes)", path, size);
+            }
+        }
+        debug!(
+            "Disk cache eviction complete: freed {} bytes ({:.1} MiB)",
+            freed,
+            freed as f64 / 1048576.0
+        );
     }
 
     pub async fn load(&self, key: &str) -> anyhow::Result<Vec<u8>> {
         let filename = Self::key_to_filename(key);
         let filepath = self.base_dir.join(filename);
 
-        trace!("Loading data for key '{}' from file: {:?}", key, filepath);
-
-        if !filepath.exists() {
-            trace!("File does not exist for key '{}': {:?}", key, filepath);
-            return Err(anyhow!("file {} does not exist", filepath.display()));
-        }
-
-        match tokio::fs::read(filepath).await {
-            Ok(data) => {
-                debug!(
-                    "Successfully loaded data for key '{}', size: {} bytes",
-                    key,
-                    data.len()
-                );
-                Ok(data)
+        let _permit = self.read_sem.clone().acquire_owned().await?;
+        let raw = match tokio::fs::read(&filepath).await {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(anyhow!("file {} does not exist", filepath.display()));
             }
             Err(e) => {
-                error!("Failed to load data for key '{}': {}", key, e);
-                Err(e.into())
+                return Err(e.into());
+            }
+        };
+
+        // Decode with CRC32C verification (handles legacy unencoded files too)
+        match super::cache_integrity::decode(&raw) {
+            Some(data) => {
+                // Touch atime so LRU eviction keeps hot data longer.
+                // Uses futimens with UTIME_NOW on atime only (mtime unchanged).
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let _ = std::fs::metadata(&filepath).map(|m| {
+                        let mtime = libc::timespec {
+                            tv_sec: m.mtime(),
+                            tv_nsec: m.mtime_nsec(),
+                        };
+                        let times = [
+                            libc::timespec {
+                                tv_sec: 0,
+                                tv_nsec: libc::UTIME_NOW,
+                            },
+                            mtime,
+                        ];
+                        let c_path =
+                            std::ffi::CString::new(filepath.as_os_str().as_encoded_bytes()).ok();
+                        if let Some(p) = c_path {
+                            unsafe {
+                                // SAFETY: valid null-terminated path and timespec array
+                                libc::utimensat(libc::AT_FDCWD, p.as_ptr(), times.as_ptr(), 0);
+                            }
+                        }
+                    });
+                }
+                Ok(data)
+            }
+            None => {
+                // Corrupted — delete the file and return error
+                let _ = tokio::fs::remove_file(&filepath).await;
+                Err(anyhow!(
+                    "CRC32C verification failed for cache key '{}', file deleted",
+                    key
+                ))
+            }
+        }
+    }
+
+    pub async fn load_with_health(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        if self.health.is_bypassed() {
+            return Ok(None);
+        }
+
+        let filename = Self::key_to_filename(key);
+        let filepath = self.base_dir.join(filename);
+        if tokio::fs::metadata(&filepath).await.is_err() {
+            return Ok(None);
+        }
+
+        match self.load(key).await {
+            Ok(data) => {
+                self.health.record_success();
+                Ok(Some(data))
+            }
+            Err(err) => {
+                self.health.record_error();
+                warn!(key, error = ?err, "disk cache load failed; treating as cache miss");
+                Ok(None)
             }
         }
     }
@@ -275,8 +576,16 @@ impl DiskStorage {
             return Err(anyhow!("file {} does not exist", filepath.display()));
         }
 
-        match tokio::fs::remove_file(filepath).await {
+        // Get size before removing
+        let file_size = tokio::fs::metadata(&filepath)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        let _permit = self.write_sem.clone().acquire_owned().await?;
+        match tokio::fs::remove_file(&filepath).await {
             Ok(_) => {
+                self.bytes_used.fetch_sub(file_size, Ordering::Relaxed);
                 debug!("Successfully removed file for key '{}'", key);
                 Ok(())
             }
@@ -817,6 +1126,10 @@ impl SystemMetrics {
         utilization * 0.7 + (request_rate / 100.0).min(1.0) * 0.3 // Adjusted scaling for RPS
     }
 
+    fn get_hot_cache_utilization(&self) -> f64 {
+        self.hot_cache_utilization.load(Ordering::Relaxed) as f64 / 10000.0
+    }
+
     fn update_cache_utilization(&self, current_size: u64, max_size: u64) {
         if max_size > 0 {
             let utilization = current_size
@@ -856,7 +1169,7 @@ impl SystemMetrics {
 /// - **Normal Load**: `factor = 1.0` (baseline)
 ///
 /// ## Hit Rate Factor
-/// - **Low Hit Rate** (<0.6): `factor = 1.3` (30% more conservative)
+/// - **Low Hit Rate** (<0.6): `factor = 0.5..0.75` (faster warmup)
 /// - **High Hit Rate** (>0.8): `factor = 0.9` (10% more aggressive)
 /// - **Normal Hit Rate**: `factor = 1.0` (baseline)
 ///
@@ -958,26 +1271,36 @@ impl Policy {
         let mut threshold = self.base_promotion_threshold;
         let mut adjustments = Vec::new();
 
-        // Adjust based on system load
-        if system_load > self.aggressive_promotion_load_threshold {
-            // High load: be more aggressive with promotion (lower threshold)
-            threshold *= 0.7;
-            adjustments.push(format!("high load ({:.2}): *0.7", system_load));
-        }
-
-        // Adjust based on hit rate
-        if hit_rate < self.conservative_promotion_hit_rate_threshold {
-            // Low hit rate: be more conservative (higher threshold) to avoid cache pollution
-            threshold *= 1.3;
-            adjustments.push(format!("low hit rate ({:.2}): *1.3", hit_rate));
+        // Adjust based on hit rate. A miss-heavy startup needs faster
+        // promotion; once hit rate recovers, return to the normal threshold.
+        if hit_rate < 0.3 {
+            threshold *= 0.5;
+            adjustments.push(format!("very low hit rate ({:.2}): *0.5", hit_rate));
+        } else if hit_rate < self.conservative_promotion_hit_rate_threshold {
+            threshold *= 0.75;
+            adjustments.push(format!("low hit rate ({:.2}): *0.75", hit_rate));
         } else if hit_rate > 0.8 {
             // High hit rate: be more aggressive to maintain good performance
             threshold *= 0.9;
             adjustments.push(format!("high hit rate ({:.2}): *0.9", hit_rate));
         }
 
+        let hot_utilization = self.system_metrics.get_hot_cache_utilization();
+        if hot_utilization > 0.95 {
+            threshold *= 1.6;
+            adjustments.push(format!("hot cache critical ({:.2}): *1.6", hot_utilization));
+        } else if hot_utilization > 0.85 {
+            threshold *= 1.3;
+            adjustments.push(format!("hot cache high ({:.2}): *1.3", hot_utilization));
+        }
+
+        if system_load > self.aggressive_promotion_load_threshold {
+            threshold *= 1.2;
+            adjustments.push(format!("high system load ({:.2}): *1.2", system_load));
+        }
+
         // Ensure threshold stays within reasonable bounds
-        let final_threshold = threshold.clamp(1.0, 50.0);
+        let final_threshold = threshold.clamp(2.0, 50.0);
 
         debug!(
             "Adaptive threshold calculation: base={:.2}, system_load={:.2}, hit_rate={:.2}, adjustments=[{}], final={:.2}",
@@ -1167,7 +1490,7 @@ impl Policy {
 /// let config = ChunksCacheConfig {
 ///     hot_cache_size: 2048,                 // Larger hot cache
 ///     base_promotion_threshold: 3.0,        // Very aggressive
-///     short_window_size: Duration::from_secs(5),   // Faster response
+///     short_window_size: Duration::from_millis(500),   // Faster response
 ///     short_window_weight: 0.9,            // Heavily prefer bursts
 ///     aggressive_promotion_load_threshold: 0.6,    // Earlier aggression
 ///     ..Default::default()
@@ -1181,32 +1504,53 @@ impl Policy {
 /// - Access statistics use lock-free atomic operations
 /// - Cache operations use Moka's concurrent-safe implementation
 ///
+/// Cache statistics for monitoring and diagnostics
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    pub hot_bytes: u64,
+    pub hot_entries: u64,
+    pub max_hot_bytes: u64,
+    pub disk_bytes: u64,
+    pub max_disk_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+}
+
 /// # Memory Management
 ///
 /// - **Hot Cache**: Stores actual data, limited by `hot_cache_size`
 /// - **Cold Cache**: Stores only `()` markers, minimal memory overhead
 /// - **Access Stats**: Per-key statistics, automatically cleaned up when idle
 /// - **Disk Storage**: Uses system temp directory, respects available space
+#[derive(Clone)]
 pub struct ChunksCache {
     /// Persistent disk storage backend with SHA256-based file naming
     disk_storage: DiskStorage,
 
     /// Hot cache tier storing frequently accessed data in memory
     /// Uses Moka's high-performance concurrent cache implementation
-    hot_cache: moka::future::Cache<String, Vec<u8>>,
+    hot_cache: moka::future::Cache<String, bytes::Bytes>,
 
-    /// Approximate hot cache bytes (sum of Vec<u8> lengths)
+    /// Approximate hot cache bytes (sum of Bytes lengths)
     hot_bytes: Arc<AtomicU64>,
 
     /// Cold cache tier tracking all accessed keys for pattern analysis
     /// Stores empty tuples () as lightweight metadata markers
     cold_cache: moka::future::Cache<String, ()>,
 
+    /// Keys currently being persisted to disk by opportunistic inserts.
+    disk_insert_inflight: Arc<DashSet<String>>,
+
     /// Intelligent promotion policy engine with adaptive thresholding
     policy: Policy,
 
     /// Cache configuration parameters (stored for runtime adjustments)
     config: ChunksCacheConfig,
+
+    /// Read-path cache hit counter (hot cache + disk cache)
+    pub cache_hits: Arc<AtomicU64>,
+    /// Read-path cache miss counter (fell through to S3)
+    pub cache_misses: Arc<AtomicU64>,
 }
 
 impl ChunksCache {
@@ -1217,9 +1561,13 @@ impl ChunksCache {
 
     /// Creates a new ChunksCache with custom configuration
     pub async fn new_with_config(mut config: ChunksCacheConfig) -> anyhow::Result<Self> {
-        info!(
-            "Creating new ChunksCache with configuration: hot_cache_size={}, cold_cache_size={}, base_promotion_threshold={}",
-            config.hot_cache_size, config.cold_cache_size, config.base_promotion_threshold
+        debug!(
+            "Creating new ChunksCache with configuration: hot_cache_size={}, cold_cache_size={}, max_hot_bytes={}, max_disk_bytes={}, base_promotion_threshold={}",
+            config.hot_cache_size,
+            config.cold_cache_size,
+            config.max_hot_bytes,
+            config.max_disk_bytes,
+            config.base_promotion_threshold
         );
 
         let cache_dir = config
@@ -1227,21 +1575,30 @@ impl ChunksCache {
             .take()
             .unwrap_or_else(|| cache_dir().unwrap());
         debug!("Using cache directory: {:?}", cache_dir);
-        let disk_storage = DiskStorage::new(cache_dir).await?;
+        let disk_storage = DiskStorage::new(cache_dir, config.max_disk_bytes).await?;
 
         let hot_bytes = Arc::new(AtomicU64::new(0));
         let hot_bytes_evict = hot_bytes.clone();
+        // Use byte-weighted capacity: moka evicts entries when total weight exceeds max_capacity.
+        // The weigher returns the byte size of each entry (clamped to u32::MAX).
         let hot_cache_builder = moka::future::Cache::builder()
-            .max_capacity(config.hot_cache_size as u64)
-            .time_to_idle(Duration::from_secs(30))
-            .time_to_live(Duration::from_secs(120))
-            .eviction_listener(move |_key, value: Vec<u8>, _cause| {
-                hot_bytes_evict.fetch_sub(value.len() as u64, Ordering::Relaxed);
+            .max_capacity(config.max_hot_bytes)
+            .weigher(|_key: &String, value: &bytes::Bytes| -> u32 {
+                // Each entry's weight is its byte size (with overhead estimate for key + metadata)
+                (value.len() as u64 + 64).min(u32::MAX as u64) as u32
+            })
+            .time_to_idle(Duration::from_secs(300))
+            .time_to_live(Duration::from_secs(3600))
+            .eviction_listener(move |_key, value: bytes::Bytes, _cause| {
+                // Saturating sub to prevent underflow from racing insert_hot/eviction
+                let _ = hot_bytes_evict.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(value.len() as u64))
+                });
             });
         let cold_cache_builder = moka::future::Cache::builder()
             .max_capacity(config.cold_cache_size as u64)
-            .time_to_idle(Duration::from_secs(30))
-            .time_to_live(Duration::from_secs(120));
+            .time_to_idle(Duration::from_secs(300))
+            .time_to_live(Duration::from_secs(3600));
 
         debug!(
             "Creating policy with adaptive threshold: {}",
@@ -1265,115 +1622,187 @@ impl ChunksCache {
             hot_cache: hot_cache_builder.build(),
             hot_bytes,
             cold_cache: cold_cache_builder.build(),
+            disk_insert_inflight: Arc::new(DashSet::new()),
             policy,
             config,
+            cache_hits: Arc::new(AtomicU64::new(0)),
+            cache_misses: Arc::new(AtomicU64::new(0)),
         })
     }
 
-    pub async fn get(&self, key: &String) -> Option<Vec<u8>> {
-        trace!("Cache GET request for key: {}", key);
-        self.policy.record_access(key.clone()).await;
-
-        // Check hot cache first
+    pub async fn get(&self, key: &String) -> Option<bytes::Bytes> {
+        // Check hot cache first — fastest path, no promotion tracking needed.
         if let Some(value) = self.hot_cache.get(key).await {
-            debug!(
-                "Hot cache HIT for key: {}, size: {} bytes",
-                key,
-                value.len()
-            );
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            trace!("Hot cache HIT: {} ({} bytes)", key, value.len());
             self.policy.record_cache_request(true);
-            self.update_utilization_metrics();
             return Some(value);
         }
 
-        debug!("Hot cache MISS for key: {}", key);
+        trace!("Hot cache MISS: {}", key);
         self.policy.record_cache_request(false);
 
-        let diskstorage = self.disk_storage.clone();
-        let policy = self.policy.clone();
-        let hot_cache = self.hot_cache.clone();
-        let hot_bytes = self.hot_bytes.clone();
-        let key_owned = key.to_string();
-
-        // ensure key exists in cold cache
-        self.cold_cache.get(key).await?;
-
-        let load_future = async move {
-            trace!("Loading data from disk for key: {}", key_owned);
-            let value = diskstorage.load(&key_owned).await.ok().unwrap_or_default();
-
-            if value.is_empty() {
-                warn!("No data found on disk for key: {}", key_owned);
-                return value;
+        // Try loading from disk directly — the cold_cache index may have
+        // evicted the key marker but the file can still exist on disk
+        // (populated by write-through or prior reads).
+        let value = match self.disk_storage.load_with_health(key).await {
+            Ok(Some(value)) if !value.is_empty() => value,
+            Ok(_) => {
+                self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                return None;
             }
-
-            debug!(
-                "Loaded {} bytes from disk for key: {}",
-                value.len(),
-                key_owned
-            );
-
-            if policy.should_promote(key_owned.clone()).await {
-                debug!("Promoting key to hot cache: {}", key_owned);
-                hot_cache.insert(key_owned.clone(), value.clone()).await;
-                hot_bytes.fetch_add(value.len() as u64, Ordering::Relaxed);
-            } else {
-                trace!("Key not eligible for promotion: {}", key_owned);
+            Err(_) => {
+                self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                return None;
             }
-
-            value
         };
 
-        let value = self.hot_cache.get_with_by_ref(key, load_future).await;
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        debug!("Loaded {} bytes from disk for key: {}", value.len(), key);
+
+        // Record access only for disk hits — drives promotion decisions.
+        self.policy.record_access(key.clone()).await;
+
+        // Re-populate cold cache index so future lookups are faster
+        self.cold_cache.insert(key.clone(), ()).await;
+
+        if self.policy.should_promote(key.clone()).await {
+            debug!("Promoting key to hot cache: {}", key);
+            let b = bytes::Bytes::from(value.clone());
+            self.hot_bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
+            self.hot_cache.insert(key.clone(), b).await;
+        }
 
         self.update_utilization_metrics();
+        Some(bytes::Bytes::from(value))
+    }
 
-        if value.is_empty() {
-            debug!("No data found for key: {}", key);
-            None
+    /// Update cache utilization metrics (using byte-based utilization)
+    fn update_utilization_metrics(&self) {
+        let hot_bytes = self.hot_cache.weighted_size();
+        let max_bytes = self.config.max_hot_bytes;
+        // Convert byte utilization to entry-like scale for the policy
+        let utilization_scaled = if max_bytes > 0 {
+            (hot_bytes * 10000 / max_bytes).min(10000)
         } else {
-            debug!("Returning {} bytes for key: {}", value.len(), key);
-            value.into()
+            0
+        };
+        trace!(
+            "Updating cache utilization: {:.1} MiB / {:.1} MiB hot, disk: {:.1} MiB / {:.1} MiB",
+            hot_bytes as f64 / 1048576.0,
+            max_bytes as f64 / 1048576.0,
+            self.disk_storage.bytes_used() as f64 / 1048576.0,
+            self.config.max_disk_bytes as f64 / 1048576.0,
+        );
+        self.policy
+            .update_cache_utilization(utilization_scaled, 10000);
+    }
+
+    /// Get cache statistics
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hot_bytes: self.hot_cache.weighted_size(),
+            hot_entries: self.hot_cache.entry_count(),
+            max_hot_bytes: self.config.max_hot_bytes,
+            disk_bytes: self.disk_storage.bytes_used(),
+            max_disk_bytes: self.config.max_disk_bytes,
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(Ordering::Relaxed),
         }
     }
 
-    /// Update cache utilization metrics
-    fn update_utilization_metrics(&self) {
-        let current_size = self.hot_cache.entry_count();
-        let max_size = self.config.hot_cache_size as u64;
-        let bytes = self.hot_bytes.load(Ordering::Relaxed);
-        trace!(
-            "Updating cache utilization: {}/{} entries, {} MB hot bytes",
-            current_size,
-            max_size,
-            bytes / 1024 / 1024
-        );
-        self.policy.update_cache_utilization(current_size, max_size);
+    pub async fn insert_hot(&self, key: &str, data: bytes::Bytes) {
+        let len = data.len() as u64;
+        self.hot_cache.insert(key.to_owned(), data).await;
+        self.hot_cache.run_pending_tasks().await;
+        self.hot_bytes.fetch_add(len, Ordering::Relaxed);
+    }
+
+    pub async fn insert_opportunistic(&self, key: String, data: bytes::Bytes) {
+        // Insert into hot memory cache (fast path for subsequent reads).
+        // Bytes::clone() is an Arc bump — zero-copy.
+        self.insert_hot(&key, data.clone()).await;
+
+        // Persist to disk so future cold starts / hot cache evictions avoid
+        // S3, but keep this genuinely opportunistic. If local cache I/O is
+        // saturated, skip the disk write instead of queuing more background
+        // work that can compete with foreground reads and writes.
+        if self.cold_cache.get(&key).await.is_some() {
+            return;
+        }
+
+        let Some(permit) = self.disk_storage.try_io_permit(&key) else {
+            tracing::debug!(
+                key = %key,
+                "disk cache insert skipped: write_sem saturated"
+            );
+            return;
+        };
+
+        if !self.disk_insert_inflight.insert(key.clone()) {
+            return;
+        }
+
+        let disk_storage = self.disk_storage.clone();
+        let cold_cache = self.cold_cache.clone();
+        let inflight = self.disk_insert_inflight.clone();
+        let cached_key = key.clone();
+        tokio::spawn(async move {
+            // Ensure inflight is always cleared when this task exits.
+            struct ClearInFlight {
+                inflight: Arc<DashSet<String>>,
+                key: String,
+            }
+            impl Drop for ClearInFlight {
+                fn drop(&mut self) {
+                    self.inflight.remove(&self.key);
+                }
+            }
+            let _clear = ClearInFlight {
+                inflight: inflight.clone(),
+                key: cached_key.clone(),
+            };
+
+            if cold_cache.get(&cached_key).await.is_some() {
+                return;
+            }
+
+            let res = disk_storage
+                .store_with_permit_health(&cached_key, data, permit)
+                .await;
+
+            match res {
+                Ok(true) => {
+                    cold_cache.insert(cached_key.clone(), ()).await;
+                }
+                Ok(false) => {
+                    // Bypassed by health check — no error, no cold marker
+                }
+                Err(err) => {
+                    warn!(error = ?err, key = %cached_key, "disk cache store failed");
+                }
+            }
+        });
+    }
+
+    pub async fn is_disk_cached(&self, key: &str) -> bool {
+        self.cold_cache.get(key).await.is_some()
+    }
+
+    pub fn hit_rate(&self) -> f64 {
+        self.policy.system_metrics.get_hit_rate()
     }
 
     pub async fn insert(&self, key: &str, data: &Vec<u8>) -> anyhow::Result<()> {
-        info!(
-            "Cache INSERT request for key: {}, size: {} bytes",
-            key,
-            data.len()
-        );
-        trace!("Inserting into hot cache: {}", key);
-        self.hot_cache.insert(key.to_owned(), data.clone()).await;
-        self.hot_bytes
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
-
-        trace!("Storing on disk: {}", key);
-        self.disk_storage.store(key, data).await?;
-
-        trace!("Adding to cold cache: {}", key);
-        self.cold_cache.insert(key.to_owned(), ()).await;
-
-        debug!("Successfully inserted key: {}", key);
+        self.insert_hot(key, bytes::Bytes::from(data.clone())).await;
+        if self.disk_storage.store_with_health(key, data).await? {
+            self.cold_cache.insert(key.to_owned(), ()).await;
+        }
         Ok(())
     }
 
     pub async fn remove(&self, key: &String) -> anyhow::Result<()> {
-        info!("Cache REMOVE request for key: {}", key);
+        debug!("Cache REMOVE request for key: {}", key);
         trace!("Invalidating from hot cache: {}", key);
         self.hot_cache.invalidate(key).await;
         // self.disk_storage.remove(key).await?;
@@ -1383,11 +1812,49 @@ impl ChunksCache {
         debug!("Successfully removed key: {}", key);
         Ok(())
     }
-}
 
+    /// Try to acquire a disk write permit without blocking.
+    /// Returns None if disk I/O is saturated (all write_sem permits taken).
+    pub fn try_disk_store_permit(&self, key: &str) -> Option<OwnedSemaphorePermit> {
+        self.disk_storage.try_io_permit(key)
+    }
+
+    /// Store data to disk cache, awaiting a write permit if necessary.
+    /// Used by background write-cache population tasks.
+    pub async fn store_to_disk(&self, key: &str, data: bytes::Bytes) -> anyhow::Result<()> {
+        let permit = self.disk_storage.write_sem.clone().acquire_owned().await?;
+        if self
+            .disk_storage
+            .store_with_permit_health(key, data, permit)
+            .await?
+        {
+            self.cold_cache.insert(key.to_owned(), ()).await;
+        }
+        Ok(())
+    }
+
+    /// Store data to disk cache using a pre-acquired permit.
+    /// Used by write-path cache population to avoid blocking on permit acquisition.
+    pub async fn store_to_disk_with_permit(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        permit: OwnedSemaphorePermit,
+    ) -> anyhow::Result<()> {
+        if self
+            .disk_storage
+            .store_with_permit_health(key, data, permit)
+            .await?
+        {
+            self.cold_cache.insert(key.to_owned(), ()).await;
+        }
+        Ok(())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk::cache_health::DiskHealth;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -1396,7 +1863,7 @@ mod tests {
     // Test helper: create a temporary storage directory
     async fn setup_test_storage() -> (DiskStorage, tempfile::TempDir) {
         let temp_dir = tempdir().unwrap();
-        let storage = DiskStorage::new(temp_dir.path()).await.unwrap();
+        let storage = DiskStorage::new(temp_dir.path(), 0).await.unwrap();
         (storage, temp_dir)
     }
 
@@ -1413,7 +1880,7 @@ mod tests {
         // Ensure the directory does not exist
         assert!(!dir_path.exists());
 
-        let _storage = DiskStorage::new(&dir_path).await.unwrap();
+        let _storage = DiskStorage::new(&dir_path, 0).await.unwrap();
         assert!(dir_path.exists());
         assert!(dir_path.is_dir());
     }
@@ -1425,7 +1892,7 @@ mod tests {
         // Directory already exists
         assert!(temp_dir.path().exists());
 
-        let _storage = DiskStorage::new(temp_dir.path()).await.unwrap();
+        let _storage = DiskStorage::new(temp_dir.path(), 0).await.unwrap();
         assert!(temp_dir.path().exists());
     }
 
@@ -1571,9 +2038,7 @@ mod tests {
 
         // Launch multiple concurrent tasks
         for i in 0..10 {
-            let storage_clone = DiskStorage {
-                base_dir: storage.base_dir.clone(),
-            };
+            let storage_clone = storage.clone();
             let etag = format!("concurrent_etag_{}", i);
             let data = format!("Data for {}", i).into_bytes();
 
@@ -1589,6 +2054,102 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_insert_opportunistic_persists_when_write_permit_available() {
+        let temp_dir = tempdir().unwrap();
+        let cache = ChunksCache::new_with_config(ChunksCacheConfig::with_budgets(
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            temp_dir.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+
+        let key = "available-opportunistic-key".to_string();
+        for _ in 0..16 {
+            cache
+                .insert_opportunistic(key.clone(), vec![7u8; 128 * 1024].into())
+                .await;
+        }
+
+        for _ in 0..50 {
+            if cache.disk_insert_inflight.is_empty() && cache.is_disk_cached(&key).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(cache.disk_insert_inflight.is_empty());
+        assert!(cache.is_disk_cached(&key).await);
+    }
+
+    #[tokio::test]
+    async fn test_insert_opportunistic_skips_disk_when_write_permits_saturated() {
+        let temp_dir = tempdir().unwrap();
+        let cache = ChunksCache::new_with_config(ChunksCacheConfig::with_budgets(
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            temp_dir.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+
+        let mut permits = Vec::new();
+        while let Ok(permit) = cache.disk_storage.write_sem.clone().try_acquire_owned() {
+            permits.push(permit);
+        }
+        assert!(
+            !permits.is_empty(),
+            "test must saturate at least one disk cache write permit"
+        );
+
+        let key = "saturated-opportunistic-key".to_string();
+        cache
+            .insert_opportunistic(key.clone(), vec![9u8; 128 * 1024].into())
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            cache.disk_insert_inflight.is_empty(),
+            "opportunistic disk cache writes should not queue behind saturated local I/O"
+        );
+        assert!(
+            !cache.is_disk_cached(&key).await,
+            "disk cache insert should be skipped while write permits are saturated"
+        );
+        assert!(
+            cache.get(&key).await.is_some(),
+            "hot cache insert should still happen before the opportunistic disk skip"
+        );
+
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn test_store_to_disk_with_permit_accepts_bytes() {
+        let temp_dir = tempdir().unwrap();
+        let cache = ChunksCache::new_with_config(ChunksCacheConfig::with_budgets(
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            temp_dir.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+
+        let key = "bytes-store-key";
+        let data = bytes::Bytes::from_static(b"store bytes without vec roundtrip");
+        let permit = cache
+            .try_disk_store_permit(key)
+            .expect("disk cache write permit should be available");
+
+        cache
+            .store_to_disk_with_permit(key, data.clone(), permit)
+            .await
+            .unwrap();
+
+        assert_eq!(cache.get(&key.to_string()).await, Some(data));
     }
 
     #[test]
@@ -1641,6 +2202,66 @@ mod tests {
         let remove_error = storage.remove(etag).await.unwrap_err();
         let error_string = remove_error.to_string();
         assert!(error_string.contains("does not exist"));
+    }
+
+    #[test]
+    fn test_disk_health_bypass_and_recovery() {
+        let health = DiskHealth::new();
+
+        health.record_error();
+        health.record_error();
+        health.record_error();
+        assert!(health.is_bypassed());
+
+        for _ in 0..10 {
+            health.record_success();
+        }
+        assert!(!health.is_bypassed());
+    }
+
+    #[tokio::test]
+    async fn test_disk_health_bypass_on_repeated_store_errors() {
+        let temp_dir = tempdir().unwrap();
+        let not_dir = temp_dir.path().join("not-a-directory");
+        fs::write(&not_dir, b"not a directory").await.unwrap();
+        let storage = DiskStorage::new(&not_dir, 0).await.unwrap();
+
+        for i in 0..3 {
+            storage
+                .store_with_health(&format!("bad-key-{i}"), b"data")
+                .await
+                .unwrap();
+        }
+
+        assert!(storage.health.is_bypassed());
+        storage
+            .store_with_health("skipped-after-bypass", b"data")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_chunks_cache_insert_swallows_disk_cache_errors() {
+        let temp_dir = tempdir().unwrap();
+        let not_dir = temp_dir.path().join("not-a-directory");
+        fs::write(&not_dir, b"not a directory").await.unwrap();
+        let cache = ChunksCache::new_with_config(ChunksCacheConfig::with_budgets(
+            16 * 1024 * 1024,
+            16 * 1024 * 1024,
+            not_dir,
+        ))
+        .await
+        .unwrap();
+
+        for i in 0..3 {
+            cache
+                .insert(&format!("bad-cache-key-{i}"), &vec![1u8; 4096])
+                .await
+                .unwrap();
+        }
+
+        assert!(cache.disk_storage.health.is_bypassed());
+        assert_eq!(cache.get(&"missing-key".to_string()).await, None);
     }
 
     // ========== AccessStats tests ==========
@@ -1773,6 +2394,39 @@ mod tests {
         } else {
             println!("Key not promoted - this is normal for low frequency access");
         }
+    }
+
+    #[test]
+    fn test_default_promotion_policy_is_more_aggressive_for_read_cache_warmup() {
+        let config = ChunksCacheConfig::default();
+
+        assert_eq!(config.base_promotion_threshold, 5.0);
+        assert_eq!(config.short_window_weight, 0.75);
+        assert_eq!(config.medium_window_weight, 0.25);
+    }
+
+    #[test]
+    fn test_adaptive_threshold_lowers_when_hit_rate_is_poor() {
+        let policy = Policy::new(
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            100,
+            5.0,
+            0.75,
+            0.25,
+            true,
+            0.8,
+            0.6,
+        );
+
+        for _ in 0..10 {
+            policy.record_cache_request(false);
+        }
+
+        assert!(
+            policy.calculate_adaptive_threshold() < 5.0,
+            "cold-start miss-heavy workloads should promote faster"
+        );
     }
 
     #[test]

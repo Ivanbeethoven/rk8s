@@ -592,12 +592,20 @@ where
                 .map_err(|e| meta_error_to_io(path, e))?
         };
 
-        let attr = self
+        let mut attr = self
             .meta_layer()
             .stat(ino)
             .await
             .map_err(|e| meta_error_to_io(path, e))?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{path}: not found")))?;
+
+        // Close-to-open: if there is a local inode with a more recent size
+        // (e.g. from an uncommitted write), prefer it over the metadata value.
+        if let Some(size) = self.vfs.inode_size_cached(ino) {
+            if size > attr.size {
+                attr.size = size;
+            }
+        }
 
         let name = path.rsplit('/').next().unwrap_or("");
         Ok(FileStat::new(name.to_string(), attr.ino, attr))
@@ -763,7 +771,13 @@ where
 
             let fh = self
                 .vfs
-                .open(fi.inode(), fi.attr().clone(), flags.read, flags.write)
+                .open(
+                    fi.inode(),
+                    fi.attr().clone(),
+                    flags.read,
+                    flags.write || flags.append,
+                    flags.append,
+                )
                 .await
                 .map_err(io::Error::from)?;
             let file_id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
@@ -811,7 +825,13 @@ where
 
             let fh = self
                 .vfs
-                .open(fi.inode(), fi.attr().clone(), flags.read, flags.write)
+                .open(
+                    fi.inode(),
+                    fi.attr().clone(),
+                    flags.read,
+                    flags.write || flags.append,
+                    flags.append,
+                )
                 .await
                 .map_err(io::Error::from)?;
             let file_id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
@@ -2055,7 +2075,7 @@ mod tests {
         let client = ObjectClient::new(LocalFsBackend::new(tmp.path()));
         let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
         let metadata: Arc<dyn MetaStore> = meta_handle.store();
-        let store = ObjectBlockStore::new(client);
+        let store = ObjectBlockStore::new_async(client).await.unwrap();
         let config = FileSystemConfig::default().with_caller(CallerIdentity::root());
         FileSystem::with_config(layout, store, metadata, config)
             .await

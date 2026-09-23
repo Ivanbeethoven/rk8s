@@ -1,0 +1,13 @@
+apiVersion: storage.slayerfs.io/v1alpha1
+kind: SlayerFSCluster
+metadata:
+  name: demo
+spec:
+  redis: {}
+  rustfs:
+    bucket: slayerfs-data
+    storageSize: 20Gi
+  mountConfig:
+    mountPoint: /mnt/slayerfs
+    chunkSize: 67108864
+    blockSize: 4194304

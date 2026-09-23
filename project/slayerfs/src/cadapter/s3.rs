@@ -4,6 +4,8 @@ use crate::cadapter::client::ObjectBackend;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
+use aws_config::timeout::TimeoutConfig;
+use aws_sdk_s3::config::RequestChecksumCalculation;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::{ByteStream, SdkBody};
 use aws_sdk_s3::{Client, config::Region};
@@ -30,12 +32,17 @@ pub struct S3Config {
     pub max_retries: u32,
     /// Base delay for exponential backoff in milliseconds (default: 100ms)
     pub retry_base_delay: u64,
-    /// Enable MD5 checksums for uploads (default: true)
+    /// Enable MD5 checksums for uploads (default: false, matching JuiceFS behavior)
     pub enable_md5: bool,
     /// Custom endpoint URL (e.g. for MinIO or localstack)
     pub endpoint: Option<String>,
     /// Force path-style access (required for some S3-compatible services)
     pub force_path_style: bool,
+    /// Disable SDK-level payload checksum calculation (SigV4 payload signing).
+    /// When true, sets `RequestChecksumCalculation::WhenRequired` to skip
+    /// unnecessary SHA-256 payload hashing, saving ~20% CPU on write paths.
+    /// Safe for self-hosted S3 backends (RustFS/MinIO) over trusted networks.
+    pub disable_payload_checksum: bool,
 }
 
 impl Default for S3Config {
@@ -43,13 +50,14 @@ impl Default for S3Config {
         Self {
             bucket: String::new(),
             region: None,
-            part_size: 8 * 1024 * 1024, // 8MB
-            max_concurrency: 4,
-            max_retries: 3,
+            part_size: 16 * 1024 * 1024, // 16MB — larger parts reduce HTTP overhead
+            max_concurrency: 32,         // Raise S3 parallelism to keep multi-job reads saturated
+            max_retries: 1,
             retry_base_delay: 100,
-            enable_md5: true,
+            enable_md5: false,
             endpoint: None,
             force_path_style: false,
+            disable_payload_checksum: true,
         }
     }
 }
@@ -80,11 +88,26 @@ impl S3Backend {
 
         let mut aws_config_loader = aws_config::defaults(BehaviorVersion::latest());
 
+        // Prevent indefinite hangs on stalled S3 connections.
+        let timeout_config = TimeoutConfig::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(30))
+            .operation_timeout(Duration::from_secs(120))
+            .build();
+        aws_config_loader = aws_config_loader.timeout_config(timeout_config);
+
         if let Some(region) = &config.region {
             aws_config_loader = aws_config_loader.region(Region::new(region.clone()));
         }
 
+        tracing::info!(
+            endpoint = ?config.endpoint,
+            region = ?config.region,
+            bucket = %config.bucket,
+            "s3 backend aws config load begin"
+        );
         let aws_config = aws_config_loader.load().await;
+        tracing::info!("s3 backend aws config load complete");
 
         let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&aws_config);
 
@@ -96,7 +119,19 @@ impl S3Backend {
             s3_config_builder = s3_config_builder.force_path_style(true);
         }
 
+        if config.disable_payload_checksum {
+            // Skip payload checksum (SigV4 SHA-256 of request body) to send
+            // UNSIGNED-PAYLOAD. This matches JuiceFS behavior and avoids wasting
+            // ~20% CPU on cryptographic hashing for non-AWS S3 backends (MinIO, RustFS, etc.).
+            s3_config_builder = s3_config_builder
+                .request_checksum_calculation(RequestChecksumCalculation::WhenRequired);
+            s3_config_builder = s3_config_builder.response_checksum_validation(
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+            );
+        }
+
         let client = Client::from_conf(s3_config_builder.build());
+        tracing::info!("s3 backend client ready");
 
         Ok(Self { client, config })
     }
@@ -120,8 +155,10 @@ impl S3Backend {
         ByteStream::from_body_0_4(Body::wrap_stream(stream))
     }
 
+    #[tracing::instrument(level = "debug", skip(self, chunks), fields(key, total_size))]
     async fn put_object_vectored_simple(&self, key: &str, chunks: Vec<Bytes>) -> Result<()> {
         let total_size = chunks.iter().map(|c| c.len()).sum::<usize>();
+        tracing::Span::current().record("total_size", total_size);
         let checksum = if self.config.enable_md5 && total_size > 0 {
             Some(Self::md5_base64_chunks(&chunks))
         } else {
@@ -158,6 +195,7 @@ impl S3Backend {
     }
 
     /// Put small objects directly (simpler than multipart upload)
+    #[tracing::instrument(level = "debug", skip(self, data), fields(key, size = data.len()))]
     async fn put_object_simple(&self, key: &str, data: &[u8]) -> Result<()> {
         let mut attempt = 0;
         loop {
@@ -310,6 +348,7 @@ impl S3Backend {
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", skip(self, chunks), fields(key, parts))]
     async fn multipart_upload_vectored(&self, key: &str, chunks: Vec<Bytes>) -> Result<()> {
         let create = self
             .client
@@ -482,12 +521,14 @@ impl ObjectBackend for S3Backend {
             return self.put_object_simple(key, &[]).await;
         }
         if total_size <= self.config.part_size {
+            // Use streaming body to avoid copying chunks into a contiguous Vec.
             return self.put_object_vectored_simple(key, chunks).await;
         }
 
         self.multipart_upload_vectored(key, chunks).await
     }
 
+    #[tracing::instrument(level = "debug", skip(self, data), fields(key, size = data.len()))]
     async fn put_object(&self, key: &str, data: &[u8]) -> Result<()> {
         // Small objects use direct put_object; large objects use multipart upload
         if data.len() <= self.config.part_size {
@@ -498,6 +539,7 @@ impl ObjectBackend for S3Backend {
         self.multipart_upload(key, data).await
     }
 
+    #[tracing::instrument(level = "debug", skip(self), fields(key))]
     async fn get_object(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let resp = self
             .client
@@ -522,6 +564,7 @@ impl ObjectBackend for S3Backend {
 
     /// Get a range of bytes from an object.
     /// Used for small range reads in intelligent read strategy.
+    #[tracing::instrument(level = "debug", skip(self, buf), fields(key, offset, len = buf.len()))]
     async fn get_object_range(&self, key: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -571,6 +614,7 @@ impl ObjectBackend for S3Backend {
         Ok(resp.e_tag().unwrap_or_default().to_string())
     }
 
+    #[tracing::instrument(level = "debug", skip(self), fields(key))]
     async fn delete_object(&self, key: &str) -> Result<()> {
         let mut attempt = 0;
 
@@ -593,5 +637,100 @@ impl ObjectBackend for S3Backend {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_s3::Config;
+    use aws_sdk_s3::config::{Credentials, Region};
+    use tokio::time::timeout;
+
+    #[test]
+    fn s3_config_defaults_raise_parallelism() {
+        let config = S3Config::default();
+
+        assert_eq!(config.max_concurrency, 32);
+    }
+
+    fn test_backend() -> S3Backend {
+        let endpoint = std::env::var("SLAYERFS_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+        let bucket =
+            std::env::var("SLAYERFS_S3_BUCKET").unwrap_or_else(|_| "slayerfs-data".to_string());
+        let region =
+            std::env::var("SLAYERFS_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+
+        let s3_config = Config::builder()
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .region(Region::new(region))
+            .credentials_provider(Credentials::new(
+                std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "rustfsadmin".to_string()),
+                std::env::var("AWS_SECRET_ACCESS_KEY")
+                    .unwrap_or_else(|_| "rustfsadmin".to_string()),
+                None,
+                None,
+                "rustfs-small-object-streaming-body-compat-test",
+            ))
+            .build();
+
+        S3Backend {
+            client: Client::from_conf(s3_config),
+            config: S3Config {
+                bucket,
+                region: None,
+                part_size: 8 * 1024 * 1024,
+                max_concurrency: 1,
+                max_retries: 1,
+                retry_base_delay: 1,
+                enable_md5: true,
+                endpoint: None,
+                force_path_style: true,
+                disable_payload_checksum: true,
+            },
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live S3-compatible endpoint; set SLAYERFS_S3_ENDPOINT and SLAYERFS_S3_BUCKET"]
+    async fn rustfs_small_object_streaming_body_compat() {
+        let backend = test_backend();
+        let prefix = format!("diagnostics/rustfs-streaming-body/{}/", std::process::id());
+        let simple_key = format!("{prefix}simple");
+        let streaming_key = format!("{prefix}streaming");
+        let payload = b"small-object-streaming-body-compat-payload";
+        let chunks = vec![
+            Bytes::copy_from_slice(&payload[..7]),
+            Bytes::copy_from_slice(&payload[7..24]),
+            Bytes::copy_from_slice(&payload[24..]),
+        ];
+
+        backend
+            .put_object_simple(&simple_key, payload)
+            .await
+            .expect("contiguous put_object should succeed before testing streaming body");
+        assert_eq!(
+            backend.get_object(&simple_key).await.unwrap().as_deref(),
+            Some(payload.as_slice())
+        );
+
+        let streaming_put = timeout(
+            Duration::from_secs(10),
+            backend.put_object_vectored_simple(&streaming_key, chunks),
+        )
+        .await
+        .expect("streaming body put_object timed out; contiguous put_object already succeeded")
+        .expect("streaming body put_object returned an error");
+
+        assert_eq!(streaming_put, ());
+        assert_eq!(
+            backend.get_object(&streaming_key).await.unwrap().as_deref(),
+            Some(payload.as_slice())
+        );
+
+        let _ = backend.delete_object(&simple_key).await;
+        let _ = backend.delete_object(&streaming_key).await;
     }
 }

@@ -1,4 +1,5 @@
 use crate::control::job::{JobInfo, JobOutcome, JobState};
+use crate::meta::store::MetaStoreCapabilities;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ControlRequest {
@@ -16,6 +17,8 @@ pub enum ControlResponse {
         mount_point: String,
         started_at: i64,
         version: String,
+        meta_backend: String,
+        capabilities: MetaStoreCapabilities,
     },
     Accepted {
         job_id: String,

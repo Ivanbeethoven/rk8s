@@ -175,3 +175,53 @@ jeprof --show_bytes --svg "$BIN" /tmp/slayerfs_heap.*.heap > /tmp/slayerfs_heap.
 > 如果符号不完整，可用 `RUSTFLAGS="-g"` 重新编译再采集。
 
 jemalloc heap profiling专用于堆内存分析，不反应 CPU/IO。
+
+## run_perf.sh（自动化性能分析 + 火焰图）
+
+`tools/perf/run_perf.sh` 提供一键性能分析流程：构建 → 启动基础设施 → 挂载 → fio 压测 → perf 采样 → 生成火焰图。
+
+```bash
+cd project/slayerfs
+./tools/perf/run_perf.sh              # 完整流程
+./tools/perf/run_perf.sh --quick      # 短时间压测（15s）
+./tools/perf/run_perf.sh --no-build   # 跳过编译
+./tools/perf/run_perf.sh --skip-offcpu # 跳过 off-CPU 分析
+```
+
+输出产物：
+- `/tmp/slayerfs-perf/flame/oncpu-flame.svg` — On-CPU 火焰图
+- `/tmp/slayerfs-perf/flame/offcpu-flame.svg` — Off-CPU 火焰图
+- `/tmp/slayerfs-perf/results/fio-*.json` — fio 原始数据
+- `/tmp/slayerfs-perf/llm-report.txt` — LLM 可读的分析报告
+
+> **注意**：脚本使用 `--call-graph fp`（frame pointers）而非 `dwarf`，因为 slayerfs
+> release binary 含有 735MB+ 的调试信息，`addr2line` 无法处理如此大的 DWARF section，
+> 会报 "could not read first record" 错误。Frame pointer 方式更快更可靠。
+
+## slayerfs-stats（实时性能监控）
+
+类似 `juicefs stats`，通过读取挂载点下的 `.stats` 虚拟文件实时展示性能指标。
+
+```bash
+# 编译
+cargo build -p slayerfs-stats
+
+# 使用（默认 1s 刷新）
+slayerfs-stats /mnt/slayerfs
+
+# 自定义刷新间隔
+slayerfs-stats /mnt/slayerfs -i 2
+
+# 直接查看原始指标
+cat /mnt/slayerfs/.stats
+```
+
+展示内容：
+| 模块 | 指标 | 说明 |
+|------|------|------|
+| FUSE | ops, read, write, r_lat, w_lat | FUSE 层吞吐与延迟 |
+| META | ops, txn, lat | 元数据操作与事务 |
+| OBJECT | get, get/s, put, put/s, del | S3 对象存储流量 |
+| CACHE | hit, miss, dirty | 缓存命中率与脏数据量 |
+
+详细文档见 `doc/stats-tool.md`。

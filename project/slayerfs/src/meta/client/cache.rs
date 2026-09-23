@@ -6,12 +6,11 @@ use std::time::Duration;
 use crate::chunk::SliceDesc;
 use crate::meta::entities::etcd::EtcdEntryInfo;
 use crate::meta::store::{DirEntry, FileAttr, MetaError, MetaStore};
-use crate::vfs::fs::FileType;
 use dashmap::{DashMap, Entry};
 use moka::future::Cache;
 use moka::notification::RemovalCause;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::debug;
 
 /// Type alias for children map to reduce complexity
 /// BTreeMap provides ordered iteration for consistent ls output
@@ -113,7 +112,7 @@ impl InodeCache {
             .time_to_idle(ttl)
             .eviction_listener(
                 move |key: Arc<i64>, _value: Arc<InodeEntry>, cause: RemovalCause| {
-                    info!("InodeCache: Evicting inode {} (cause: {:?})", key, cause);
+                    debug!("InodeCache: Evicting inode {} (cause: {:?})", key, cause);
                     entries_clone.remove(&*key);
                 },
             )
@@ -137,6 +136,32 @@ impl InodeCache {
                 self.ttl_manager.insert(ino, node).await;
             }
         }
+    }
+
+    pub(crate) async fn mark_children_complete_empty(&self, ino: i64) {
+        if let Some(node) = self.ttl_manager.get(&ino).await {
+            let mut children_lock = node.children.write().await;
+            if matches!(&*children_lock, ChildrenState::NotLoaded) {
+                *children_lock = ChildrenState::Complete(Arc::new(BTreeMap::new()));
+            }
+        }
+    }
+
+    pub(crate) async fn refresh_cached_node_for_fresh_stat(
+        &self,
+        ino: i64,
+        attr: FileAttr,
+    ) -> bool {
+        let Some(node) = self.ttl_manager.get(&ino).await else {
+            return false;
+        };
+
+        *node.attr.write().await = attr;
+        *node.parent.write().await = None;
+        *node.children.write().await = ChildrenState::NotLoaded;
+        node.children_generation.fetch_add(1, Ordering::AcqRel);
+        node.slices.clear();
+        true
     }
 
     pub(crate) async fn invalidate_inode(&self, ino: i64) {
@@ -259,11 +284,18 @@ impl InodeCache {
         None
     }
 
-    pub(crate) async fn lookup(&self, parent_ino: i64, name: &str) -> Option<i64> {
+    pub(crate) async fn lookup_if_loaded(
+        &self,
+        parent_ino: i64,
+        name: &str,
+    ) -> Option<Option<i64>> {
         let parent_node = self.ttl_manager.get(&parent_ino).await?;
         let children_lock = parent_node.children.read().await;
-        let children_map = children_lock.get_map()?;
-        children_map.get(name).copied()
+        match &*children_lock {
+            ChildrenState::NotLoaded => None,
+            ChildrenState::Partial(children_map) => children_map.get(name).copied().map(Some),
+            ChildrenState::Complete(children_map) => Some(children_map.get(name).copied()),
+        }
     }
 
     pub(crate) async fn readdir(&self, ino: i64) -> Option<Vec<DirEntry>> {
@@ -278,11 +310,10 @@ impl InodeCache {
         let mut entries = Vec::new();
 
         for (name, child_ino) in children_map.iter() {
-            let kind = if let Some(child) = self.ttl_manager.get(child_ino).await {
-                child.attr.read().await.kind
-            } else {
-                FileType::File
+            let Some(child) = self.ttl_manager.get(child_ino).await else {
+                return None;
             };
+            let kind = child.attr.read().await.kind;
 
             entries.push(DirEntry {
                 ino: *child_ino,
@@ -381,5 +412,48 @@ impl InodeCache {
                 .children_generation
                 .fetch_add(1, Ordering::AcqRel);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::store::{FileAttr, FileType};
+
+    fn attr(ino: i64, kind: FileType) -> FileAttr {
+        FileAttr {
+            ino,
+            size: 0,
+            blocks: 0,
+            kind,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            nlink: if kind == FileType::Dir { 2 } else { 1 },
+        }
+    }
+
+    #[tokio::test]
+    async fn readdir_returns_none_when_child_attr_is_missing() {
+        let cache = InodeCache::new(8, Duration::from_secs(60));
+        cache.insert_node(1, attr(1, FileType::Dir), None).await;
+        cache.insert_node(2, attr(2, FileType::Dir), Some(1)).await;
+        cache
+            .load_children_if_fresh(1, vec![("subdir".to_string(), 2)], 0)
+            .await;
+
+        let entries = cache.readdir(1).await.expect("complete cache");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, FileType::Dir);
+
+        cache.invalidate_inode(2).await;
+
+        assert!(
+            cache.readdir(1).await.is_none(),
+            "missing child attrs must force a backend readdir instead of reporting File"
+        );
     }
 }

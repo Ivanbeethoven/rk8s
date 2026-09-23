@@ -9,6 +9,14 @@ use anyhow::anyhow;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
+
+fn current_time_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
 use std::time::Instant;
 use tokio::pin;
 use tokio::sync::Notify;
@@ -170,6 +178,7 @@ where
 {
     attr: FileAttr,
     last_offset: u64,
+    last_check: i64,
     reader: Option<Arc<FileReader<B, M>>>,
     writer: Option<Arc<FileWriter<B, M>>>,
 }
@@ -184,9 +193,13 @@ where
     pub(crate) ino: i64,
     pub(crate) opened_at: Instant,
     pub(crate) flags: HandleFlags,
+    write_dirty: AtomicBool,
     gate: Arc<HandleGate>,
     state: StdMutex<FileHandleState<B, M>>,
 }
+
+/// Default attribute cache TTL for open files (seconds).
+const ATTR_CACHE_TTL: i64 = 1;
 
 impl<B, M> FileHandle<B, M>
 where
@@ -199,10 +212,12 @@ where
             ino,
             opened_at: Instant::now(),
             flags,
+            write_dirty: AtomicBool::new(false),
             gate: Arc::new(HandleGate::new()),
             state: StdMutex::new(FileHandleState {
                 attr,
                 last_offset: 0,
+                last_check: current_time_secs(),
                 reader: None,
                 writer: None,
             }),
@@ -214,21 +229,83 @@ where
         guard.reader = Some(reader);
     }
 
+    pub(crate) fn ensure_reader_with<F>(&self, make_reader: F)
+    where
+        F: FnOnce() -> Arc<FileReader<B, M>>,
+    {
+        let mut guard = self.state.lock().unwrap();
+        if guard.reader.is_none() {
+            guard.reader = Some(make_reader());
+        }
+    }
+
     pub(crate) fn writer(&self, writer: Arc<FileWriter<B, M>>) {
         let mut guard = self.state.lock().unwrap();
         guard.writer = Some(writer);
     }
 
+    /// Return the cached attr regardless of TTL (used for handle-level access).
     pub(crate) fn attr(&self) -> FileAttr {
         self.state.lock().unwrap().attr.clone()
     }
 
     pub(crate) fn update_attr(&self, attr: &FileAttr) {
-        self.state.lock().unwrap().attr = attr.clone();
+        let mut guard = self.state.lock().unwrap();
+        guard.attr = attr.clone();
+        guard.last_check = current_time_secs();
+    }
+
+    /// JuiceFS-style Check: returns the cached attr if within TTL.
+    /// Used to avoid a metadata-store round-trip for getattr.
+    pub(crate) fn check_attr(&self) -> Option<FileAttr> {
+        let guard = self.state.lock().unwrap();
+        let now = current_time_secs();
+        if now - guard.last_check < ATTR_CACHE_TTL {
+            Some(guard.attr.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Update the cached attr, invalidating if mtime changed.
+    /// Returns true if the attr was updated in-place.
+    pub(crate) fn update_attr_if_changed(&self, new_attr: &FileAttr) -> bool {
+        let mut guard = self.state.lock().unwrap();
+        let changed = new_attr.mtime != guard.attr.mtime;
+        if changed {
+            guard.attr = new_attr.clone();
+            guard.last_check = current_time_secs();
+            true
+        } else if new_attr.size > guard.attr.size {
+            guard.attr.size = new_attr.size;
+            guard.last_check = current_time_secs();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Force the cached size to at least `min_size`.  This is called after
+    /// every extending write so that O_APPEND from other handles sees the
+    /// most recent file size via check_attr/attr.
+    pub(crate) fn extend_size(&self, min_size: u64) {
+        let mut guard = self.state.lock().unwrap();
+        if min_size > guard.attr.size {
+            guard.attr.size = min_size;
+        }
+        guard.last_check = current_time_secs();
     }
 
     pub(crate) fn update_offset(&self, offset: u64) {
         self.state.lock().unwrap().last_offset = offset;
+    }
+
+    pub(crate) fn mark_write_dirty(&self) {
+        self.write_dirty.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn take_write_dirty(&self) -> bool {
+        self.write_dirty.swap(false, Ordering::AcqRel)
     }
 
     #[allow(dead_code)]
@@ -251,8 +328,31 @@ where
         Ok(data)
     }
 
+    pub(crate) async fn try_read_overlay<F, Fut>(
+        &self,
+        offset: u64,
+        len: usize,
+        f: F,
+    ) -> anyhow::Result<Option<Vec<u8>>>
+    where
+        F: FnOnce(u64, usize) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Option<Vec<u8>>>>,
+    {
+        let _guard = self.gate.read_lock().await;
+        let data = f(offset, len).await?;
+        if let Some(data) = &data {
+            self.update_offset(offset + data.len() as u64);
+        }
+        Ok(data)
+    }
+
     pub(crate) async fn write(&self, offset: u64, data: &[u8]) -> anyhow::Result<usize> {
         let _guard = self.gate.write_lock().await;
+        self.write_unlocked(offset, data).await
+    }
+
+    /// Write while the caller already holds the required handle write locks.
+    pub(crate) async fn write_unlocked(&self, offset: u64, data: &[u8]) -> anyhow::Result<usize> {
         let writer = {
             let guard = self.state.lock().unwrap();
             guard
@@ -261,15 +361,14 @@ where
                 .ok_or_else(|| anyhow!("file handle writer not initialized"))?
         };
         let written = writer.write_at(offset, data).await?;
-        // Keep write(2) close to POSIX visibility expectations: once the syscall
-        // returns, subsequent truncate/read/copy paths must observe the data.
-        writer.flush().await?;
         self.update_offset(offset + written as u64);
+        if written > 0 {
+            self.mark_write_dirty();
+        }
         Ok(written)
     }
 
     pub(crate) async fn flush(&self) -> anyhow::Result<()> {
-        let _guard = self.gate.write_lock().await;
         let writer = {
             let guard = self.state.lock().unwrap();
             guard
@@ -296,17 +395,23 @@ pub(crate) struct FileHandleWriteGuard {
 pub(crate) struct HandleFlags {
     pub(crate) read: bool,
     pub(crate) write: bool,
+    pub(crate) append: bool,
 }
 
 impl HandleFlags {
-    pub(crate) const fn new(read: bool, write: bool) -> Self {
-        Self { read, write }
+    pub(crate) const fn new(read: bool, write: bool, append: bool) -> Self {
+        Self {
+            read,
+            write,
+            append,
+        }
     }
 }
 
 /// Directory handle for caching directory listing during opendir-releasedir lifecycle
 pub struct DirHandle {
     pub(crate) ino: i64,
+    pub(crate) attr: Option<FileAttr>,
     pub(crate) entries: Vec<DirEntry>,
     #[allow(dead_code)]
     pub(crate) opened_at: Instant,
@@ -321,6 +426,7 @@ impl DirHandle {
     pub(crate) fn new(ino: i64, entries: Vec<DirEntry>) -> Self {
         Self {
             ino,
+            attr: None,
             entries,
             opened_at: Instant::now(),
             prefetch_task: None,
@@ -336,11 +442,17 @@ impl DirHandle {
     ) -> Self {
         Self {
             ino,
+            attr: None,
             entries,
             opened_at: Instant::now(),
             prefetch_task: Some(task),
             prefetch_done: done_flag,
         }
+    }
+
+    pub(crate) fn with_attr(mut self, attr: FileAttr) -> Self {
+        self.attr = Some(attr);
+        self
     }
 
     /// Get entries starting from offset, limited to MAX_READDIR_ENTRIES

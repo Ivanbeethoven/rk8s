@@ -94,6 +94,7 @@ impl EtcdEntryInfo {
         FileAttr {
             ino,
             size,
+            blocks: size.div_ceil(512),
             kind,
             mode: self.permission.mode,
             uid: self.permission.uid,

@@ -38,7 +38,7 @@ use tokio::sync::Notify;
 
 pub type SharedError = Arc<anyhow::Error>;
 
-type SharedResult<V> = Result<Arc<V>, SharedError>;
+pub type SharedResult<V> = Result<Arc<V>, SharedError>;
 
 enum EntryState<V> {
     Running,
@@ -215,6 +215,18 @@ where
         };
 
         leader.complete(shared_result)
+    }
+
+    /// Join an existing flight for `key` without starting a new operation.
+    ///
+    /// This is useful when a caller has a cheaper fallback, but would prefer to
+    /// reuse a broader in-flight request if one already exists.
+    pub async fn try_piggyback(&self, key: &K) -> Option<SharedResult<V>> {
+        let entry = self.in_flight.get(key).map(|entry| entry.value().clone());
+        match entry {
+            Some(entry) => Some(Self::wait_for_result(&entry).await),
+            None => None,
+        }
     }
 
     async fn wait_for_result(entry: &Arc<FlightEntry<V>>) -> SharedResult<V> {
@@ -457,6 +469,43 @@ mod tests {
 
         assert_eq!(&*next, "second");
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_try_piggyback_joins_existing_flight_without_starting_one() {
+        let sf = Arc::new(SingleFlight::<String, String>::new());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+
+        let leader_sf = sf.clone();
+        let counter_clone = counter.clone();
+        let started_clone = started.clone();
+        let release_clone = release.clone();
+        let leader = tokio::spawn(async move {
+            leader_sf
+                .execute("key".to_string(), || async move {
+                    counter_clone.fetch_add(1, Ordering::SeqCst);
+                    started_clone.notify_one();
+                    release_clone.notified().await;
+                    Ok::<_, std::io::Error>("shared".to_string())
+                })
+                .await
+        });
+
+        started.notified().await;
+
+        let key = "key".to_string();
+        let piggyback = sf.try_piggyback(&key);
+        release.notify_one();
+
+        let piggyback_result = piggyback.await.unwrap().unwrap();
+        let leader_result = leader.await.unwrap().unwrap();
+
+        assert_eq!(&*piggyback_result, "shared");
+        assert_eq!(&*leader_result, "shared");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert!(sf.try_piggyback(&"key".to_string()).await.is_none());
     }
 
     #[tokio::test]

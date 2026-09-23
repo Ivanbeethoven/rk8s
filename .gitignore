@@ -16,7 +16,16 @@
 # Claude Code
 CLAUDE.md
 .claude
+slayerfs-wt
 project/rkforge/tests/dockers/output
 project/docs
 **/artifacts/**
 **/xfstests/**
+**/.claude/**
+
+
+
+
+
+
+  "includeCoAuthoredBy": false,

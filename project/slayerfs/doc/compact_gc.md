@@ -126,7 +126,7 @@ Uncommitted slices (crashed during heavy compaction):
 2. Delete block data
 3. Remove via `delete_uncommitted_slices()`
 
-Note: `orphan` status is set when a `pending` slice is detected to have no corresponding `slice_meta` entry (already deleted by other means).
+Note: `orphan` status is set when a `pending` slice is detected to have no corresponding `slice_meta` entry (already deleted by other means). Orphan records are always included in cleanup regardless of age, since they represent data whose metadata is already gone and there is no risk of dangling reads.
 
 ## Configuration
 
@@ -145,10 +145,11 @@ pub struct CompactConfig {
 
 // Reserved configs (defined but not yet implemented in current logic):
 // - async_threshold: defined but not used in compaction decision currently
-// - max_concurrent_tasks: defined but chunks are processed sequentially currently
+// - max_concurrent_tasks: defined for future parallel compaction, chunks processed sequentially now
 
-// Note: CompactionWorkerConfig (in src/chunk/compact/worker.rs) also has
-// max_chunks_per_run: usize, // default: 100 (for worker scan limit)
+// Note: CompactionWorkerConfig (in src/chunk/compact/worker.rs) has its own
+// max_chunks_per_run: usize, // default: 100 (worker scan limit per cycle)
+// This is separate from CompactConfig::max_chunks_per_run (default: 1000, reserved)
 
 // LockTtlConfig
 pub struct LockTtlConfig {
@@ -171,29 +172,51 @@ pub struct BlockGcConfig {
 
 ## Lock Manager
 
-`CompactLockManager` provides:
+`CompactLockManager` provides two-tier locking for each chunk being compacted:
 
-- **Local lock**: `HashSet<u64>` for in-process fast check
-- **Global lock**: MetaStore TTL lock for cross-process sync (only acquired for sync compaction)
+- **Local lock**: `HashSet<u64>` + `RwLock` — same-process fast rejection, O(1) lookup
+- **Global lock**: `MetaStore::get_global_lock(ChunkCompactLock(chunk_id), ttl_secs)` — distributed exclusion across nodes
 
-Unlock behavior: removes local lock only; global lock expires via TTL.
+**Both sync and async compaction now require the global lock** (not just sync as in earlier versions). This prevents multiple nodes from compacting the same chunk concurrently.
+
+**Dynamic TTL calculation** (`LockTtlConfig`):
+- Base TTL differs for sync vs async compaction (`sync_ttl_secs` vs `async_ttl_secs`)
+- Extra TTL added per slice: `ttl_per_slice_ms × slice_count`
+- Clamped to `[min_ttl_secs, max_ttl_secs]` range
+
+**TOCTOU protection**: After acquiring the lock, `run_compaction_cycle` re-analyzes the chunk and re-calls `should_compact`. If another node already compacted it, the cycle skips without doing redundant work.
+
+**Unlock behavior**: `ChunkLockGuard::unlock()` explicitly releases the global lock and removes the local entry. On unexpected drop (panic, early return), `Drop` spawns a background task to best-effort release the global lock. Crash scenarios fall back to TTL expiry.
 
 ## Background Workers
 
 ### CompactionWorker
 
-Runs two background tasks:
+`CompactionWorker::start(worker_config, gc_config)` spawns **two independent Tokio tasks** and returns their `JoinHandle` pair:
 
-1. **Compaction cycle**: Scans chunks, compacts those meeting thresholds
-2. **GC cycle**: Runs `BlockStoreGC` to cleanup delayed and orphan slices
+1. **Compaction task** (`compaction_handle`): Ticks at `scan_interval` (default 1 hour)
+   - Calls `MetaStore::list_chunk_ids(max_chunks_per_run)` to get candidate chunks
+   - If `list_chunk_ids` returns `MetaError::NotImplemented`（部分后端未实现），silently skips the cycle
+   - For each chunk: check thresholds → try acquire lock (local + global) → TOCTOU re-check → compact → release lock
+   - `max_chunks_per_run` (CompactionWorkerConfig default: **100**) limits per-cycle scan scope
+
+2. **GC task** (`gc_handle`): Delegated entirely to `BlockStoreGC::start(gc_config)`
+   - Ticks at `gc_config.interval` (default 1 hour, independent of compaction interval)
 
 ### BlockStoreGC
 
-Methods:
+`run_gc_cycle` executes two phases per tick:
 
-- `new(meta_store, block_store)` - Create GC instance
-- `start(config)` - Spawn background task
-- `run_gc_cycle(config)` - Run single GC cycle
+**Phase A — Delayed slice cleanup**:
+1. `process_delayed_slices(batch_size, min_age_secs)` — fetch up to `batch_size` records older than `min_age_secs`
+2. For each record: `delete_range((slice_id, 0), num_blocks)` on block store
+3. On success: collect `delayed_id` → `confirm_delayed_deleted(&confirmed_ids)` batch confirm
+4. On block deletion failure: skip confirm, retry in next cycle (idempotent)
+
+**Phase B — Orphan uncommitted slice cleanup**:
+1. `cleanup_orphan_uncommitted_slices(orphan_cleanup_age_secs, batch_size)` — returns `(slice_id, size)` list
+2. For each: `delete_range((slice_id, 0), num_blocks)`
+3. Batch `delete_uncommitted_slices(&cleaned_slice_ids)` to remove metadata records
 
 ## Test Files
 

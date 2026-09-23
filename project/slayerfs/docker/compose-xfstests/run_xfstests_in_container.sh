@@ -176,24 +176,98 @@ EOF
 
 install_mount_helper() {
     local helper="/usr/sbin/mount.fuse.slayerfs"
-    cat >"$helper" <<'EOF'
+    # 把运行时确定的路径直接硬写进 helper，避免 mount 调用时环境变量被清除
+    local baked_log_file="${log_file:-/artifacts/slayerfs.log}"
+    local baked_fuse_log_file="${fuse_log_file:-}"
+
+    cat >"$helper" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH"
 
-src="${1:-}"
-target="${2:-}"
+src="\${1:-}"
+target="\${2:-}"
 shift 2 || true
 
-config_path="${SLAYERFS_CONFIG_PATH:-/run/slayerfs/config.yaml}"
-log_file="${SLAYERFS_LOG_FILE:-/artifacts/slayerfs.log}"
+config_path="\${SLAYERFS_CONFIG_PATH:-/run/slayerfs/config.yaml}"
+log_file="${baked_log_file}"
 
-mkdir -p "$target" "$(dirname "$log_file")"
+mkdir -p "\$target" "\$(dirname "\$log_file")"
 
-/usr/local/bin/slayerfs mount --config "$config_path" "$target" >>"$log_file" 2>&1 &
-sleep "${SLAYERFS_MOUNT_WAIT_SECS:-1}"
-exit 0
+is_slayerfs_mounted() {
+    findmnt -rn --target "\$target" --output FSTYPE 2>/dev/null | grep -Eq '^fuse(\\.|$)'
+}
+
+pre_wait_secs="\${SLAYERFS_PRE_MOUNT_WAIT_SECS:-10}"
+pre_deadline=\$((SECONDS + pre_wait_secs))
+while is_slayerfs_mounted; do
+    if (( SECONDS >= pre_deadline )); then
+        echo "target \$target is still mounted before starting SlayerFS after \${pre_wait_secs}s" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+
+EOF
+
+    append_env_export() {
+        local name="$1"
+        local default="${2-}"
+        local value="${!name:-$default}"
+        if [[ -n "$value" || $# -ge 2 ]]; then
+            printf 'export %s=%q\n' "$name" "$value" >>"$helper"
+        fi
+    }
+    append_env_export AWS_ACCESS_KEY_ID "rustfsadmin"
+    append_env_export AWS_SECRET_ACCESS_KEY "rustfsadmin"
+    append_env_export AWS_DEFAULT_REGION "us-east-1"
+    append_env_export AWS_EC2_METADATA_DISABLED "true"
+    append_env_export AWS_SESSION_TOKEN
+    append_env_export SLAYERFS_MOUNT_WAIT_SECS "60"
+    append_env_export SLAYERFS_PRE_MOUNT_WAIT_SECS "10"
+    append_env_export SLAYERFS_MOUNT_READY_DELAY_SECS "1"
+    append_env_export RUST_LOG
+
+    if [[ -n "$baked_fuse_log_file" ]]; then
+        cat >>"$helper" <<EOF
+mkdir -p "\$(dirname "${baked_fuse_log_file}")"
+SLAYERFS_FUSE_OP_LOG=1 SLAYERFS_FUSE_LOG_FILE="${baked_fuse_log_file}" \\
+    /usr/local/bin/slayerfs mount --privileged --config "\$config_path" "\$target" >>"\$log_file" 2>&1 &
+slayerfs_pid=\$!
+EOF
+    else
+        cat >>"$helper" <<'EOF'
+/usr/local/bin/slayerfs mount --privileged --config "$config_path" "$target" >>"$log_file" 2>&1 &
+slayerfs_pid=$!
+EOF
+    fi
+
+    cat >>"$helper" <<'EOF'
+wait_secs="${SLAYERFS_MOUNT_WAIT_SECS:-60}"
+deadline=$((SECONDS + wait_secs))
+while (( SECONDS < deadline )); do
+    if is_slayerfs_mounted; then
+        sleep "${SLAYERFS_MOUNT_READY_DELAY_SECS:-1}"
+        exit 0
+    fi
+    if ! kill -0 "$slayerfs_pid" 2>/dev/null; then
+        status=0
+        wait "$slayerfs_pid" || status=$?
+        if (( status == 0 )); then
+            status=1
+        fi
+        echo "slayerfs mount process exited before $target became a mountpoint (status=$status)" >&2
+        exit "$status"
+    fi
+    sleep 0.1
+done
+
+echo "timed out after ${wait_secs}s waiting for SlayerFS mount at $target" >&2
+echo "slayerfs_pid=$slayerfs_pid running=$(kill -0 "$slayerfs_pid" 2>/dev/null && echo yes || echo no)" >&2
+echo "findmnt: $(findmnt -rn --target "$target" --output TARGET,FSTYPE,SOURCE 2>/dev/null || true)" >&2
+ps -o pid,ppid,stat,etime,comm,args -p "$slayerfs_pid" >&2 || true
+exit 1
 EOF
     chmod +x "$helper"
 }
@@ -218,6 +292,9 @@ copy_artifacts() {
     if [[ -f "$log_file" && "$log_file" != "$artifact_dir/slayerfs.log" ]]; then
         cp -f "$log_file" "$artifact_dir/slayerfs.log" || true
     fi
+    if [[ -n "${SLAYERFS_FUSE_LOG_FILE:-}" && -f "${SLAYERFS_FUSE_LOG_FILE}" && "${SLAYERFS_FUSE_LOG_FILE}" != "$artifact_dir/slayerfs_fuse_ops.log" ]]; then
+        cp -f "${SLAYERFS_FUSE_LOG_FILE}" "$artifact_dir/slayerfs_fuse_ops.log" || true
+    fi
     if [[ -f "$config_path" ]]; then
         cp -f "$config_path" "$artifact_dir/backend.yml" || true
     fi
@@ -233,7 +310,7 @@ copy_artifacts() {
 }
 
 cleanup() {
-    while mount | grep -q " on $mount_dir "; do
+    while findmnt -rn --target "$mount_dir" --output FSTYPE 2>/dev/null | grep -Eq '^fuse(\.|$)'; do
         fusermount3 -u "$mount_dir" >/dev/null 2>&1 \
             || umount -f "$mount_dir" >/dev/null 2>&1 \
             || umount -l "$mount_dir" >/dev/null 2>&1 \
@@ -289,6 +366,8 @@ run_xfstests() {
 }
 
 main() {
+    local normalized_fuse_op_log
+
     if [[ -z "$artifact_dir" ]]; then
         ts="$(date +%s)-$RANDOM"
         artifact_dir="${artifact_root%/}/run-${ts}"
@@ -297,6 +376,15 @@ main() {
     chmod a+rwx "$artifact_dir" >/dev/null 2>&1 || true
     log_file="$artifact_dir/slayerfs.log"
     export SLAYERFS_LOG_FILE="$log_file"
+    normalized_fuse_op_log="${SLAYERFS_FUSE_OP_LOG:-0}"
+    normalized_fuse_op_log="${normalized_fuse_op_log,,}"
+    if [[ "$normalized_fuse_op_log" =~ ^(1|true|yes|on)$ ]]; then
+        fuse_log_file="$artifact_dir/slayerfs_fuse_ops.log"
+        export SLAYERFS_FUSE_LOG_FILE="$fuse_log_file"
+    else
+        fuse_log_file=""
+        unset SLAYERFS_FUSE_LOG_FILE || true
+    fi
 
     trap on_exit EXIT INT TERM
 

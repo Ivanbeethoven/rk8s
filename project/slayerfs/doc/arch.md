@@ -1,206 +1,175 @@
-# S3LayerFS
+# SlayerFS 架构概述
 
+SlayerFS 是一个用 Rust 实现的分布式文件系统，设计思路受 JuiceFS 启发。计算与存储分离，元数据与数据分流到不同后端，对外通过 FUSE 挂载提供 POSIX 兼容的文件系统接口。
 
-# S3LayerFS
+## 分层结构
 
-Version: 0.1
+整个系统从上到下分为 6 层：
 
-Summary
-------
-This document describes an MVP for a Rust-based distributed filesystem (in the spirit of juicefs-rs) with a persistent backend that interfaces with `rustfs`. The goal is to produce a mountable, usable system as quickly as possible: FUSE mounting, centralized metadata (DB), a write path that goes from write buffer -> slice -> chunk -> block -> upload (to rustfs), a read path that locates blocks via metadata and fills local cache on misses, and simple compaction and GC. The document includes the data model, module partitioning, API examples, and deployment/testing strategies.
-
-MVP feature checklist (must-have)
----------------------------------
-- FUSE mount and basic filesystem operations (open/read/write/create/unlink/rename/truncate/stat/readdir)
-- Metadata backend: Postgres (production) / SQLite (single-node development) / Redis (KV mode)
-- Write path: in-memory buffer -> slice -> chunk (64 MiB) -> block (default 4 MiB) -> concurrent upload to rustfs
-- Read path: locate blocks via metadata, prefer local cache; on cache miss read from rustfs and fill cache
-- Client session registration and heartbeat (used for crash recovery / cleanup)
-- Background workers: upload workers, compaction, GC, session cleaner
-- CLI tools: `format`, `mount`, `fsck` (basic)
-
-Optional (post-MVP iterations)
-- Improved local disk caching policies (LRU, size-limit)
-- Support for more metadata backends (TiKV, Redis)
-- Encryption/compression plugins, multi-tenancy, finer-grained permissions
-
-Overall architecture (layered)
-------------------
-- CLI / Daemon (single binary)
-- FUSE adapter (fuser / fuse3)
-- VFS layer: POSIX semantics, handle management, cache control
-- MetaClient: SQLx (Postgres/SQLite) or other backend, responsible for transactions and mappings
-- Data layer (Reader / Writer)
-	- Writer: buffer -> slice -> split -> block -> upload -> metadata commit
-	- Reader: metadata lookup -> assemble blocks -> return data
-- ChunkStore adapter: implementation that targets `rustfs` (preferred) or an S3-compatible adapter
-- Local cache: disk or memory-backed cache
-- Background workers: heartbeat, compaction, GC, upload pools
-
-## Architecture diagram
-
-```mermaid
-flowchart TD
-	subgraph App["CLI / Daemon"]
-		CLI["CLI / Daemon"]
-	end
-
-	subgraph Fuse["FUSE adapter"]
-		FUSE["FUSE adapter"]
-	end
-
-	subgraph VFS["VFS layer"]
-		VFSCore["VFS: POSIX semantics, handles, cache control"]
-		Cache["Local cache (memory/disk)"]
-	end
-
-	subgraph Meta["MetaClient"]
-		MetaClient["Meta client (SQLx / Redis)"]
-		DB["Postgres / SQLite / Redis / Etcd"]
-	end
-
-	subgraph Data["Data layer"]
-		Writer["Writer: buffer -> slice -> split -> block"]
-		Reader["Reader: metadata lookup -> assemble blocks"]
-	end
-
-	subgraph Adapter["ChunkStore adapter"]
-		CAdapter["Chunk/Object Store Adapter"]
-		S3["S3-compatible"]
-		Rustfs["rustfs backend"]
-	end
-
-	subgraph BG["Background workers"]
-		Workers["heartbeat, compaction, GC, upload pools"]
-	end
-
-	%% App entry
-	CLI --> FUSE --> VFSCore
-
-	%% VFS interactions
-	VFSCore <--> Cache
-	VFSCore --> MetaClient
-	MetaClient --> DB
-
-	%% Write path
-	VFSCore --> Writer
-	Writer --> CAdapter --> S3
-	CAdapter --> Rustfs
-	Writer --> MetaClient
-
-	%% Read path
-	VFSCore --> Reader
-	Reader --> MetaClient
-	Reader --> CAdapter --> S3
-	Reader -.-> Cache
-
-	%% Background workers
-	Workers --> MetaClient
-	Workers --> CAdapter
+```
+┌──────────────────────────────────────────┐
+│  CLI / Daemon  (main.rs)                 │  ← 入口、配置解析、信号处理
+├──────────────────────────────────────────┤
+│  FUSE 适配层  (fuse/)                     │  ← rfuse3, io_uring, 请求分发
+├──────────────────────────────────────────┤
+│  VFS 层  (vfs/)                          │  ← POSIX 语义, 句柄管理, 缓存
+├──────────────────────────────────────────┤
+│  MetaClient / MetaLayer  (meta/)         │  ← 元数据缓存, 会话, 事务封装
+│  MetaStore  (meta/store.rs trait)        │  ← 元数据存储抽象
+│  ├── DatabaseMetaStore (SQLite/Postgres) │
+│  ├── EtcdMetaStore                       │
+│  └── RedisMetaStore                      │
+├──────────────────────────────────────────┤
+│  数据层  (chunk/)                         │  ← Chunk/Block/Slice 管理
+│  ├── Writer (上传, 提交)                  │
+│  ├── Reader (定位, 读取, 拼装)            │
+│  ├── BlockStore (对象存储适配)             │
+│  └── Compaction/GC                       │
+├──────────────────────────────────────────┤
+│  对象后端  (cadapter/)                    │
+│  ├── LocalFsBackend (本地磁盘)            │
+│  └── S3Backend (S3 兼容存储)              │
+└──────────────────────────────────────────┘
 ```
 
-说明：
-- 写路径（绿色实线）：VFS 将写缓冲切片与分块后，通过 Adapter 上传块对象，并向 Meta 提交 blocks/slice_blocks/slices 以及 inode.size 的原子更新。
-- 读路径（蓝色虚线）：VFS 先查 Meta 获取块信息，从 Adapter 读取并按需填充本地缓存，再拼装返回。
-- 后台任务：心跳、合并压缩（compaction）、GC、并行上传池等与 Meta/Adapter 协作。
+### 1. CLI / Daemon 层
 
-Modules communicate primarily using async Tokio; IO and uploads are asynchronous and concurrent.
+`main.rs` 是整个系统的入口，负责：
 
-Consistency semantics (current implementation)
----------------------------------------------
-This project is still evolving. The current behavior (as of now) is:
+- 解析 CLI 参数（支持 YAML 配置文件 + 命令行覆盖）
+- 初始化 tracing 日志系统（支持 log 文件分离、chrome trace、flamegraph、tokio-console）
+- 创建 MetaStore 和 BlockStore 实例
+- 构造 VFS 实例并通过 FUSE 挂载
+- 信号处理（SIGINT 卸载）
 
-- Single-process (one VFS instance):
-  - Handle-based IO: reads and writes go through `FileHandle` with a per-handle
-    gate. Writes wait for in-flight reads; reads wait for in-flight writes.
-  - Read-after-write is enforced by flushing pending writes before each read.
-    Reads may block until pending slices are uploaded and metadata committed.
-  - Writes are append-only slices inside each chunk. Metadata is committed
-    asynchronously by a per-chunk commit loop. Only committed slices are visible
-    to readers.
-  - Flush serializes with writes: while a flush is in progress, new writes to the
-    same file wait.
-  - VFS exposes `flush` / `fsync` to trigger timestamp updates for mmap-heavy
-    workloads via `update_timestamps_on_flush`.
+提供三个子命令：`mount`、`gc`、`info`。其中 `gc` 和 `info` 通过 Unix domain socket 与已运行的 daemon 通信（control plane）。
 
-- Truncate (single-process):
-  - Truncate locks all file handles, flushes pending writes, updates metadata,
-    prunes slices using the configured `layout.chunk_size`, clears reader and
-    writer caches for the inode, and updates the in-memory size. This prevents
-    old data from reappearing after a shrink followed by an extend.
+源码入口：`src/main.rs`，库入口：`src/lib.rs`
 
-- Multi-process / multi-client:
-  - There is no cross-client cache coherence yet. Reader caches are only
-    invalidated by the local writer after commit, so other clients may serve
-    stale data.
-  - File size is updated in metadata on write, but data commit is async, so
-    another client may observe size growth before data is fully committed and
-    read zeros.
+### 2. FUSE 适配层
 
-- Close-to-open:
-  - Best-effort only. `open` uses a cache-bypassing stat (`stat_fresh`) to refresh
-    the inode size/attrs, and `close` triggers a flush for write handles.
-    Cross-client cache invalidation is not implemented yet.
+`src/fuse/` 基于 `rfuse3` 实现 FUSE 协议，关键文件：
 
-These semantics will be tightened as cache invalidation is coordinated across
-clients.
+- `mod.rs`：实现 `fuser::Filesystem` trait，将 FUSE 请求翻译为 VFS 调用
+- `mount.rs`：挂载逻辑，支持特权模式（直接 `/dev/fuse`）和非特权模式（`fusermount3`）
+- `adapter.rs`：FUSE 与 VFS 之间的类型适配
 
-Metadata model (suggested simplified SQL schema)
--------------------------------------
-The following schema is a suggested example suitable for Postgres or SQLite (fields are simplified):
+FUSE 层通过 `OpTimer` RAII 结构记录每个操作的计数、字节数和延迟，写入 `.stats` 虚拟文件供 `slayerfs-stats` 读取。
 
-```sql
-CREATE TABLE inodes (
-	ino BIGINT PRIMARY KEY,
-	parent BIGINT,
-	name TEXT,
-	mode INTEGER,
-	uid INTEGER,
-	gid INTEGER,
-	size BIGINT,
-	atime TIMESTAMP,
-	mtime TIMESTAMP,
-	ctime TIMESTAMP
-);
+### 3. VFS 层
 
-CREATE TABLE chunks (
-	chunk_id BIGSERIAL PRIMARY KEY,
-	ino BIGINT,
-	chunk_index INTEGER,
-	updated_at TIMESTAMP
-);
+`src/vfs/` 是核心逻辑层，实现 POSIX 语义：
 
-CREATE TABLE slices (
-	slice_id BIGSERIAL PRIMARY KEY,
-	chunk_id BIGINT,
-	offset INT,  -- offset within the chunk
-	length INT,
-	created_at TIMESTAMP,
-	status TEXT, -- pending | committed
-	owner_session TEXT
-);
+- `fs/mod.rs`：`VFS` 结构体，是所有文件系统操作的入口（open/read/write/mkdir/unlink/rename/truncate 等）
+- `handles.rs`：文件和目录句柄管理，每个打开的文件持有 `FileHandle`
+- `io/reader.rs`：`FileReader`，读取路径，包含预读（readahead）逻辑
+- `io/writer.rs`：`FileWriter`，写入路径，管理 Slice 状态机和异步上传
+- `inode.rs`：inode 号分配与管理
+- `cache/`：VFS 层的缓存子系统（page cache、read cache、write-back cache、prefetch）
+- `meta_ops.rs`：元数据操作的 VFS 封装
+- `sdk.rs`：SDK 客户端封装（`VfsClient`）
+- `stats.rs`：`.stats` 虚拟文件的实现
+- `memory.rs`：全局内存预算管理
 
-CREATE TABLE blocks (
-	block_id UUID PRIMARY KEY,
-	object_key TEXT,
-	size INT,
-	checksum TEXT,
-	refcount INT DEFAULT 0,
-	created_at TIMESTAMP
-);
+### 4. 元数据层
 
-CREATE TABLE slice_blocks (
-	slice_id BIGINT,
-	block_id UUID,
-	block_index INT,
-	PRIMARY KEY (slice_id, block_index)
-);
+`src/meta/` 管理所有文件系统命名空间和布局元数据：
 
-CREATE TABLE sessions (
-	session_id TEXT PRIMARY KEY,
-	host TEXT,
-	pid INT,
-	start_time TIMESTAMP,
-	last_heartbeat TIMESTAMP
-);
+- `store.rs`：`MetaStore` trait，定义了 70+ 个元数据操作接口（stat、lookup、mkdir、create、unlink、rename、link、symlink、xattr、quota、lock 等）
+- `client/mod.rs`：`MetaClient`，在 MetaStore 之上提供缓存层（InodeCache、PathTrie、path_cache）
+- `layer.rs`：`MetaLayer`，组合 MetaClient，为 VFS 提供更高层语义
+- `stores/database/mod.rs`：`DatabaseMetaStore`，基于 SeaORM，支持 SQLite 和 PostgreSQL
+- `stores/etcd/mod.rs`：`EtcdMetaStore`，基于 etcd-client，支持分布式 KV、watch、事务
+- `stores/redis/mod.rs`：`RedisMetaStore`，基于 redis-rs，支持 Version + Lua CAS 并发控制
+- `entities/`：SeaORM 实体定义（`file_meta`、`content_meta`、`access_meta`、`slice_meta` 等）
+- `factory.rs`：`MetaStoreFactory`，工厂模式创建不同后端
+- `migrations.rs`：数据库 schema 迁移
+
+### 5. 数据层（Chunk 子系统）
+
+`src/chunk/` 实现了 JuiceFS 风格的 Chunk → Block 两级数据布局：
+
+- `layout.rs`：`ChunkLayout`，定义 chunk_size（默认 64MiB）和 block_size（默认 4MiB），提供全套偏移换算
+- `span.rs`：泛型 `Span<T>` 结构，用编译期 marker（ChunkTag/BlockTag/PageTag）区分层级
+- `slice.rs`：`SliceDesc` — 一次写操作在 Chunk 内产生的连续区间；`block_span_iter_slice` — slice 到 block 的映射
+- `writer.rs`：`DataUploader`，并发上传 slice 的各 block 数据
+- `reader.rs`：`DataFetcher`，按 SliceDesc 加载 block 并拼装
+- `store.rs`：`BlockStore` trait + `ObjectBlockStore` 实现，封装对象读写
+- `cache.rs`：`ChunksCache`，双层缓存（热内存 + 冷磁盘）
+- `compact/`：压缩与 GC（Compactor、CompactionWorker、BlockStoreGC）
+
+### 6. 对象后端
+
+`src/cadapter/` 抽象对象存储访问：
+
+- `client.rs`：`ObjectBackend` trait + `ObjectClient<B>` 泛型封装
+- `localfs.rs`：`LocalFsBackend`，以本地目录模拟对象存储
+- `s3.rs`：`S3Backend`，接入 S3 兼容存储，支持 multipart upload、path-style、checksum 控制
+
+## 数据流转
+
+### 写路径
+
 ```
+FUSE write(ino, offset, data)
+  → VFS::write()
+    → FileWriter::write_at(offset, data)
+      → 按 Chunk 边界切分为 ChunkSpan 列表
+      → 每个 Chunk：追加到 SliceState（Writable 状态）
+      → auto_flush 定时器触发 spawn_flush_slice
+        → SliceState: Writable → Readonly → Uploading
+        → DataUploader::write_at_vectored()
+          → block_span_iter_slice 拆分为 BlockSpan 列表
+          → 并发：BlockStore::write_fresh_vectored(key=(slice_id, block_index), data)
+        → SliceState: Uploaded
+        → commit_chunk()
+          → MetaLayer::append_slice(chunk_id, SliceDesc)
+        → SliceState: Committed（对读可见）
+```
+
+### 读路径
+
+```
+FUSE read(ino, offset, len)
+  → VFS::read()
+    → FileReader::read_at(offset, len)
+      → 按 Chunk 边界切分
+      → 每个 Chunk：
+        → DataFetcher::prepare_slices(chunk_id)
+          → MetaLayer::get_slices(chunk_id) 加载全部 SliceDesc
+        → DataFetcher::read_at(offset, len)
+          → Intervals 反向扫描（最新 slice 优先）构建 need_read 列表
+          → 对每条 need_read：
+            → block_span_iter_slice 枚举 BlockSpan 列表
+            → 并发：BlockStore::read_range(key, offset, buf)
+          → 空洞区间填 0
+```
+
+## 模块间依赖
+
+```
+fuse ──→ vfs ──→ meta/layer ──→ meta/client ──→ meta/store (trait)
+                │                                    ├── database
+                │                                    ├── etcd
+                │                                    └── redis
+                │
+                ├──→ chunk/writer ──→ chunk/store ──→ cadapter
+                │                                ├── localfs
+                ├──→ chunk/reader ──→ chunk/store ─┘
+                │                   └── chunk/cache
+                │
+                └──→ chunk/compact ──→ chunk/store
+                         └── chunk/compact/gc
+```
+
+## 进程模型
+
+SlayerFS 以单进程 daemon 方式运行。一个进程内包含：
+
+- FUSE dispatch loop（可选 worker pool 模式）
+- MetaClient（含 cache、session heartbeat）
+- VFS（含 reader/writer cache）
+- 后台任务线程（compaction worker、GC worker）
+- Control plane server（Unix domain socket，处理 gc/info 命令）
+
+多进程部署时，每个进程独立挂载同一个文件系统，共享元数据后端和对象存储。一致性依赖 close-to-open 语义（当前为尽力而为）和全局锁（compaction 场景）。

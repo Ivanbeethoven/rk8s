@@ -36,6 +36,9 @@ impl From<EntryType> for FileType {
 pub struct FileAttr {
     pub ino: i64,
     pub size: u64,
+    /// Number of 512-byte blocks allocated on the backend for this inode.
+    /// For sparse files this is typically smaller than `size.div_ceil(512)`.
+    pub blocks: u64,
     pub kind: FileType,
     pub mode: u32,
     pub uid: u32,
@@ -140,6 +143,33 @@ pub struct StatFsSnapshot {
     pub available_space: u64,
     pub used_inodes: u64,
     pub available_inodes: u64,
+}
+
+/// Explicit feature declaration for a metadata backend.
+///
+/// The `MetaStore` trait intentionally contains optional methods while SlayerFS
+/// is converging on JuiceFS-level semantics. These flags let callers and tools
+/// distinguish implemented backend features from trait-level placeholders.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MetaStoreCapabilities {
+    pub namespace: bool,
+    pub file_data: bool,
+    pub batch_stat: bool,
+    pub hardlinks: bool,
+    pub symlinks: bool,
+    pub rename_exchange: bool,
+    pub open_close_tracking: bool,
+    pub stat_fs: bool,
+    pub sessions: bool,
+    pub global_locks: bool,
+    pub plocks: bool,
+    pub flocks: bool,
+    pub xattr: bool,
+    pub acl: bool,
+    pub quota: bool,
+    pub dump_load: bool,
+    pub compaction: bool,
+    pub watch_invalidation: bool,
 }
 
 /// Directory entry
@@ -265,6 +295,33 @@ pub trait Visitor<T>: Send {
     fn visit(&mut self, item: T) -> Result<(), MetaError>;
 }
 
+/// Categorizes why a retryable conflict occurred, enabling callers to choose
+/// appropriate backoff strategies and produce better diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryReason {
+    /// Chunk version mismatch — a concurrent write or compact changed the
+    /// chunk between our read and our commit attempt.
+    VersionConflict,
+    /// Compaction conflict — another compact or write landed while we were
+    /// compacting the same chunk.
+    CompactConflict,
+    /// Generic CAS / transaction conflict (etcd txn, Redis WATCH, etc.).
+    TransactionConflict,
+    /// A global or per-inode lock is held by another operation.
+    LockContention,
+}
+
+impl std::fmt::Display for RetryReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VersionConflict => write!(f, "version_conflict"),
+            Self::CompactConflict => write!(f, "compact_conflict"),
+            Self::TransactionConflict => write!(f, "transaction_conflict"),
+            Self::LockContention => write!(f, "lock_contention"),
+        }
+    }
+}
+
 /// Metadata operation errors
 #[derive(Debug, thiserror::Error)]
 pub enum MetaError {
@@ -303,8 +360,11 @@ pub enum MetaError {
     #[error("Internal error: {0}")]
     Internal(String),
 
-    #[error("continue retry")]
-    ContinueRetry,
+    /// A retryable conflict — the caller should back off and retry.
+    /// The `RetryReason` helps commit_chunk choose an appropriate backoff
+    /// strategy and provides better observability in logs.
+    #[error("continue retry: {0}")]
+    ContinueRetry(RetryReason),
 
     #[error("error: max retries exceeded")]
     MaxRetriesExceeded,
@@ -382,6 +442,11 @@ pub trait MetaStore: Send + Sync {
     /// Human readable backend name (for diagnostics and logging)
     fn name(&self) -> &'static str {
         "meta-store"
+    }
+
+    /// Returns the optional feature set implemented by this backend.
+    fn capabilities(&self) -> MetaStoreCapabilities {
+        MetaStoreCapabilities::default()
     }
 
     /// Build a concrete store instance from backend config.
@@ -987,6 +1052,26 @@ pub trait MetaStore: Send + Sync {
         pid: u32,
     ) -> Result<(), MetaError> {
         let _ = (inode, owner, lock_type, pid, block, range);
+        Err(MetaError::NotImplemented)
+    }
+
+    /// Gets BSD flock status for an inode / owner pair.
+    /// Returns UnLock when no flock is held by that owner.
+    async fn get_flock(&self, inode: i64, owner: i64) -> Result<FileLockType, MetaError> {
+        let _ = (inode, owner);
+        Err(MetaError::NotImplemented)
+    }
+
+    /// Sets or clears a BSD flock (whole-file advisory lock).
+    /// When `block` is true the call polls until the lock is acquired.
+    async fn set_flock(
+        &self,
+        inode: i64,
+        owner: i64,
+        block: bool,
+        lock_type: FileLockType,
+    ) -> Result<(), MetaError> {
+        let _ = (inode, owner, block, lock_type);
         Err(MetaError::NotImplemented)
     }
 }

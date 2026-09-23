@@ -10,7 +10,7 @@ where
     for c in 0..max_retries {
         match f().await {
             Ok(r) => return Ok(r),
-            Err(MetaError::ContinueRetry) => {}
+            Err(MetaError::ContinueRetry(_)) => {}
             Err(e) => return Err(e),
         }
 
@@ -28,7 +28,7 @@ macro_rules! backoff {
             for c in 0..$max_retries {
                 match $retry_block.await {
                     Ok(r) => return Ok(r),
-                    Err(e) if matches!(e, $crate::meta::store::MetaError::ContinueRetry) => {}
+                    Err(e) if matches!(e, $crate::meta::store::MetaError::ContinueRetry(_)) => {}
                     Err(e) => return Err(e),
                 }
 
@@ -47,7 +47,7 @@ macro_rules! backoff {
 #[cfg(test)]
 mod tests {
     use crate::meta::backoff::backoff;
-    use crate::meta::store::MetaError;
+    use crate::meta::store::{MetaError, RetryReason};
     use rand::RngCore;
     use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -59,7 +59,7 @@ mod tests {
         let maybe_failed = || async {
             if current.load(Ordering::Relaxed) < try_my_fortune {
                 current.fetch_add(1, Ordering::Relaxed);
-                Err(MetaError::ContinueRetry)
+                Err(MetaError::ContinueRetry(RetryReason::VersionConflict))
             } else {
                 Ok(0)
             }
@@ -80,7 +80,7 @@ mod tests {
                 async {
                     if current < try_my_fortune {
                         current += 1;
-                        Err(MetaError::ContinueRetry)
+                        Err(MetaError::ContinueRetry(RetryReason::VersionConflict))
                     } else {
                         Ok(0)
                     }

@@ -7,9 +7,11 @@ use crate::meta::client::MetaClient;
 use crate::meta::config::CompactConfig;
 use crate::meta::config::MetaClientConfig;
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
-use crate::meta::store::{AclRule, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot};
+use crate::meta::store::{
+    AclRule, MetaError, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
+};
 use dashmap::{DashMap, Entry};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -81,12 +83,30 @@ struct VfsBackgroundTasks {
     gc_handle: tokio::task::JoinHandle<()>,
 }
 
+const RECENTLY_UNLINKED_ATTR_TTL: Duration = Duration::from_secs(5);
+const RECENTLY_UNLINKED_ATTR_CLEANUP_THRESHOLD: usize = 4096;
+const RECENTLY_UNLINKED_ATTR_CLEANUP_INTERVAL: u64 =
+    RECENTLY_UNLINKED_ATTR_CLEANUP_THRESHOLD as u64;
+
+fn vfs_timing_enabled_from_env() -> bool {
+    std::env::var("SLAYERFS_VFS_TIMING")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 use crate::vfs::Inode;
 use crate::vfs::backend::Backend;
+use crate::vfs::cache::config::CacheConfig;
 use crate::vfs::config::VFSConfig;
 use crate::vfs::error::{PathHint, VfsError};
 use crate::vfs::handles::{DirHandle, FileHandle, HandleFlags};
 use crate::vfs::io::{DataReader, DataWriter};
+use crate::vfs::memory::MemoryBudget;
 
 struct HandleRegistry<B, M>
 where
@@ -143,6 +163,14 @@ where
         self.handles.get(&fh).map(|entry| Arc::clone(entry.value()))
     }
 
+    fn mark_write_dirty(&self, fh: u64) -> bool {
+        let Some(handle) = self.handles.get(&fh) else {
+            return false;
+        };
+        handle.mark_write_dirty();
+        true
+    }
+
     fn handles_for(&self, ino: i64) -> Vec<u64> {
         self.inode_handles
             .get(&ino)
@@ -151,7 +179,11 @@ where
     }
 
     fn attr_for(&self, fh: u64) -> Option<FileAttr> {
-        self.handles.get(&fh).map(|entry| entry.attr())
+        self.handles.get(&fh).map(|entry| entry.attr()).or_else(|| {
+            self.dir_handles
+                .get(&fh)
+                .and_then(|entry| entry.attr.clone())
+        })
     }
 
     fn attr_for_inode(&self, ino: i64) -> Option<FileAttr> {
@@ -159,6 +191,13 @@ where
         for fh in fhs {
             if let Some(handle) = self.handles.get(&fh) {
                 return Some(handle.attr());
+            }
+        }
+        for entry in self.dir_handles.iter() {
+            if entry.ino == ino
+                && let Some(attr) = entry.attr.clone()
+            {
+                return Some(attr);
             }
         }
         None
@@ -194,39 +233,21 @@ where
         self.dir_handles.remove(&fh).map(|(_, handle)| handle)
     }
 
+    /// Replace the DirHandle at an existing fh with a fresh one.
+    /// Used for rewinddir: keep the same fh but swap in new entries.
+    fn replace_dir(&self, fh: u64, handle: DirHandle) -> bool {
+        if self.dir_handles.contains_key(&fh) {
+            self.dir_handles.insert(fh, Arc::new(handle));
+            true
+        } else {
+            false
+        }
+    }
+
     fn get_dir(&self, fh: u64) -> Option<Arc<DirHandle>> {
         self.dir_handles
             .get(&fh)
             .map(|entry| Arc::clone(entry.value()))
-    }
-}
-
-struct ModifiedTracker {
-    entries: Mutex<HashMap<i64, Instant>>,
-}
-
-impl ModifiedTracker {
-    fn new() -> Self {
-        Self {
-            entries: Mutex::new(HashMap::new()),
-        }
-    }
-
-    async fn touch(&self, ino: i64) {
-        let mut guard = self.entries.lock().await;
-        guard.insert(ino, Instant::now());
-    }
-
-    async fn modified_since(&self, ino: i64, since: Instant) -> bool {
-        let guard = self.entries.lock().await;
-        guard.get(&ino).map(|&ts| ts >= since).unwrap_or(false)
-    }
-
-    async fn cleanup_older_than(&self, ttl: Duration) {
-        let now = Instant::now();
-        let cutoff = now.checked_sub(ttl).unwrap_or(now);
-        let mut guard = self.entries.lock().await;
-        guard.retain(|_, ts| *ts >= cutoff);
     }
 }
 
@@ -237,9 +258,14 @@ where
 {
     handles: HandleRegistry<S, M>,
     inodes: DashMap<i64, Arc<Inode>>,
+    recently_unlinked: DashMap<i64, (FileAttr, Instant)>,
+    recently_unlinked_cleanup_tick: AtomicU64,
     reader: Arc<DataReader<S, M>>,
     writer: Arc<DataWriter<S, M>>,
-    modified: ModifiedTracker,
+    append_locks: DashMap<i64, Arc<Mutex<()>>>,
+    posix_lock_owners: DashMap<(i64, i64), ()>,
+    pub(crate) stats: Arc<crate::vfs::stats::FsStats>,
+    vfs_timing_enabled: bool,
 }
 
 impl<S, M> VfsState<S, M>
@@ -248,20 +274,257 @@ where
     M: MetaLayer + Send + Sync + 'static,
 {
     fn new(config: Arc<VFSConfig>, backend: Arc<Backend<S, M>>) -> Self {
-        let reader = Arc::new(DataReader::new(config.read.clone(), backend.clone()));
-        let writer = Arc::new(DataWriter::new(
-            config.write.clone(),
-            backend,
-            reader.clone(),
-        ));
+        let memory_budget = (config.cache.memory_budget_bytes > 0)
+            .then(|| MemoryBudget::new(config.cache.memory_budget_bytes));
+
+        let prefetcher = if config.cache.prefetch_enabled {
+            let prefetch_backend = backend.clone();
+            let prefetch_layout = config.read.layout;
+            let prefetch_concurrency = config.cache.prefetch_concurrency.max(1);
+            let prefetch_queue_depth = prefetch_concurrency.saturating_mul(16).max(1024);
+            Some(Arc::new(crate::vfs::cache::prefetch::GlobalPrefetcher::new(
+                prefetch_concurrency,
+                prefetch_queue_depth,
+                move |ino, start, len| {
+                    let backend = prefetch_backend.clone();
+                    let layout = prefetch_layout;
+                    async move {
+                        use crate::chunk::reader::DataFetcher;
+                        use crate::vfs::chunk_id_for;
+                        use crate::vfs::io::split_chunk_spans;
+
+                        let spans = split_chunk_spans(layout, start, len as usize);
+                        // Issue all spans concurrently — each span fetches
+                        // its blocks via SingleFlight so parallelism is bounded
+                        // by the prefetch semaphore, not serialized here.
+                        let mut tasks = Vec::with_capacity(spans.len());
+                        for span in spans {
+                            let cid = match chunk_id_for(ino, span.index) {
+                                Ok(c) => c,
+                                Err(_) => continue,
+                            };
+                            let backend = backend.clone();
+                            tasks.push(tokio::spawn(async move {
+                                let mut fetcher = DataFetcher::new(layout, cid, &*backend);
+                                if fetcher.prepare_slices().await.is_err() {
+                                    return;
+                                }
+                                let _ =
+                                    fetcher.read_at(span.offset.into(), span.len as usize).await;
+                            }));
+                        }
+                        for t in tasks {
+                            let _ = t.await;
+                        }
+                    }
+                },
+            ))
+                as Arc<dyn crate::vfs::cache::prefetch::Prefetcher>)
+        } else {
+            None
+        };
+
+        let mut reader_builder = DataReader::new(config.read.clone(), backend.clone());
+        if let Some(memory_budget) = memory_budget.clone() {
+            reader_builder = reader_builder.with_memory_budget(memory_budget);
+        }
+        if let Some(prefetcher) = prefetcher {
+            reader_builder = reader_builder.with_prefetcher(prefetcher);
+        }
+        let reader = Arc::new(reader_builder);
+
+        let write_back = {
+            let cache_root = config.cache.cache_root.join("writeback");
+            let _ = std::fs::create_dir_all(&cache_root);
+            let wb = Arc::new(crate::vfs::cache::write_back::FsWriteBackCache::new(
+                cache_root,
+            ));
+
+            // Crash recovery: scan for dirty slices from a previous session.
+            // Skip in test builds to avoid cross-test contamination from
+            // leftover dirty slice files in the shared temp directory.
+            #[cfg(not(test))]
+            {
+                let wb_clone = wb.clone();
+                let backend_clone = backend.clone();
+                let layout = config.write.layout;
+                tokio::spawn(async move {
+                    Self::recover_dirty_slices(&wb_clone, &backend_clone, layout).await;
+                });
+            }
+
+            Some(wb)
+        };
+
+        let mut writer_builder =
+            DataWriter::new(config.write.clone(), backend, reader.clone(), write_back);
+        if let Some(memory_budget) = memory_budget {
+            writer_builder = writer_builder.with_memory_budget(memory_budget);
+        }
+        let writer = Arc::new(writer_builder);
         writer.start_flush_background();
         Self {
             handles: HandleRegistry::new(),
             inodes: DashMap::new(),
+            recently_unlinked: DashMap::new(),
+            recently_unlinked_cleanup_tick: AtomicU64::new(0),
             reader,
             writer,
-            modified: ModifiedTracker::new(),
+            append_locks: DashMap::new(),
+            posix_lock_owners: DashMap::new(),
+            stats: Arc::new(crate::vfs::stats::FsStats::new()),
+            vfs_timing_enabled: vfs_timing_enabled_from_env(),
         }
+    }
+
+    /// Scan local SSD for dirty slices from a previous session.
+    /// Re-uploads recoverable slices and cleans up stale records.
+    async fn recover_dirty_slices(
+        wb: &crate::vfs::cache::write_back::FsWriteBackCache,
+        backend: &Arc<Backend<S, M>>,
+        layout: crate::chunk::ChunkLayout,
+    ) {
+        use crate::vfs::cache::keys::DirtySliceState;
+        use crate::vfs::cache::write_back::WriteBackCache;
+
+        let records = match wb.recover().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = ?e, "write-back cache recovery scan failed");
+                return;
+            }
+        };
+
+        if records.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            count = records.len(),
+            "recovered dirty slices from previous session"
+        );
+
+        for record in records {
+            if !record.path.exists() {
+                let _ = wb.remove(&record.key).await;
+                continue;
+            }
+
+            match record.state {
+                DirtySliceState::Sealed | DirtySliceState::Failed | DirtySliceState::Uploading => {
+                    tracing::info!(
+                        ino = record.ino,
+                        chunk_id = record.chunk_id,
+                        length = record.length,
+                        state = ?record.state,
+                        "re-uploading recovered slice"
+                    );
+                    Self::reupload_recovered_slice(wb, backend, layout, &record).await;
+                }
+                _ => {
+                    let _ = wb.remove(&record.key).await;
+                }
+            }
+        }
+    }
+
+    async fn reupload_recovered_slice(
+        wb: &crate::vfs::cache::write_back::FsWriteBackCache,
+        backend: &Arc<Backend<S, M>>,
+        layout: crate::chunk::ChunkLayout,
+        record: &crate::vfs::cache::write_back::DirtySliceRecord,
+    ) {
+        use crate::chunk::writer::DataUploader;
+        use crate::vfs::cache::write_back::WriteBackCache;
+
+        let data = match tokio::fs::read(&record.path).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(path = ?record.path, error = ?e, "cannot read recovered slice");
+                return;
+            }
+        };
+
+        let slice_id = match backend.meta().next_id(crate::meta::SLICE_ID_KEY).await {
+            Ok(id) => id as u64,
+            Err(e) => {
+                tracing::warn!(error = ?e, "failed to allocate slice_id for recovery");
+                return;
+            }
+        };
+
+        let uploader = DataUploader::new(layout, backend);
+        let chunks = vec![bytes::Bytes::from(data)];
+        if let Err(e) = uploader
+            .write_at_vectored(slice_id, 0u64.into(), &chunks)
+            .await
+        {
+            tracing::warn!(slice_id, error = ?e, "recovery upload failed");
+            return;
+        }
+
+        let desc = crate::chunk::SliceDesc {
+            chunk_id: record.chunk_id,
+            slice_id,
+            offset: record.chunk_offset,
+            length: record.length,
+        };
+        let (ino, chunk_index) = crate::vfs::extract_ino_and_chunk_index(record.chunk_id);
+        let file_offset = chunk_index * layout.chunk_size + desc.offset;
+        let new_size = file_offset + desc.length;
+
+        // Check if the inode still exists before committing.  If the file was
+        // deleted before the crash, the dirty record is orphaned and should be
+        // cleaned up rather than entering an infinite recovery retry loop.
+        match backend.meta().stat(ino).await {
+            Ok(None) | Err(MetaError::NotFound(_)) => {
+                tracing::warn!(
+                    ino,
+                    slice_id,
+                    "recovery skipped: inode deleted, removing orphan dirty record"
+                );
+                let _ = wb.remove(&record.key).await;
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(ino, slice_id, error = ?e, "recovery stat check failed, will retry commit");
+            }
+            Ok(Some(_)) => {}
+        }
+
+        if let Err(e) = backend
+            .meta()
+            .write(ino, record.chunk_id, desc, new_size)
+            .await
+        {
+            // If the inode was deleted between stat and write, clean up and move on.
+            if matches!(e, MetaError::NotFound(_)) {
+                tracing::warn!(
+                    ino,
+                    slice_id,
+                    "recovery metadata commit: inode gone, removing orphan dirty record"
+                );
+                let _ = wb.remove(&record.key).await;
+                return;
+            }
+            tracing::warn!(ino, slice_id, error = ?e, "recovery metadata commit failed");
+            return;
+        }
+
+        tracing::info!(
+            ino,
+            slice_id,
+            length = record.length,
+            "recovery commit success"
+        );
+        let _ = wb.remove(&record.key).await;
+    }
+
+    fn append_lock(&self, ino: i64) -> Arc<Mutex<()>> {
+        self.append_locks
+            .entry(ino)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 }
 
@@ -370,13 +633,29 @@ where
         meta_layer: Arc<MetaClient<R>>,
         compact_config: CompactConfig,
     ) -> Result<Self, VfsError> {
+        Self::with_meta_layer_with_cache_config(
+            layout,
+            store,
+            meta_layer,
+            compact_config,
+            CacheConfig::default(),
+        )
+    }
+
+    pub(crate) fn with_meta_layer_with_cache_config(
+        layout: ChunkLayout,
+        store: Arc<S>,
+        meta_layer: Arc<MetaClient<R>>,
+        compact_config: CompactConfig,
+        cache_config: CacheConfig,
+    ) -> Result<Self, VfsError> {
         let enabled = !meta_layer.options().no_background_jobs;
         let bg_config = VfsBackgroundConfig::from_compact_config(&layout, compact_config, enabled);
         let background_tasks =
             Self::start_background_tasks(&meta_layer, Arc::clone(&store), layout, bg_config);
 
         Self::from_components_with_background(
-            VFSConfig::new(layout),
+            VFSConfig::new_with_cache_config(layout, cache_config),
             store,
             meta_layer,
             background_tasks,
@@ -455,6 +734,64 @@ where
         let config = Arc::new(config);
         let state = Arc::new(VfsState::new(config, backend));
 
+        // Background statistics logger — JuiceFS-stats equivalent.
+        let fuse_stats = state.stats.clone();
+        if let (Some(hits), Some(misses)) = store.cache_counters() {
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(100));
+                let mut prev_reads: u64 = 0;
+                let mut prev_bytes: u64 = 0;
+                let mut prev_lat_us: u64 = 0;
+                loop {
+                    interval.tick().await;
+                    let h = hits.load(std::sync::atomic::Ordering::Relaxed);
+                    let m = misses.load(std::sync::atomic::Ordering::Relaxed);
+                    let total = h + m;
+                    let rate = if total > 0 {
+                        (h as f64 / total as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    let reads = fuse_stats
+                        .fuse_read_ops
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let bytes = fuse_stats
+                        .fuse_read_bytes
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let lat_us = fuse_stats
+                        .fuse_read_lat_us
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let reads_delta = reads.saturating_sub(prev_reads);
+                    let bytes_delta = bytes.saturating_sub(prev_bytes);
+                    let lat_delta = lat_us.saturating_sub(prev_lat_us);
+                    let avg_sz = if reads_delta > 0 {
+                        bytes_delta / reads_delta
+                    } else {
+                        0
+                    };
+                    let avg_lat_us = if reads_delta > 0 {
+                        lat_delta / reads_delta
+                    } else {
+                        0
+                    };
+                    prev_reads = reads;
+                    prev_bytes = bytes;
+                    prev_lat_us = lat_us;
+                    tracing::info!(
+                        hits = h,
+                        misses = m,
+                        total,
+                        hit_pct = rate,
+                        fuse_reads = reads,
+                        fuse_rd_bytes = bytes,
+                        avg_read_sz = avg_sz,
+                        avg_read_lat_us = avg_lat_us,
+                        "stats"
+                    );
+                }
+            });
+        }
+
         Ok(Self {
             core,
             state,
@@ -464,6 +801,23 @@ where
 
     pub(crate) fn root_ino(&self) -> i64 {
         self.core.root
+    }
+
+    /// Access the shared statistics counters.
+    pub fn stats(&self) -> &Arc<crate::vfs::stats::FsStats> {
+        &self.state.stats
+    }
+
+    fn vfs_timing_timer<'a>(
+        &'a self,
+        ops_counter: &'a AtomicU64,
+        lat_counter: &'a AtomicU64,
+    ) -> crate::vfs::stats::MaybeOpTimer<'a> {
+        crate::vfs::stats::MaybeOpTimer::new(
+            self.state.vfs_timing_enabled,
+            ops_counter,
+            lat_counter,
+        )
     }
 
     pub(crate) fn meta_layer(&self) -> &M {
@@ -480,6 +834,10 @@ where
 
     fn file_handle_required(&self, fh: u64) -> Result<Arc<FileHandle<S, M>>, VfsError> {
         self.file_handle(fh).ok_or(VfsError::StaleNetworkFileHandle)
+    }
+
+    pub(crate) fn mark_handle_write_dirty(&self, fh: u64) -> bool {
+        self.state.handles.mark_write_dirty(fh)
     }
 
     fn file_handles_for_inode(&self, ino: i64) -> Vec<Arc<FileHandle<S, M>>> {
@@ -504,6 +862,18 @@ where
 
     pub(crate) fn inode_size_cached(&self, ino: i64) -> Option<u64> {
         self.state.inodes.get(&ino).map(|inode| inode.file_size())
+    }
+
+    fn extend_local_file_size(&self, ino: i64, min_size: u64) {
+        if let Some(inode) = self.state.inodes.get(&ino)
+            && min_size > inode.file_size()
+        {
+            inode.extend_size(min_size);
+        }
+
+        for handle in self.file_handles_for_inode(ino) {
+            handle.extend_size(min_size);
+        }
     }
 
     pub(crate) async fn inode_size(&self, ino: i64) -> Result<u64, VfsError> {
@@ -542,7 +912,19 @@ where
             attr.size = size;
         }
 
+        tracing::debug!(ino, nlink = attr.nlink, kind = ?attr.kind, "stat_ino");
         Some(attr)
+    }
+
+    pub(crate) fn blocks_for_attr(&self, attr: &FileAttr) -> u64 {
+        if let Some(inode) = self.state.inodes.get(&attr.ino)
+            && let Some(blocks) = inode.allocated_blocks_512()
+        {
+            return blocks;
+        }
+        // Fall back to the metadata-provided value.  For backends that haven't
+        // implemented accurate block tracking yet, this is `size.div_ceil(512)`.
+        attr.blocks
     }
 
     /// Returns the current time as nanoseconds since UNIX_EPOCH.
@@ -669,8 +1051,6 @@ where
                 }
                 None => {
                     let ino = self.meta_mkdir(cur_ino, part.to_string()).await?;
-                    self.state.modified.touch(cur_ino).await;
-                    self.state.modified.touch(ino).await;
                     cur_ino = ino;
                 }
             }
@@ -697,27 +1077,7 @@ where
 
         let parent_ino = self.resolve_parent_inode(&dir).await?;
 
-        // Check if target already exists
-        if let Some(ino) = self.meta_lookup(parent_ino, &name).await? {
-            let attr = self
-                .meta_stat_required(ino, PathHint::some(path.as_str()))
-                .await?;
-            if attr.kind == FileType::Dir {
-                return Ok(ino);
-            }
-
-            return Err(VfsError::AlreadyExists {
-                path: PathHint::some(path.as_str()),
-            });
-        }
-
-        // Create the directory
-        let ino = self.meta_mkdir(parent_ino, name).await?;
-
-        self.state.modified.touch(parent_ino).await;
-        self.state.modified.touch(ino).await;
-
-        Ok(ino)
+        self.mkdir_at(parent_ino, &name).await
     }
 
     /// Create a regular file in an existing parent directory (std-like behavior).
@@ -742,27 +1102,7 @@ where
 
         let parent_ino = self.resolve_parent_inode(&dir).await?;
 
-        if let Some(existing) = self.meta_lookup(parent_ino, &name).await? {
-            let attr = self
-                .meta_stat_required(existing, PathHint::some(path.as_str()))
-                .await?;
-            if attr.kind == FileType::Dir {
-                return Err(VfsError::IsADirectory {
-                    path: PathHint::some(path.as_str()),
-                });
-            }
-            if create_new {
-                return Err(VfsError::AlreadyExists {
-                    path: PathHint::some(path.as_str()),
-                });
-            }
-            return Ok(existing);
-        }
-
-        let ino = self.meta_create_file(parent_ino, name).await?;
-        self.state.modified.touch(parent_ino).await;
-        self.state.modified.touch(ino).await;
-        Ok(ino)
+        self.create_file_at(parent_ino, &name, create_new).await
     }
 
     /// Create a regular file (running `mkdir_p` on its parent if needed).
@@ -773,29 +1113,331 @@ where
         let path = Self::norm_path(path);
         let (dir, name) = Self::split_dir_file(&path);
         let dir_ino = self.mkdir_p(&dir).await?;
+        self.create_file_at(dir_ino, &name, false).await
+    }
 
-        // check the file exists and then return.
-        if let Some(ino) = self.meta_lookup(dir_ino, &name).await? {
-            let attr = self
-                .meta_stat_required(ino, PathHint::some(path.as_str()))
-                .await?;
-            return if attr.kind == FileType::Dir {
-                Err(VfsError::IsADirectory {
-                    path: PathHint::some(path.as_str()),
-                })
-            } else {
-                Ok(ino)
-            };
+    /// Create a hard link using inode numbers directly, avoiding path reconstruction.
+    /// This is the preferred path from FUSE which already has the inodes.
+    #[tracing::instrument(level = "debug", skip(self), fields(src_ino, parent_ino, name))]
+    pub(crate) async fn link_by_ino(
+        &self,
+        src_ino: i64,
+        parent_ino: i64,
+        name: &str,
+    ) -> Result<FileAttr, VfsError> {
+        if name.is_empty() || name.contains('/') || name.contains('\0') {
+            return Err(VfsError::InvalidFilename);
         }
 
-        let ino = self.meta_create_file(dir_ino, name.clone()).await?;
-        self.state.modified.touch(dir_ino).await;
-        self.state.modified.touch(ino).await;
-        Ok(ino)
+        let attr = self.meta_link(src_ino, parent_ino, name).await?;
+
+        Ok(attr)
+    }
+
+    /// Create a directory using a parent inode and entry name directly.
+    #[tracing::instrument(level = "debug", skip(self), fields(parent_ino, name))]
+    async fn mkdir_at_inner(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        existing_dir_ok: bool,
+    ) -> Result<i64, VfsError> {
+        if name.is_empty() || name.contains('/') || name.contains('\0') {
+            return Err(VfsError::InvalidFilename);
+        }
+
+        match self.meta_mkdir(parent_ino, name.to_string()).await {
+            Ok(ino) => Ok(ino),
+            Err(VfsError::AlreadyExists { .. }) => {
+                if !existing_dir_ok {
+                    return Err(VfsError::AlreadyExists {
+                        path: PathHint::none(),
+                    });
+                }
+
+                let Some(existing) = self.meta_lookup(parent_ino, name).await? else {
+                    return Err(VfsError::AlreadyExists {
+                        path: PathHint::none(),
+                    });
+                };
+                let attr = self.meta_stat_required(existing, PathHint::none()).await?;
+                if attr.kind == FileType::Dir {
+                    Ok(existing)
+                } else {
+                    Err(VfsError::AlreadyExists {
+                        path: PathHint::none(),
+                    })
+                }
+            }
+            Err(VfsError::NotFound { path }) => {
+                if let Some(parent_attr) = self.meta_stat(parent_ino).await?
+                    && parent_attr.kind != FileType::Dir
+                {
+                    return Err(VfsError::NotADirectory {
+                        path: PathHint::none(),
+                    });
+                }
+                Err(VfsError::NotFound { path })
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub(crate) async fn mkdir_at(&self, parent_ino: i64, name: &str) -> Result<i64, VfsError> {
+        self.mkdir_at_inner(parent_ino, name, true).await
+    }
+
+    pub(crate) async fn mkdir_at_new(&self, parent_ino: i64, name: &str) -> Result<i64, VfsError> {
+        self.mkdir_at_inner(parent_ino, name, false).await
+    }
+
+    /// Create or open a regular file using a parent inode and entry name directly.
+    #[tracing::instrument(level = "debug", skip(self), fields(parent_ino, name, create_new))]
+    pub(crate) async fn create_file_at(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        create_new: bool,
+    ) -> Result<i64, VfsError> {
+        let _total_timer = self.vfs_timing_timer(
+            &self.stats().vfs_create_total_ops,
+            &self.stats().vfs_create_total_lat_us,
+        );
+        if name.is_empty() || name.contains('/') || name.contains('\0') {
+            return Err(VfsError::InvalidFilename);
+        }
+
+        let create_result = {
+            let _meta_timer = self.vfs_timing_timer(
+                &self.stats().vfs_create_meta_ops,
+                &self.stats().vfs_create_meta_lat_us,
+            );
+            self.meta_create_file(parent_ino, name.to_string()).await
+        };
+
+        match create_result {
+            Ok(ino) => Ok(ino),
+            Err(VfsError::AlreadyExists { .. }) => {
+                if create_new {
+                    return Err(VfsError::AlreadyExists {
+                        path: PathHint::none(),
+                    });
+                }
+                let existing = self.meta_lookup(parent_ino, name).await?.ok_or_else(|| {
+                    VfsError::AlreadyExists {
+                        path: PathHint::none(),
+                    }
+                })?;
+                let attr = self.meta_stat_required(existing, PathHint::none()).await?;
+                if attr.kind == FileType::Dir {
+                    Err(VfsError::IsADirectory {
+                        path: PathHint::none(),
+                    })
+                } else {
+                    Ok(existing)
+                }
+            }
+            Err(VfsError::NotFound { path }) => {
+                if let Some(parent_attr) = self.meta_stat(parent_ino).await?
+                    && parent_attr.kind != FileType::Dir
+                {
+                    return Err(VfsError::NotADirectory {
+                        path: PathHint::none(),
+                    });
+                }
+                Err(VfsError::NotFound { path })
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Create a symbolic link using a parent inode and entry name directly.
+    #[tracing::instrument(level = "debug", skip(self), fields(parent_ino, name))]
+    pub(crate) async fn create_symlink_at(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        target: &str,
+    ) -> Result<(i64, FileAttr), VfsError> {
+        if name.is_empty() || name.contains('/') || name.contains('\0') {
+            return Err(VfsError::InvalidFilename);
+        }
+
+        let parent_attr = self
+            .meta_stat_required(parent_ino, PathHint::none())
+            .await?;
+        if parent_attr.kind != FileType::Dir {
+            return Err(VfsError::NotADirectory {
+                path: PathHint::none(),
+            });
+        }
+
+        if self.meta_lookup(parent_ino, name).await?.is_some() {
+            return Err(VfsError::AlreadyExists {
+                path: PathHint::none(),
+            });
+        }
+
+        let result = self.meta_symlink(parent_ino, name, target).await?;
+        Ok(result)
+    }
+
+    /// Remove a regular file or symlink using parent inode and name directly.
+    #[tracing::instrument(level = "debug", skip(self), fields(parent_ino, name))]
+    pub(crate) async fn unlink_at(&self, parent_ino: i64, name: &str) -> Result<(), VfsError> {
+        let _total_timer = self.vfs_timing_timer(
+            &self.stats().vfs_unlink_total_ops,
+            &self.stats().vfs_unlink_total_lat_us,
+        );
+        if name.is_empty() || name.contains('/') || name.contains('\0') {
+            return Err(VfsError::InvalidFilename);
+        }
+
+        let ino = {
+            let _lookup_timer = self.vfs_timing_timer(
+                &self.stats().vfs_unlink_lookup_ops,
+                &self.stats().vfs_unlink_lookup_lat_us,
+            );
+            self.meta_lookup_required(parent_ino, name, PathHint::none())
+                .await?
+        };
+        let attr = {
+            let _stat_timer = self.vfs_timing_timer(
+                &self.stats().vfs_unlink_stat_ops,
+                &self.stats().vfs_unlink_stat_lat_us,
+            );
+            self.meta_stat_required(ino, PathHint::none()).await?
+        };
+        if attr.kind == FileType::Dir {
+            return Err(VfsError::IsADirectory {
+                path: PathHint::none(),
+            });
+        }
+
+        {
+            let _meta_timer = self.vfs_timing_timer(
+                &self.stats().vfs_unlink_meta_ops,
+                &self.stats().vfs_unlink_meta_lat_us,
+            );
+            self.meta_unlink(parent_ino, name).await?;
+        }
+        {
+            let _recent_timer = self.vfs_timing_timer(
+                &self.stats().vfs_unlink_recent_ops,
+                &self.stats().vfs_unlink_recent_lat_us,
+            );
+            self.remember_recently_unlinked_attr(ino, attr);
+        }
+        Ok(())
+    }
+
+    /// Remove an empty directory using parent inode and name directly.
+    #[tracing::instrument(level = "debug", skip(self), fields(parent_ino, name))]
+    pub(crate) async fn rmdir_at(&self, parent_ino: i64, name: &str) -> Result<(), VfsError> {
+        if name.is_empty() || name.contains('/') || name.contains('\0') {
+            return Err(VfsError::InvalidFilename);
+        }
+
+        let ino = self
+            .meta_lookup_required(parent_ino, name, PathHint::none())
+            .await?;
+        let attr = self.meta_stat_required(ino, PathHint::none()).await?;
+        if attr.kind != FileType::Dir {
+            return Err(VfsError::NotADirectory {
+                path: PathHint::none(),
+            });
+        }
+        if !self.meta_readdir(ino).await?.is_empty() {
+            return Err(VfsError::DirectoryNotEmpty {
+                path: PathHint::none(),
+            });
+        }
+
+        self.meta_rmdir(parent_ino, name).await?;
+        Ok(())
+    }
+
+    async fn parent_is_descendant_of(
+        &self,
+        mut parent_ino: i64,
+        ancestor_ino: i64,
+    ) -> Result<bool, VfsError> {
+        while parent_ino != self.core.root {
+            if parent_ino == ancestor_ino {
+                return Ok(true);
+            }
+            match self.meta_get_dir_parent(parent_ino).await? {
+                Some(next) if next != parent_ino => parent_ino = next,
+                _ => return Ok(false),
+            }
+        }
+        Ok(ancestor_ino == self.core.root)
+    }
+
+    /// Rename an entry using parent inodes and names directly.
+    #[tracing::instrument(
+        level = "debug",
+        skip(self),
+        fields(old_parent_ino, old_name, new_parent_ino, new_name)
+    )]
+    pub(crate) async fn rename_at(
+        &self,
+        old_parent_ino: i64,
+        old_name: &str,
+        new_parent_ino: i64,
+        new_name: &str,
+    ) -> Result<(), VfsError> {
+        if old_name.is_empty()
+            || new_name.is_empty()
+            || old_name.contains('/')
+            || old_name.contains('\0')
+            || new_name.contains('/')
+            || new_name.contains('\0')
+        {
+            return Err(VfsError::InvalidFilename);
+        }
+
+        if old_parent_ino == new_parent_ino && old_name == new_name {
+            return Ok(());
+        }
+
+        let src_ino = self
+            .meta_lookup_required(old_parent_ino, old_name, PathHint::none())
+            .await?;
+        let src_attr = self.meta_stat_required(src_ino, PathHint::none()).await?;
+
+        let new_parent_attr = self
+            .meta_stat_required(new_parent_ino, PathHint::none())
+            .await?;
+        if new_parent_attr.kind != FileType::Dir {
+            return Err(VfsError::NotADirectory {
+                path: PathHint::none(),
+            });
+        }
+
+        if src_attr.kind == FileType::Dir
+            && self
+                .parent_is_descendant_of(new_parent_ino, src_ino)
+                .await?
+        {
+            return Err(VfsError::CircularRename {
+                path: PathHint::none(),
+            });
+        }
+
+        self.meta_rename(
+            old_parent_ino,
+            old_name,
+            new_parent_ino,
+            new_name.to_string(),
+        )
+        .await?;
+
+        Ok(())
     }
 
     /// Create a hard link at `link_path` that references `existing_path`.
-    #[tracing::instrument(level = "trace", skip(self), fields(existing_path, link_path))]
+    #[tracing::instrument(level = "debug", skip(self), fields(existing_path, link_path))]
     pub async fn link(&self, existing_path: &str, link_path: &str) -> Result<FileAttr, VfsError> {
         let existing_path = Self::norm_path(existing_path);
         let link_path = Self::norm_path(link_path);
@@ -824,27 +1466,7 @@ where
 
         let parent_ino = self.resolve_parent_inode(&parent_path).await?;
 
-        let parent_attr = self
-            .meta_stat_required(parent_ino, PathHint::some(parent_path.as_str()))
-            .await?;
-        if parent_attr.kind != FileType::Dir {
-            return Err(VfsError::NotADirectory {
-                path: PathHint::some(parent_path.as_str()),
-            });
-        }
-
-        if self.meta_lookup(parent_ino, &name).await?.is_some() {
-            return Err(VfsError::AlreadyExists {
-                path: PathHint::some(link_path.as_str()),
-            });
-        }
-
-        let attr = self.meta_link(src_ino, parent_ino, &name).await?;
-
-        self.state.modified.touch(parent_ino).await;
-        self.state.modified.touch(src_ino).await;
-
-        Ok(attr)
+        self.link_by_ino(src_ino, parent_ino, &name).await
     }
 
     /// Create a symbolic link at `link_path` pointing to `target`.
@@ -865,27 +1487,7 @@ where
 
         let parent_ino = self.resolve_parent_inode(&dir).await?;
 
-        let parent_attr = self
-            .meta_stat_required(parent_ino, PathHint::some(dir.as_str()))
-            .await?;
-        if parent_attr.kind != FileType::Dir {
-            return Err(VfsError::NotADirectory {
-                path: PathHint::some(dir.as_str()),
-            });
-        }
-
-        if self.meta_lookup(parent_ino, &name).await?.is_some() {
-            return Err(VfsError::AlreadyExists {
-                path: PathHint::some(link_path.as_str()),
-            });
-        }
-
-        let (ino, attr) = self.meta_symlink(parent_ino, &name, target).await?;
-
-        self.state.modified.touch(parent_ino).await;
-        self.state.modified.touch(ino).await;
-
-        Ok((ino, attr))
+        self.create_symlink_at(parent_ino, &name, target).await
     }
 
     /// Fetch a file's attributes (kind/size come from the metadata layer).
@@ -950,25 +1552,7 @@ where
 
         let parent_ino = self.resolve_parent_inode(&dir).await?;
 
-        let ino = self
-            .meta_lookup_required(parent_ino, &name, PathHint::some(path.as_str()))
-            .await?;
-
-        let attr = self
-            .meta_stat_required(ino, PathHint::some(path.as_str()))
-            .await?;
-
-        if attr.kind == FileType::Dir {
-            return Err(VfsError::IsADirectory {
-                path: PathHint::some(path.as_str()),
-            });
-        }
-
-        self.meta_unlink(parent_ino, &name).await?;
-        self.state.modified.touch(parent_ino).await;
-        self.state.modified.touch(ino).await;
-
-        Ok(())
+        self.unlink_at(parent_ino, &name).await
     }
 
     /// Remove an empty directory (root cannot be removed; non-empty dirs error out).
@@ -985,228 +1569,7 @@ where
 
         let parent_ino = self.resolve_parent_inode(&dir).await?;
 
-        let ino = self
-            .meta_lookup_required(parent_ino, &name, PathHint::some(path.as_str()))
-            .await?;
-
-        let attr = self
-            .meta_stat_required(ino, PathHint::some(path.as_str()))
-            .await?;
-
-        if attr.kind != FileType::Dir {
-            return Err(VfsError::NotADirectory {
-                path: PathHint::some(path.as_str()),
-            });
-        }
-
-        let children = self.meta_readdir(ino).await?;
-        if !children.is_empty() {
-            return Err(VfsError::DirectoryNotEmpty {
-                path: PathHint::some(path.as_str()),
-            });
-        }
-
-        self.meta_rmdir(parent_ino, &name).await?;
-        self.state.modified.touch(parent_ino).await;
-        self.state.modified.touch(ino).await;
-
-        Ok(())
-    }
-
-    /// Rename files or directories.
-    ///
-    /// Implements POSIX rename semantics: if the destination exists, it will be replaced,
-    /// subject to appropriate checks (e.g., file/directory type compatibility, non-empty directories).
-    /// Parent directories are created as needed.
-    /// Check if renaming 'src_path' to 'dst_path' would create a circular reference.
-    /// This prevents moving a directory into its own subdirectory.
-    ///
-    /// Note: Current implementation is limited because FileAttr doesn't expose parent_ino.
-    /// A complete solution would require either:
-    /// 1. Adding parent_ino to FileAttr
-    /// 2. Walking up the directory tree using path-based lookups
-    /// 3. Maintaining a separate parent tracking structure
-    async fn is_circular_rename(
-        &self,
-        src_ino: i64,
-        src_attr: &FileAttr,
-        new_parent_ino: i64,
-    ) -> Result<bool, VfsError> {
-        // Only directories can create circular references
-        if src_attr.kind != FileType::Dir {
-            return Ok(false);
-        }
-
-        // Direct check: moving directory into itself
-        if src_ino == new_parent_ino {
-            return Ok(true);
-        }
-
-        // If moving to root, no circular reference possible
-        if new_parent_ino == self.core.root {
-            return Ok(false);
-        }
-
-        // Without parent tracking in metadata, we cannot reliably walk up the tree
-        // The path-based check in validate_rename_operation handles the common cases
-        // For edge cases, we rely on the direct inode check above
-        Ok(false)
-    }
-
-    /// Validate rename operation parameters and permissions
-    async fn validate_rename_operation(
-        &self,
-        old_path: &str,
-        new_path: &str,
-        old_parent_ino: i64,
-        old_name: &str,
-        _new_parent_ino: i64,
-        new_name: &str,
-    ) -> Result<(i64, FileAttr), VfsError> {
-        // Validate source exists and get its attributes first
-        let src_ino = self
-            .meta_lookup_required(
-                old_parent_ino,
-                old_name,
-                PathHint::some(format!("source '{}' not found", old_path)),
-            )
-            .await?;
-
-        let src_attr = self
-            .meta_stat_required(
-                src_ino,
-                PathHint::some(format!("source '{}' metadata not found", old_path)),
-            )
-            .await?;
-
-        // Prevent renaming to the same location
-        if old_path == new_path {
-            // POSIX allows this as a no-op, so we return success
-            // The caller should handle this gracefully
-        }
-
-        // Validate target name is not empty and doesn't contain invalid characters
-        if new_name.is_empty() {
-            return Err(VfsError::InvalidRenameTarget {
-                path: PathHint::some("target name cannot be empty"),
-            });
-        }
-
-        if new_name.contains('/') || new_name.contains('\0') {
-            return Err(VfsError::InvalidRenameTarget {
-                path: PathHint::some(format!(
-                    "target name '{}' contains invalid characters",
-                    new_name
-                )),
-            });
-        }
-
-        // Check for circular rename (directory into its own subdirectory)
-        // Simple path-based check: if new_path starts with old_path/, it's circular
-        if src_attr.kind == FileType::Dir {
-            let old_path_with_slash = format!("{}/", old_path.trim_end_matches('/'));
-            let new_path_normalized = new_path.trim_end_matches('/');
-
-            if new_path_normalized.starts_with(&old_path_with_slash) {
-                return Err(VfsError::CircularRename {
-                    path: PathHint::some(format!(
-                        "cannot move directory '{}' into its own subdirectory '{}'",
-                        old_path, new_path
-                    )),
-                });
-            }
-
-            // Also check via inode if paths are different parents
-            if _new_parent_ino != old_parent_ino
-                && self
-                    .is_circular_rename(src_ino, &src_attr, _new_parent_ino)
-                    .await?
-            {
-                return Err(VfsError::CircularRename {
-                    path: PathHint::some(format!(
-                        "cannot move directory '{}' into its own subdirectory '{}'",
-                        old_path, new_path
-                    )),
-                });
-            }
-        }
-
-        // Check if source and destination are on the same filesystem
-        // For now, we assume all operations are within the same filesystem
-        // Future enhancement: check device IDs
-
-        Ok((src_ino, src_attr))
-    }
-
-    /// Optimized rename within the same directory - avoids duplicate parent resolution
-    async fn rename_same_directory(
-        &self,
-        dir: &str,
-        old_name: &str,
-        new_name: &str,
-    ) -> Result<(), VfsError> {
-        let parent_ino = self.resolve_parent_inode(dir).await?;
-        let old_path = format!("{}{}{}", dir, if dir == "/" { "" } else { "/" }, old_name);
-        let new_path = format!("{}{}{}", dir, if dir == "/" { "" } else { "/" }, new_name);
-
-        // Validate the rename operation
-        let (_src_ino, src_attr) = self
-            .validate_rename_operation(
-                &old_path, &new_path, parent_ino, old_name, parent_ino, new_name,
-            )
-            .await?;
-
-        // Handle destination existence and replacement semantics
-        let dst_path = format!("{}{}{}", dir, if dir == "/" { "" } else { "/" }, new_name);
-        if let Some((dest_ino, dest_kind)) = self.meta_lookup_path(&dst_path).await? {
-            // Handle replacement logic (same as in main rename function)
-            match (src_attr.kind, dest_kind) {
-                // Directory replacing directory
-                (FileType::Dir, FileType::Dir) => {
-                    let children = self.meta_readdir(dest_ino).await?;
-                    if !children.is_empty() {
-                        return Err(VfsError::DirectoryNotEmpty {
-                            path: PathHint::some(format!(
-                                "cannot replace non-empty directory '{}/{}'",
-                                dir, new_name
-                            )),
-                        });
-                    }
-                    self.meta_rmdir(parent_ino, new_name).await?;
-                }
-                // Directory replacing file/symlink - not allowed
-                (FileType::Dir, FileType::File) | (FileType::Dir, FileType::Symlink) => {
-                    return Err(VfsError::IsADirectory {
-                        path: PathHint::some(format!(
-                            "cannot replace file '{}/{}' with directory",
-                            dir, old_name
-                        )),
-                    });
-                }
-                // File/symlink replacing directory - not allowed
-                (FileType::File, FileType::Dir) | (FileType::Symlink, FileType::Dir) => {
-                    return Err(VfsError::IsADirectory {
-                        path: PathHint::some(format!(
-                            "cannot replace directory '{}/{}' with file",
-                            dir, new_name
-                        )),
-                    });
-                }
-                // File/symlink replacing file/symlink - allowed
-                _ => {
-                    self.meta_unlink(parent_ino, new_name).await?;
-                }
-            }
-        }
-
-        // Perform the rename
-        self.meta_rename(parent_ino, old_name, parent_ino, new_name.to_string())
-            .await?;
-
-        // Update cache
-        self.state.modified.touch(parent_ino).await;
-
-        Ok(())
+        self.rmdir_at(parent_ino, &name).await
     }
 
     /// Step 1: Resolve parent directory inode from path
@@ -1226,125 +1589,17 @@ where
         Ok(ino)
     }
 
-    /// Step 2: Handle destination replacement according to POSIX semantics
-    async fn handle_destination_replacement(
-        &self,
-        new_path: &str,
-        old_path: &str,
-        src_kind: FileType,
-        new_parent_ino: i64,
-        new_name: &str,
-    ) -> Result<(), VfsError> {
-        if let Some((dest_ino, dest_kind)) = self.meta_lookup_path(new_path).await? {
-            match (src_kind, dest_kind) {
-                // Directory → Directory: only if destination is empty
-                (FileType::Dir, FileType::Dir) => {
-                    let children = self.meta_readdir(dest_ino).await?;
-
-                    if !children.is_empty() {
-                        return Err(VfsError::DirectoryNotEmpty {
-                            path: PathHint::some(format!(
-                                "cannot replace non-empty directory '{}'",
-                                new_path
-                            )),
-                        });
-                    }
-
-                    self.meta_rmdir(new_parent_ino, new_name).await?;
-                }
-
-                // Directory → File/Symlink: not allowed
-                (FileType::Dir, FileType::File) | (FileType::Dir, FileType::Symlink) => {
-                    return Err(VfsError::IsADirectory {
-                        path: PathHint::some(format!(
-                            "cannot replace file '{}' with directory '{}'",
-                            new_path, old_path
-                        )),
-                    });
-                }
-
-                // File/Symlink → Directory: not allowed
-                (FileType::File, FileType::Dir) | (FileType::Symlink, FileType::Dir) => {
-                    return Err(VfsError::IsADirectory {
-                        path: PathHint::some(format!(
-                            "cannot replace directory '{}' with file '{}'",
-                            new_path, old_path
-                        )),
-                    });
-                }
-
-                // File/Symlink → File/Symlink: allowed, remove destination
-                (FileType::File, FileType::File)
-                | (FileType::File, FileType::Symlink)
-                | (FileType::Symlink, FileType::File)
-                | (FileType::Symlink, FileType::Symlink) => {
-                    self.meta_unlink(new_parent_ino, new_name).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Step 3: Execute the rename and update metadata
-    async fn execute_rename(
-        &self,
-        old_parent_ino: i64,
-        old_name: &str,
-        new_parent_ino: i64,
-        new_name: String,
-    ) -> Result<(), VfsError> {
-        self.meta_rename(old_parent_ino, old_name, new_parent_ino, new_name)
-            .await?;
-
-        // Update modification tracking
-        self.state.modified.touch(old_parent_ino).await;
-        if old_parent_ino != new_parent_ino {
-            self.state.modified.touch(new_parent_ino).await;
-        }
-
-        Ok(())
-    }
-
-    #[tracing::instrument(level = "trace", skip(self), fields(old, new))]
+    #[tracing::instrument(level = "debug", skip(self), fields(old, new))]
     pub async fn rename(&self, old: &str, new: &str) -> Result<(), VfsError> {
-        // Step 1: Normalize and parse paths
         let old = Self::norm_path(old);
         let new = Self::norm_path(new);
         let (old_dir, old_name) = Self::split_dir_file(&old);
         let (new_dir, new_name) = Self::split_dir_file(&new);
 
-        // Fast path: same directory rename
-        if old_dir == new_dir {
-            return self
-                .rename_same_directory(&old_dir, &old_name, &new_name)
-                .await;
-        }
-
-        // Step 2: Resolve parent directory inodes
         let old_parent_ino = self.resolve_parent_inode(&old_dir).await?;
         let new_parent_ino = self.resolve_parent_inode(&new_dir).await?;
 
-        // Step 3: Validate the rename operation
-        let (_src_ino, src_attr) = self
-            .validate_rename_operation(
-                &old,
-                &new,
-                old_parent_ino,
-                &old_name,
-                new_parent_ino,
-                &new_name,
-            )
-            .await?;
-
-        // Step 4: Handle destination replacement according to POSIX semantics
-        self.handle_destination_replacement(&new, &old, src_attr.kind, new_parent_ino, &new_name)
-            .await?;
-
-        // Step 5: Ensure destination parent exists (create if needed)
-        let new_dir_ino = self.mkdir_p(&new_dir).await?;
-
-        // Step 6: Execute the rename operation
-        self.execute_rename(old_parent_ino, &old_name, new_dir_ino, new_name)
+        self.rename_at(old_parent_ino, &old_name, new_parent_ino, &new_name)
             .await?;
 
         Ok(())
@@ -1414,12 +1669,6 @@ where
         self.meta_rename_exchange(old_parent_ino, &old_name, new_parent_ino, &new_name)
             .await?;
 
-        // Update cache
-        self.state.modified.touch(old_parent_ino).await;
-        if old_parent_ino != new_parent_ino {
-            self.state.modified.touch(new_parent_ino).await;
-        }
-
         Ok(())
     }
 
@@ -1471,7 +1720,7 @@ where
                 }
                 // Directory replacing file/symlink
                 (FileType::Dir, FileType::File) | (FileType::Dir, FileType::Symlink) => {
-                    return Err(VfsError::IsADirectory {
+                    return Err(VfsError::NotADirectory {
                         path: PathHint::some(new.as_str()),
                     });
                 }
@@ -1518,41 +1767,131 @@ where
         self.truncate_inode(ino, size).await
     }
 
+    async fn flush_before_truncate(
+        &self,
+        ino: i64,
+        size: u64,
+        op: &'static str,
+    ) -> Result<(), VfsError> {
+        let start = Instant::now();
+        tracing::debug!(ino, size, op, "truncate path: flush pending writes");
+        self.state
+            .writer
+            .flush_required_for_truncate(ino as u64)
+            .await
+            .map_err(|err| {
+                let message = err.to_string();
+                let is_timeout = message.contains("flush timeout") || message.contains("timed out");
+                tracing::error!(
+                    ino,
+                    size,
+                    op,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    error = %message,
+                    "truncate path: flush failed"
+                );
+                if is_timeout {
+                    VfsError::TimedOut
+                } else {
+                    VfsError::from(err)
+                }
+            })?;
+        tracing::debug!(
+            ino,
+            size,
+            op,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "truncate path: flush complete"
+        );
+        Ok(())
+    }
+
     /// Truncate/extend file size by inode (metadata only; holes are read as zeros).
     /// Shrinking does not eagerly reclaim block data.
     pub async fn truncate_inode(&self, ino: i64, size: u64) -> Result<(), VfsError> {
+        // Flush dirty data BEFORE acquiring mutation_lock so that we do not hold the
+        // lock across a potentially long upload wait (up to FLUSH_DEADLINE = 300 s).
+        // Holding the lock during flush would cause all concurrent FUSE WRITEs for
+        // this inode to queue at the mutex, eventually stalling kernel writeback and
+        // blocking userspace pwrite(2) for the entire flush duration.
+        //
+        // After we take the lock we call writer.clear() to drop any newly-written
+        // dirty slices that arrived between the pre-flush and the lock acquisition.
+        // Those writes lose their data (truncate semantics: last-writer wins at the
+        // inode level), and meta_truncate removes any slices committed in that window.
+        self.flush_before_truncate(ino, size, "truncate_inode")
+            .await?;
+
+        let mutation_lock = self.state.append_lock(ino);
+        tracing::debug!(ino, size, "truncate_inode: waiting for mutation lock");
+        let _mutation_guard = mutation_lock.lock_owned().await;
+        tracing::debug!(ino, size, "truncate_inode: mutation lock acquired");
+
         let handles = self.file_handles_for_inode(ino);
         let mut guards = Vec::with_capacity(handles.len());
         for handle in handles {
             guards.push(handle.lock_write().await);
         }
 
-        self.state
-            .writer
-            .flush_required(ino as u64)
-            .await
-            .map_err(|_| VfsError::Other)?;
-
         self.meta_truncate(ino, size, self.core.layout.chunk_size)
             .await?;
 
         // POSIX semantic for `truncate`: `truncate` is immediately visible to old handles.
         self.state.reader.invalidate_all(ino as u64).await;
+        // Discard dirty data written between the pre-flush and the lock acquisition.
         self.state.writer.clear(ino as u64).await;
 
         let guard = self
             .lock_inode(ino)
             .or_insert_with(|| Inode::new(ino, size));
 
-        guard.update_size(size);
+        guard.set_size(size);
+        // After truncate the allocated-bytes estimate is stale — we cannot
+        // simply set it to `size` because extending truncates create holes
+        // and shrinking truncates may or may not free blocks.  Mark it
+        // unknown so st_blocks falls back to the metadata-provided value.
+        guard.invalidate_allocated_blocks();
+        guard.bump_data_epoch();
 
         if let Some(mut attr) = self.state.handles.attr_for_inode(ino) {
             attr.size = size;
             self.state.handles.update_attr_for_inode(ino, &attr);
         }
 
-        self.state.modified.touch(ino).await;
         drop(guards);
+        Ok(())
+    }
+
+    /// Minimal fallocate support for buffered mmap tests.
+    ///
+    /// SlayerFS does not reserve backend space ahead of time, but `mode=0`
+    /// must still make the file logically extend to cover `offset + length`.
+    /// Unsupported punch/collapse/zero-range modes are rejected by the FUSE
+    /// adapter so callers get a clear error instead of falling back to slow
+    /// userspace emulation.
+    pub async fn fallocate_ino(&self, ino: i64, offset: u64, length: u64) -> Result<(), VfsError> {
+        let attr = self.meta_stat_required(ino, PathHint::none()).await?;
+        if matches!(attr.kind, FileType::Dir) {
+            return Err(VfsError::IsADirectory {
+                path: PathHint::none(),
+            });
+        }
+        if length == 0 {
+            return Ok(());
+        }
+
+        let end = offset.checked_add(length).ok_or(VfsError::FileTooLarge)?;
+        let current_size = self.inode_size_cached(ino).unwrap_or(attr.size);
+        if end <= current_size {
+            return Ok(());
+        }
+
+        let req = SetAttrRequest {
+            size: Some(end),
+            ..Default::default()
+        };
+        self.set_attr(ino, &req, SetAttrFlags::empty()).await?;
+        self.update_mtime_ctime(ino).await?;
         Ok(())
     }
 
@@ -1563,24 +1902,80 @@ where
         req: &SetAttrRequest,
         flags: SetAttrFlags,
     ) -> Result<FileAttr, VfsError> {
+        if Self::deleted_inode_timestamp_only_setattr(req, &flags) {
+            let remove_after = self.state.handles.has_no_handle(ino);
+            let removed = if remove_after {
+                let _remove_timer = self.vfs_timing_timer(
+                    &self.stats().vfs_setattr_recent_remove_ops,
+                    &self.stats().vfs_setattr_recent_remove_lat_us,
+                );
+                self.state.recently_unlinked.remove(&ino)
+            } else {
+                None
+            };
+            if let Some((_, (mut attr, inserted_at))) = removed {
+                let original = attr.clone();
+                if let Err(err) = Self::apply_timestamp_setattr_locally(&mut attr, req, &flags) {
+                    self.state
+                        .recently_unlinked
+                        .insert(ino, (original, inserted_at));
+                    return Err(err);
+                }
+                attr.nlink = 0;
+                self.state.handles.update_attr_for_inode(ino, &attr);
+                return Ok(attr);
+            }
+
+            let recent_entry = {
+                let _get_mut_timer = self.vfs_timing_timer(
+                    &self.stats().vfs_setattr_recent_get_mut_ops,
+                    &self.stats().vfs_setattr_recent_get_mut_lat_us,
+                );
+                self.state.recently_unlinked.get_mut(&ino)
+            };
+            if let Some(mut entry) = recent_entry {
+                let mut attr = entry.0.clone();
+                Self::apply_timestamp_setattr_locally(&mut attr, req, &flags)?;
+                attr.nlink = 0;
+                *entry = (attr.clone(), Instant::now());
+                self.state.handles.update_attr_for_inode(ino, &attr);
+                drop(entry);
+                if remove_after {
+                    let _remove_timer = self.vfs_timing_timer(
+                        &self.stats().vfs_setattr_recent_remove_ops,
+                        &self.stats().vfs_setattr_recent_remove_lat_us,
+                    );
+                    self.state.recently_unlinked.remove(&ino);
+                }
+                return Ok(attr);
+            }
+        }
+
         // Hold handle write guards across the ENTIRE truncate + meta_set_attr
         // sequence so that no concurrent write_ino / FUSE_WRITE_CACHE can modify
         // the inode between the truncate and the attribute read-back.  Dropping
         // the guards too early allowed a race where meta_set_attr could read back
         // a size extended by a concurrent commit, causing the FUSE setattr
         // response to carry a wrong file size and confusing the kernel page cache.
+        //
+        // flush_required is called BEFORE acquiring mutation_lock to avoid holding
+        // the lock during a potentially long upload wait (see truncate_inode for the
+        // full rationale).  writer.clear() inside the lock discards any dirty slices
+        // that arrived between the pre-flush and the lock acquisition.
         let _guards = if let Some(size) = req.size {
+            self.flush_before_truncate(ino, size, "set_attr").await?;
+
+            let mutation_lock = self.state.append_lock(ino);
+            tracing::debug!(ino, size, "set_attr truncate: waiting for mutation lock");
+            let _mutation_guard = mutation_lock.lock_owned().await;
+            tracing::debug!(ino, size, "set_attr truncate: mutation lock acquired");
+
             let handles = self.file_handles_for_inode(ino);
             let mut guards = Vec::with_capacity(handles.len());
             for handle in handles {
                 guards.push(handle.lock_write().await);
             }
 
-            self.state
-                .writer
-                .flush_required(ino as u64)
-                .await
-                .map_err(|_| VfsError::Other)?;
             self.meta_truncate(ino, size, self.core.layout.chunk_size)
                 .await?;
             self.state.reader.invalidate_all(ino as u64).await;
@@ -1589,14 +1984,16 @@ where
             let guard = self
                 .lock_inode(ino)
                 .or_insert_with(|| Inode::new(ino, size));
-            guard.update_size(size);
+            guard.set_size(size);
+            guard.invalidate_allocated_blocks();
+            guard.bump_data_epoch();
 
             if let Some(mut attr) = self.state.handles.attr_for_inode(ino) {
                 attr.size = size;
                 self.state.handles.update_attr_for_inode(ino, &attr);
             }
 
-            Some(guards)
+            Some((_mutation_guard, guards))
         } else {
             None
         };
@@ -1612,15 +2009,66 @@ where
         if let Some(size) = req.size {
             attr.size = size;
             if let Some(inode) = self.state.inodes.get(&ino) {
-                inode.update_size(size);
+                inode.set_size(size);
             }
+        } else if let Some(size) = self.inode_size_cached(ino) {
+            // Non-size setattr requests (for example mtime/ctime updates emitted
+            // during writeback-cache mmap traffic) must still report the current
+            // local file size. Returning the stale meta-layer size here can make
+            // the kernel believe the file shrank back to 0 and expose zero-filled
+            // reads in xfstests generic/074 fstest.3.
+            attr.size = size;
         }
 
-        self.state.modified.touch(ino).await;
         self.state.handles.update_attr_for_inode(ino, &attr);
 
         // _guards dropped here — after meta_set_attr has read the correct state
         Ok(attr)
+    }
+
+    fn deleted_inode_timestamp_only_setattr(req: &SetAttrRequest, flags: &SetAttrFlags) -> bool {
+        let timestamp_flags = (SetAttrFlags::SET_ATIME_NOW | SetAttrFlags::SET_MTIME_NOW).bits();
+        req.mode.is_none()
+            && req.uid.is_none()
+            && req.gid.is_none()
+            && req.size.is_none()
+            && req.flags.is_none()
+            && (flags.bits() & !timestamp_flags) == 0
+    }
+
+    fn apply_timestamp_setattr_locally(
+        attr: &mut FileAttr,
+        req: &SetAttrRequest,
+        flags: &SetAttrFlags,
+    ) -> Result<(), VfsError> {
+        let mut changed = false;
+        let mut now = None;
+
+        if flags.contains(SetAttrFlags::SET_ATIME_NOW) {
+            let ts = *now.get_or_insert(Self::current_timestamp_nanos()?);
+            attr.atime = ts;
+            changed = true;
+        } else if let Some(atime) = req.atime {
+            attr.atime = atime;
+            changed = true;
+        }
+
+        if flags.contains(SetAttrFlags::SET_MTIME_NOW) {
+            let ts = *now.get_or_insert(Self::current_timestamp_nanos()?);
+            attr.mtime = ts;
+            changed = true;
+        } else if let Some(mtime) = req.mtime {
+            attr.mtime = mtime;
+            changed = true;
+        }
+
+        if let Some(ctime) = req.ctime {
+            attr.ctime = ctime;
+        } else if changed {
+            attr.ctime = *now.get_or_insert(Self::current_timestamp_nanos()?);
+        }
+
+        Ok(())
     }
 
     /// Change the permission bits of an inode (chmod).
@@ -1632,7 +2080,6 @@ where
     pub async fn chmod(&self, ino: i64, new_mode: u32) -> Result<FileAttr, VfsError> {
         let attr = self.meta_chmod(ino, new_mode).await?;
 
-        self.state.modified.touch(ino).await;
         self.state.handles.update_attr_for_inode(ino, &attr);
 
         Ok(attr)
@@ -1651,7 +2098,6 @@ where
     ) -> Result<FileAttr, VfsError> {
         let attr = self.meta_chown(ino, uid, gid).await?;
 
-        self.state.modified.touch(ino).await;
         self.state.handles.update_attr_for_inode(ino, &attr);
 
         Ok(attr)
@@ -1670,16 +2116,62 @@ where
         }
 
         let handle = self.file_handle_required(fh)?;
-        if !handle.flags.read {
+        // With writeback cache enabled, the kernel may issue reads on O_WRONLY
+        // handles to fill partial pages before writing them back, so we only
+        // reject reads when neither read nor write flags are set.
+        if !handle.flags.read && !handle.flags.write {
             return Err(VfsError::PermissionDenied {
                 path: PathHint::none(),
             });
         }
 
-        // Before reading, it is needed to flush all cached data.
-        self.state.writer.flush_if_exists(handle.ino as u64).await;
+        let file_size = self
+            .inode_size_cached(handle.ino)
+            .unwrap_or_else(|| handle.attr().size);
+        if offset >= file_size {
+            return Ok(Vec::new());
+        }
+        let actual_len = len.min((file_size - offset) as usize);
+        let writer = self.state.writer.clone();
+        let ino = handle.ino as u64;
+        if let Some(data) = handle
+            .try_read_overlay(offset, actual_len, move |offset, len| {
+                let writer = writer.clone();
+                async move { writer.read_dirty_if_fully_covered(ino, offset, len).await }
+            })
+            .await
+            .map_err(VfsError::from)?
+        {
+            return Ok(data);
+        }
 
-        handle.read(offset, len).await.map_err(VfsError::from)
+        // Read committed data from the reader cache first, then overlay any
+        // uncommitted dirty writes on top.  We intentionally do NOT call
+        // flush_if_exists here: blocking every read on a full flush+commit
+        // cycle turns random-read-heavy workloads into commit-bound traffic
+        // (adding tens of milliseconds of latency per 4 KiB read).
+        //
+        // There is a narrow race where commit_chunk pops a just-committed
+        // slice between handle.read() and overlay_dirty_if_exists().  In that
+        // window the reader may serve a stale cached page that has already
+        // been superseded.  The window is on the order of microseconds and a
+        // subsequent read will see the correct data, so this is an acceptable
+        // trade-off versus the 35+ ms read latency incurred by the
+        // synchronous flush.
+        let inode = self.ensure_inode_registered(handle.ino).await?;
+        handle.ensure_reader_with(|| self.state.reader.open_for_handle(inode, fh));
+        let mut data = handle.read(offset, len).await.map_err(VfsError::from)?;
+        self.state
+            .writer
+            .overlay_dirty_if_exists(handle.ino as u64, offset, &mut data)
+            .await
+            .map_err(VfsError::from)?;
+
+        self.state
+            .reader
+            .submit_prefetch(handle.ino, fh, offset, data.len() as u64);
+
+        Ok(data)
     }
 
     /// Write data by file handle and offset.
@@ -1699,7 +2191,25 @@ where
 
         tracing::trace!(fh, ino = handle.ino, offset, len = data.len(), "vfs.write");
 
-        let written = handle.write(offset, data).await?;
+        let (write_offset, written) = if handle.flags.append {
+            let append_lock = self.state.append_lock(handle.ino);
+            let _append_guard = append_lock.lock().await;
+            let _handle_guard = handle.lock_write().await;
+
+            let append_offset = self.inode_size(handle.ino).await?;
+            let written = handle.write_unlocked(append_offset, data).await?;
+            tracing::debug!(
+                fh,
+                ino = handle.ino,
+                append_offset,
+                len = data.len(),
+                written,
+                "vfs.append_write"
+            );
+            (append_offset, written)
+        } else {
+            (offset, handle.write(offset, data).await?)
+        };
 
         // Invalidate reader cache for the written range so subsequent reads
         // (including FUSE reads on kernel page-cache miss) see committed data
@@ -1707,13 +2217,26 @@ where
         let _ = self
             .state
             .reader
-            .invalidate(handle.ino as u64, offset, data.len())
+            .invalidate(handle.ino as u64, write_offset, data.len())
             .await;
 
-        self.update_mtime_ctime(handle.ino).await?;
-        self.state.modified.touch(handle.ino).await;
+        // Keep local inode and handle sizes in sync immediately.  Metadata size
+        // is persisted by the writer commit/flush path; doing it here forces
+        // every write through metadata and makes buffered writes serialize on
+        // the store.
+        let new_end = write_offset + written as u64;
+        if new_end > handle.attr().size {
+            self.extend_local_file_size(handle.ino, new_end);
+        }
 
-        tracing::trace!(fh, ino = handle.ino, written, "vfs.write_done");
+        tracing::trace!(
+            fh,
+            ino = handle.ino,
+            offset = write_offset,
+            written,
+            new_end,
+            "vfs.write_done"
+        );
         Ok(written)
     }
 
@@ -1723,11 +2246,8 @@ where
             return Ok(0);
         }
 
-        let handles = self.file_handles_for_inode(ino);
-        let mut guards = Vec::with_capacity(handles.len());
-        for handle in handles {
-            guards.push(handle.lock_write().await);
-        }
+        let mutation_lock = self.state.append_lock(ino);
+        let _mutation_guard = mutation_lock.lock_owned().await;
 
         let attr = self.meta_stat_required(ino, PathHint::none()).await?;
         if attr.kind == FileType::Dir {
@@ -1745,20 +2265,63 @@ where
             .write_at(offset, data)
             .await
             .map_err(VfsError::from)?;
-        writer.flush().await.map_err(|_| VfsError::Other)?;
 
         // Invalidate reader cache for the written range so any subsequent
-        // FUSE read (kernel page-cache miss) fetches the freshly committed
-        // data instead of a stale cached zero-fill from a prior truncate.
+        // read path flushes pending writer data instead of serving a stale
+        // cached zero-fill from a prior truncate.
         let _ = self
             .state
             .reader
             .invalidate(ino as u64, offset, data.len())
             .await;
 
-        self.update_mtime_ctime(ino).await?;
-        self.state.modified.touch(ino).await;
-        drop(guards);
+        // Keep local size visible immediately; metadata is extended when the
+        // writer commits dirty slices.
+        let new_end = offset + written as u64;
+        if new_end > attr.size {
+            self.extend_local_file_size(ino, new_end);
+        }
+
+        Ok(written)
+    }
+
+    /// Write back a kernel-cached page by inode. This is the hot path for
+    /// FUSE_WRITE_CACHE (mmap writeback, kernel page cache flush).
+    ///
+    /// Unlike normal writes, cached writeback does NOT acquire the per-inode
+    /// mutation lock.  The writer's internal slice-level locking is sufficient
+    /// to handle concurrent cached pages.  Truncate correctness is preserved
+    /// because truncate_inode / set_attr first drain all pending writes via
+    /// flush_before_truncate, then acquire the mutation lock and call
+    /// writer.clear().
+    ///
+    /// We also skip meta_stat_required (the kernel only sends WRITE_CACHE for
+    /// inodes that are already open files) and reader.invalidate (commit_chunk
+    /// invalidates the reader at commit time; doing it on every page write
+    /// adds measurable latency under heavy mmap traffic).
+    pub async fn write_cached_ino(
+        &self,
+        ino: i64,
+        offset: u64,
+        data: &[u8],
+        creation_unique: u64,
+    ) -> Result<usize, VfsError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let inode = self.ensure_inode_registered(ino).await?;
+        let writer = self.state.writer.ensure_file(inode.clone());
+        let written = writer
+            .write_at_cached(offset, data, creation_unique)
+            .await
+            .map_err(VfsError::from)?;
+
+        let new_end = offset + written as u64;
+        if new_end > inode.file_size() {
+            self.extend_local_file_size(ino, new_end);
+        }
+
         Ok(written)
     }
 
@@ -1778,9 +2341,16 @@ where
             return Ok(0);
         }
 
-        let len = usize::try_from(length).map_err(|_| VfsError::InvalidInput)?;
         let src = self.file_handle_required(fh_in)?;
         let dst = self.file_handle_required(fh_out)?;
+
+        let mut mutation_guards = Vec::new();
+        let mut mutation_locks = BTreeMap::new();
+        mutation_locks.insert(src.ino, self.state.append_lock(src.ino));
+        mutation_locks.insert(dst.ino, self.state.append_lock(dst.ino));
+        for lock in mutation_locks.into_values() {
+            mutation_guards.push(lock.lock_owned().await);
+        }
 
         if !src.flags.read {
             return Err(VfsError::PermissionDenied {
@@ -1805,13 +2375,28 @@ where
             locked.push(handle.lock_write().await);
         }
 
-        self.state.writer.flush_if_exists(src.ino as u64).await;
+        self.state
+            .writer
+            .flush_required(src.ino as u64)
+            .await
+            .map_err(VfsError::from)?;
         if dst.ino != src.ino {
-            self.state.writer.flush_if_exists(dst.ino as u64).await;
+            self.state
+                .writer
+                .flush_required(dst.ino as u64)
+                .await
+                .map_err(VfsError::from)?;
         }
 
         let src_attr = self.meta_stat_required(src.ino, PathHint::none()).await?;
         let dst_attr = self.meta_stat_required(dst.ino, PathHint::none()).await?;
+        let available = src_attr.size.saturating_sub(off_in);
+        let copy_len = length.min(available);
+        if copy_len == 0 {
+            return Ok(0);
+        }
+        let len = usize::try_from(copy_len).map_err(|_| VfsError::InvalidInput)?;
+
         let src_guard = self.open_guard(src.ino, src_attr, true, false).await?;
         let dst_guard = self.open_guard(dst.ino, dst_attr, false, true).await?;
 
@@ -1820,11 +2405,40 @@ where
         let data = src_guard.read(off_in, len).await?;
         let written = dst_guard.write(off_out, &data).await?;
 
-        drop(dst_guard);
-        drop(src_guard);
+        // Close guards to flush and commit before releasing locks.
+        dst_guard.close().await?;
+        src_guard.close().await?;
         drop(locked);
+        drop(mutation_guards);
 
         Ok(written)
+    }
+
+    /// Copy a byte range between two inodes by opening temporary handles.
+    pub async fn copy_file_range_inodes(
+        &self,
+        src_ino: i64,
+        off_in: u64,
+        dst_ino: i64,
+        off_out: u64,
+        length: u64,
+    ) -> Result<usize, VfsError> {
+        let src_attr = self.meta_stat_required(src_ino, PathHint::none()).await?;
+        let dst_attr = self.meta_stat_required(dst_ino, PathHint::none()).await?;
+        let src_guard = self.open_guard(src_ino, src_attr, true, false).await?;
+        let dst_guard = self.open_guard(dst_ino, dst_attr, false, true).await?;
+        let fh_in = src_guard.fh();
+        let fh_out = dst_guard.fh();
+
+        let result = self
+            .copy_file_range(fh_in, off_in, fh_out, off_out, length)
+            .await;
+
+        // Close guards to ensure handles are released cleanly.
+        dst_guard.close().await?;
+        src_guard.close().await?;
+
+        result
     }
 
     /// Allocate a per-file handle, returning the opaque fh id.
@@ -1835,18 +2449,76 @@ where
         attr: FileAttr,
         read: bool,
         write: bool,
+        append: bool,
+    ) -> Result<u64, VfsError> {
+        self.open_with_attr_refresh(ino, attr, read, write, append, true)
+            .await
+    }
+
+    pub(crate) async fn open_with_cached_attr(
+        &self,
+        ino: i64,
+        attr: FileAttr,
+        read: bool,
+        write: bool,
+        append: bool,
+    ) -> Result<u64, VfsError> {
+        self.open_with_attr_refresh(ino, attr, read, write, append, false)
+            .await
+    }
+
+    pub(crate) async fn open_fresh_ino(
+        &self,
+        ino: i64,
+        read: bool,
+        write: bool,
+        append: bool,
+    ) -> Result<u64, VfsError> {
+        let attr = match self.meta_stat_fresh(ino).await {
+            Ok(Some(attr)) => attr,
+            Ok(None) => {
+                return Err(VfsError::NotFound {
+                    path: PathHint::none(),
+                });
+            }
+            Err(err) => {
+                tracing::warn!("open: stat_fresh failed for ino {}: {}", ino, err);
+                return Err(VfsError::StaleNetworkFileHandle);
+            }
+        };
+
+        if attr.kind == FileType::Dir {
+            return Err(VfsError::IsADirectory {
+                path: PathHint::none(),
+            });
+        }
+
+        self.open_with_attr_refresh(ino, attr, read, write, append, false)
+            .await
+    }
+
+    async fn open_with_attr_refresh(
+        &self,
+        ino: i64,
+        attr: FileAttr,
+        read: bool,
+        write: bool,
+        append: bool,
+        refresh_attr: bool,
     ) -> Result<u64, VfsError> {
         let mut latest_attr = attr;
 
         // Retrieve the latest attr for close-to-open semantics.
-        match self.meta_stat_fresh(ino).await {
-            Ok(Some(fresh)) => {
-                latest_attr = fresh;
-            }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!("open: stat_fresh failed for ino {}: {}", ino, err);
-                return Err(VfsError::StaleNetworkFileHandle);
+        if refresh_attr {
+            match self.meta_stat_fresh(ino).await {
+                Ok(Some(fresh)) => {
+                    latest_attr = fresh;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!("open: stat_fresh failed for ino {}: {}", ino, err);
+                    return Err(VfsError::StaleNetworkFileHandle);
+                }
             }
         }
 
@@ -1854,17 +2526,16 @@ where
             .lock_inode(ino)
             .or_insert_with(|| Inode::new(ino, latest_attr.size));
         if latest_attr.size > guard.file_size() {
-            guard.update_size(latest_attr.size);
+            guard.extend_size(latest_attr.size);
+        } else if guard.file_size() > latest_attr.size {
+            latest_attr.size = guard.file_size();
         }
 
         let inode = guard.clone();
-        let handle = self
-            .state
-            .handles
-            .allocate(ino, latest_attr, HandleFlags::new(read, write));
-
-        let reader = self.state.reader.open_for_handle(inode.clone(), handle.fh);
-        handle.reader(reader);
+        let handle =
+            self.state
+                .handles
+                .allocate(ino, latest_attr, HandleFlags::new(read, write, append));
         if write {
             let writer = self.state.writer.ensure_file(inode.clone());
             handle.writer(writer);
@@ -1880,7 +2551,7 @@ where
         read: bool,
         write: bool,
     ) -> Result<FileGuard<S, M>, VfsError> {
-        let fh = self.open(ino, attr, read, write).await?;
+        let fh = self.open(ino, attr, read, write, false).await?;
         Ok(FileGuard::new(self.clone(), fh))
     }
 
@@ -1896,48 +2567,87 @@ where
             "vfs.close"
         );
         if handle.flags.write {
-            handle.flush().await.map_err(|_| VfsError::Other)?;
-            self.update_mtime_ctime(handle.ino).await?;
+            let _handle_guard = handle.lock_write().await;
+
+            let had_write = handle.take_write_dirty();
+            let flushed_pending = self
+                .state
+                .writer
+                .flush_for_close(handle.ino as u64)
+                .await
+                .map_err(VfsError::from)?;
+            if had_write || flushed_pending {
+                if let Err(err) = self.update_mtime_ctime(handle.ino).await {
+                    if had_write {
+                        handle.mark_write_dirty();
+                    }
+                    return Err(err);
+                }
+            }
         }
 
         // Prevent us from TOC-TOU (time of check to time of use) error.
         // If we release the handle and remove the inode directly, there is
         // a time windows between checking and releasing. It causes the inode and writer
         // to be deleted mistakenly.
-        match self.lock_inode(handle.ino) {
+        let release_writer = match self.lock_inode(handle.ino) {
             Entry::Occupied(entry) => {
                 self.state.handles.release(fh);
-                self.state.reader.close_for_handle(handle.ino as u64, fh);
-
-                if !self.state.handles.has_write_handle(handle.ino) {
-                    self.state.writer.release(handle.ino as u64);
-                }
+                let release_writer =
+                    handle.flags.write && !self.state.handles.has_write_handle(handle.ino);
 
                 if self.state.handles.has_no_handle(handle.ino) {
                     entry.remove();
                 }
+                release_writer
             }
             Entry::Vacant(_) => {
                 // This is weird/impossible?
                 // It means the inode was deleted while we held a handle to it.
                 unreachable!("Try closing a file that has never been opened");
             }
+        };
+
+        self.state
+            .reader
+            .close_for_handle(handle.ino as u64, fh)
+            .await;
+
+        if release_writer {
+            self.state.writer.release(handle.ino as u64).await;
         }
 
         tracing::trace!(fh, ino = handle.ino, "vfs.close_done");
         Ok(())
     }
 
-    /// Shared implementation for flush and fsync: conditionally flushes pending writes
-    /// and updates timestamps. Returns the inode number for logging by the caller.
+    /// Shared implementation for flush and fsync: flushes pending writes for the
+    /// inode and updates timestamps. Returns the inode number for logging.
+    ///
+    /// Always flushes the shared writer regardless of the handle's open flags:
+    /// mmap writes via FUSE writeback (write_ino) deposit data in the shared
+    /// writer and a subsequent fsync on a read-only handle must commit them.
     async fn flush_and_sync_handle(&self, fh: u64) -> Result<i64, VfsError> {
         let handle = self.file_handle_required(fh)?;
 
-        if handle.flags.write {
-            handle.flush().await.map_err(|_| VfsError::Other)?;
-        }
+        tracing::info!(fh, ino = handle.ino, "vfs.flush_handle_start");
+        let had_write = handle.take_write_dirty();
+        let flushed_pending = self
+            .state
+            .writer
+            .flush_required(handle.ino as u64)
+            .await
+            .map_err(VfsError::from)?;
+        tracing::trace!(fh, ino = handle.ino, "vfs.flush_handle_done");
 
-        self.update_timestamps_on_flush(handle.ino).await?;
+        if had_write || flushed_pending {
+            if let Err(err) = self.update_mtime_ctime(handle.ino).await {
+                if had_write {
+                    handle.mark_write_dirty();
+                }
+                return Err(err);
+            }
+        }
         Ok(handle.ino)
     }
 
@@ -1954,6 +2664,13 @@ where
         let ino = self.flush_and_sync_handle(fh).await?;
         tracing::trace!(fh, ino, "vfs.flush_done");
         Ok(())
+    }
+
+    /// Flush pending writes for an inode (best-effort, without a file handle).
+    /// Used by rename and other metadata operations that need write-back
+    /// convergence before modifying directory entries.
+    pub async fn flush_inode(&self, ino: u64) {
+        let _ = self.state.writer.flush_if_exists(ino).await;
     }
 
     /// Sync file content (fsync): flush pending writes.
@@ -1976,10 +2693,25 @@ where
     /// This pre-loads all directory entries and starts background batch prefetch for attributes.
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     pub async fn opendir(&self, ino: i64) -> Result<u64, VfsError> {
-        let handle = self.meta_opendir(ino).await?;
+        let attr = self.meta_stat_required(ino, PathHint::none()).await?;
+        let handle = self.meta_opendir(ino).await?.with_attr(attr);
         let fh = self.state.handles.allocate_dir(handle);
 
         Ok(fh)
+    }
+
+    /// Refresh a directory handle by re-reading entries from the meta layer.
+    /// Keeps the same fh — the old handle is replaced in-place.
+    /// Used for rewinddir(3): files created after opendir(3) must become
+    /// visible after rewinddir(3) + readdir(3).
+    pub async fn refresh_dir_handle(&self, fh: u64) -> Result<(), VfsError> {
+        let ino = self
+            .dir_handle(fh)
+            .ok_or(VfsError::StaleNetworkFileHandle)?
+            .ino;
+        let fresh = self.meta_opendir(ino).await?;
+        self.state.handles.replace_dir(fh, fresh);
+        Ok(())
     }
 
     /// Close a directory handle
@@ -2035,14 +2767,32 @@ where
         self.state.handles.attr_for_inode(ino)
     }
 
-    /// Check whether a file has been modified since a given point in time.
-    pub(crate) async fn modified_since(&self, ino: i64, since: Instant) -> bool {
-        self.state.modified.modified_since(ino, since).await
+    pub(crate) fn forget_recently_unlinked_attr(&self, ino: i64) {
+        self.state.recently_unlinked.remove(&ino);
     }
 
-    /// Drop modification markers older than `ttl` to keep the tracker bounded.
-    pub(crate) async fn cleanup_modified(&self, ttl: Duration) {
-        self.state.modified.cleanup_older_than(ttl).await;
+    fn remember_recently_unlinked_attr(&self, ino: i64, mut attr: FileAttr) {
+        if self.state.recently_unlinked.len() >= RECENTLY_UNLINKED_ATTR_CLEANUP_THRESHOLD
+            && self
+                .state
+                .recently_unlinked_cleanup_tick
+                .fetch_add(1, Ordering::Relaxed)
+                % RECENTLY_UNLINKED_ATTR_CLEANUP_INTERVAL
+                == 0
+        {
+            self.cleanup_recently_unlinked_attrs();
+        }
+        attr.nlink = 0;
+        self.state
+            .recently_unlinked
+            .insert(ino, (attr, Instant::now()));
+    }
+
+    fn cleanup_recently_unlinked_attrs(&self) {
+        let now = Instant::now();
+        self.state.recently_unlinked.retain(|_, (_, inserted_at)| {
+            now.duration_since(*inserted_at) <= RECENTLY_UNLINKED_ATTR_TTL
+        });
     }
 
     /// Get file lock information for a given inode and query.
@@ -2066,6 +2816,24 @@ where
     ) -> Result<(), VfsError> {
         self.meta_set_plock(inode, owner, block, lock_type, range, pid)
             .await
+    }
+
+    pub(crate) fn remember_posix_lock_owner(
+        &self,
+        inode: i64,
+        owner: i64,
+        lock_type: FileLockType,
+    ) {
+        if lock_type != FileLockType::UnLock {
+            self.state.posix_lock_owners.insert((inode, owner), ());
+        }
+    }
+
+    pub(crate) fn take_posix_lock_owner(&self, inode: i64, owner: i64) -> bool {
+        self.state
+            .posix_lock_owners
+            .remove(&(inode, owner))
+            .is_some()
     }
 
     /// Set xattr for a given inode.
@@ -2110,7 +2878,7 @@ where
     }
 
     /// Resolves a normalized path to its inode number, returning NotFound if absent.
-    async fn lookup_path_to_ino(&self, path: &str) -> Result<i64, VfsError> {
+    pub(crate) async fn lookup_path_to_ino(&self, path: &str) -> Result<i64, VfsError> {
         let (inode, _) = self.meta_lookup_path_required(path).await?;
         Ok(inode)
     }
@@ -2140,21 +2908,6 @@ where
         let inode = self.lookup_path_to_ino(&path).await?;
         self.meta_set_plock(inode, owner, block, lock_type, range, pid)
             .await
-    }
-
-    /// Update timestamps on flush/fsync for files that may have been modified via mmap.
-    /// This is necessary because the kernel doesn't call write() for mmap writes.
-    /// We only update if the file was opened for writing.
-    pub(crate) async fn update_timestamps_on_flush(&self, ino: i64) -> Result<(), VfsError> {
-        // Check if any handle for this inode was opened for writing
-        let has_write_handle = self.state.handles.has_write_handle(ino);
-
-        if has_write_handle {
-            // File was opened for writing, update mtime/ctime to handle potential mmap writes
-            self.update_mtime_ctime(ino).await?;
-        }
-
-        Ok(())
     }
 
     /// Get file system statistics (total/available space and inodes).

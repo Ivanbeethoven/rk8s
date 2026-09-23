@@ -45,6 +45,31 @@ The demo will:
 - Create nested directories/files, perform cross-block/chunk writes and read verification
 - Do rename, truncate (shrink/extend), readdir and unlink/rmdir
 - Print expected error scenarios and finally output "sdk demo: OK"
+
+### FUSE Mount Concurrency
+
+`slayerfs mount` defaults to the low-overhead `rfuse3` session dispatch path, and still allows explicit worker-pool overrides:
+
+```bash
+slayerfs mount /mnt/slayer \
+  --meta-url sqlite:///tmp/slayerfs.db \
+  --data-dir /tmp/slayerfs-data \
+  --fuse-workers 4 \
+  --fuse-max-background 64
+```
+
+Notes:
+- By default, SlayerFS uses `--fuse-workers 1`; this avoids worker-pool scheduling overhead on metadata-heavy workloads
+- `--fuse-workers 0` or `1` keeps the legacy `rfuse3` session dispatch
+- `--fuse-workers > 1` enables the `rfuse3` worker pool
+- `--fuse-max-background` caps queued + running FUSE requests
+- YAML config supports the same settings:
+
+```yaml
+fuse:
+  workers: 4
+  max_background: 64
+```
 ---
 
 ## 🌟 Current Features (MVP)

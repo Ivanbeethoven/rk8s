@@ -6,6 +6,7 @@ services:
       redis-server
       --appendonly yes
       --appendfsync everysec
+      --loglevel warning
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -71,6 +72,51 @@ services:
     networks:
       - slayerfs-xfstests
 
+  minio:
+    image: minio/minio:latest
+    container_name: minio-slayerfs-perf-redis
+    expose:
+      - "9000"
+      - "9001"
+    ports:
+      - "${MINIO_HOST_BIND:-127.0.0.1}:${MINIO_S3_HOST_PORT:-19000}:9000"
+      - "${MINIO_HOST_BIND:-127.0.0.1}:${MINIO_CONSOLE_HOST_PORT:-19001}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    command:
+      - server
+      - /data
+      - --console-address
+      - :9001
+    volumes:
+      - minio-data-perf-redis:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks:
+      - slayerfs-xfstests
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        timeout 180 sh -ec '
+          while true; do
+            mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} >/dev/null 2>&1 || { sleep 2; continue; }
+            mc mb --ignore-existing local/${SLAYERFS_S3_BUCKET:-slayerfs-data} >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+        '
+    networks:
+      - slayerfs-xfstests
+
   perf:
     image: slayerfs-xfstests-perf:local
     build:
@@ -79,8 +125,6 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      rustfs-init:
-        condition: service_completed_successfully
     environment:
       SLAYERFS_META_BACKEND: redis
       SLAYERFS_META_URL: redis://redis:6379/0
@@ -92,6 +136,12 @@ services:
       SLAYERFS_S3_FORCE_PATH_STYLE: ${SLAYERFS_S3_FORCE_PATH_STYLE:-true}
       SLAYERFS_CONFIG_PATH: /run/slayerfs/config.yaml
       SLAYERFS_LOG_FILE: /artifacts/slayerfs.log
+      SLAYERFS_FUSE_OP_LOG: ${SLAYERFS_FUSE_OP_LOG:-0}
+      SLAYERFS_MOUNT_WAIT_SECS: ${SLAYERFS_MOUNT_WAIT_SECS:-60}
+      SLAYERFS_PRE_MOUNT_WAIT_SECS: ${SLAYERFS_PRE_MOUNT_WAIT_SECS:-10}
+      SLAYERFS_MOUNT_READY_DELAY_SECS: ${SLAYERFS_MOUNT_READY_DELAY_SECS:-1}
+      SLAYERFS_NOFILE_LIMIT: ${SLAYERFS_NOFILE_LIMIT:-1048576}
+      SLAYERFS_FUSE_LOG_FILE: /artifacts/slayerfs_fuse_ops.log
       SLAYERFS_ARTIFACT_DIR: ${SLAYERFS_ARTIFACT_DIR:-}
       SLAYERFS_ARTIFACT_ROOT: /artifacts
       XFSTESTS_DIR: /opt/xfstests-dev
@@ -99,6 +149,7 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-rustfsadmin}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
       AWS_EC2_METADATA_DISABLED: ${AWS_EC2_METADATA_DISABLED:-true}
+      RUST_LOG: ${RUST_LOG:-error}
     entrypoint: ["/usr/bin/tini", "--", "/usr/local/bin/run_perf_in_container.sh"]
     privileged: true
     devices:
@@ -107,6 +158,10 @@ services:
       - SYS_ADMIN
     security_opt:
       - apparmor=unconfined
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
     volumes:
       - ./artifacts:/artifacts
       - ./run_perf_in_container.sh:/usr/local/bin/run_perf_in_container.sh:ro
@@ -121,3 +176,4 @@ networks:
 volumes:
   slayerfs-state-perf-redis:
   rustfs-data-perf-redis:
+  minio-data-perf-redis:

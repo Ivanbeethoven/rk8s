@@ -135,7 +135,9 @@ pub trait MetaLayer: Send + Sync {
                 }
                 // File/symlink replacing directory - not allowed
                 (FileType::File, FileType::Dir) | (FileType::Symlink, FileType::Dir) => {
-                    return Err(MetaError::NotDirectory(dest_ino));
+                    return Err(MetaError::Io(std::io::Error::from(
+                        std::io::ErrorKind::IsADirectory,
+                    )));
                 }
                 // File/symlink replacing file/symlink - allowed
                 _ => {}
@@ -241,6 +243,10 @@ pub trait MetaLayer: Send + Sync {
 
     async fn get_slices(&self, chunk_id: u64) -> Result<Vec<SliceDesc>, MetaError>;
 
+    async fn invalidate_chunk_slices(&self, _ino: i64, _chunk_index: u64) -> Result<(), MetaError> {
+        Ok(())
+    }
+
     async fn append_slice(&self, chunk_id: u64, slice: SliceDesc) -> Result<(), MetaError>;
 
     async fn next_id(&self, key: &str) -> Result<i64, MetaError>;
@@ -262,6 +268,16 @@ pub trait MetaLayer: Send + Sync {
         lock_type: FileLockType,
         range: FileLockRange,
         pid: u32,
+    ) -> Result<(), MetaError>;
+
+    async fn get_flock(&self, inode: i64, owner: i64) -> Result<FileLockType, MetaError>;
+
+    async fn set_flock(
+        &self,
+        inode: i64,
+        owner: i64,
+        block: bool,
+        lock_type: FileLockType,
     ) -> Result<(), MetaError>;
 
     // ---------- Extended attribute & ACL ----------
