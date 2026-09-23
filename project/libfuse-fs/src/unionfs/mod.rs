@@ -3227,6 +3227,7 @@ impl OverlayFs {
                 // trace!("get_data: found handle");
                 return Ok(Arc::clone(v));
             }
+        }
 
         let readonly: bool = flags
             & (libc::O_APPEND | libc::O_CREAT | libc::O_TRUNC | libc::O_RDWR | libc::O_WRONLY)
