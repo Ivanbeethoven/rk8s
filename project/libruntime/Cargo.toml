@@ -61,3 +61,6 @@ quinn = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 hyper = { workspace = true }
+
+[lints.clippy]
+result_large_err = "allow"
