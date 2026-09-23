@@ -10,7 +10,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{error, info, warn};
 use tracing::trace;
 
 impl Filesystem for OverlayFs {
@@ -547,7 +547,7 @@ impl Filesystem for OverlayFs {
     ) -> Result<ReplyWrite> {
         let handle_data: Arc<HandleData> = self.get_data(req, Some(fh), inode, flags).await?;
 
-        let result = match handle_data.real_handle {
+        match handle_data.real_handle {
             None => {
                 error!(
                     "unionfs write: no real_handle for inode {inode} fh {fh} — cannot write"
@@ -555,7 +555,8 @@ impl Filesystem for OverlayFs {
                 Err(Error::from_raw_os_error(libc::ENOENT).into())
             }
             Some(ref hd) => {
-                hd.layer
+                let result = hd
+                    .layer
                     .write(
                         req,
                         hd.inode,
@@ -573,23 +574,7 @@ impl Filesystem for OverlayFs {
                         hd.handle.load(Ordering::Relaxed)
                     );
                 }
-                // NOTE: no release here even though this may be a reconstructed
-                // handle (kernel fh=0): the same HandleData serves later reads
-                // of the file, and in no_open style there is no kernel RELEASE
-                // to close it — the layer's fd is intentionally kept for the
-                // lifetime of the mount entry (bounded by distinct files
-                // touched; the backing File drops with the handle data).
                 result
-            }
-        };
-        // Ephemeral (reconstructed) handles own a layer fd the kernel will
-        // never RELEASE — drop it once the I/O completes.
-        if handle_data.ephemeral {
-            if let Some(ref hd) = handle_data.real_handle {
-                let _ = hd
-                    .layer
-                    .release(req, hd.inode, hd.handle.load(Ordering::Relaxed), 0, 0, true)
-                    .await;
             }
         }
         result
