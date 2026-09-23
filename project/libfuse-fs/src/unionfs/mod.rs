@@ -127,6 +127,10 @@ struct HandleData {
     // Cache the directory entries for stable readdir offsets.
     // The snapshot contains all necessary info to avoid re-accessing childrens map.
     dir_snapshot: Mutex<Option<Vec<DirectoryEntryPlus>>>,
+    /// True for handles reconstructed outside a kernel OPEN (no_open-style
+    /// requests that carry fh=0). Such handles own a layer fd the kernel will
+    /// never RELEASE, so the I/O sites must release them when done.
+    ephemeral: bool,
 }
 
 // RealInode is a wrapper of one inode in specific layer.
@@ -1799,6 +1803,7 @@ impl OverlayFs {
                     node,
                     real_handle: None,
                     dir_snapshot: Mutex::new(None),
+                    ephemeral: false,
                 })
             }
         };
@@ -2206,6 +2211,7 @@ impl OverlayFs {
                             handle: AtomicU64::new(hd),
                         }),
                         dir_snapshot: Mutex::new(None),
+                        ephemeral: false,
                     };
                     self.handles
                         .lock()
@@ -3278,31 +3284,9 @@ impl OverlayFs {
                 handle: AtomicU64::new(real_fh),
             }),
             dir_snapshot: Mutex::new(None),
+            ephemeral: true,
         });
 
-        // Register the reconstructed handle under the fh the kernel is using
-        // (0 for no_open-style requests): the FLUSH/RELEASE that close this
-        // file arrive with that fh, and they must find the handle to forward
-        // to the layer that owns the open fd — otherwise close fails ENOENT
-        // and the layer's fd leaks. A previous entry on the same slot is
-        // released first (it belongs to a file that was already rewritten).
-        let fh_slot = handle.unwrap_or(0);
-        {
-            let mut handles = self.handles.lock().await;
-            if let Some(old) = handles.get(&fh_slot)
-                && let Some(ref rh) = old.real_handle
-            {
-                let _ = rh.layer.release(
-                    ctx,
-                    rh.inode,
-                    rh.handle.load(Ordering::Relaxed),
-                    0,
-                    0,
-                    true,
-                );
-            }
-            handles.insert(fh_slot, Arc::clone(&handle_data));
-        }
 
         return Ok(handle_data);
     }
