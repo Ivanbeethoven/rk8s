@@ -24,10 +24,7 @@ use asyncfuse::raw::{Request, Session};
 use config::Config;
 use futures::StreamExt as _;
 use std::sync::{Arc, Weak};
-use tracing::debug;
-use tracing::error;
-use tracing::info;
-use tracing::trace;
+use tracing::{debug, error, info, trace, warn};
 
 use asyncfuse::{Errno, FileType, MountOptions, mode_from_kind_and_perm};
 const SLASH_ASCII: char = '/';
@@ -1490,10 +1487,18 @@ impl OverlayFs {
                             // The kernel can issue LOOKUP/GETATTR/OPEN using a parent inode after
                             // userspace has evicted the in-memory node on FORGET. Rebuild the
                             // parent from its reserved path, then continue resolving `name` below.
-                            self.materialize_node_by_path(ctx, &path).await?
+                            match self.materialize_node_by_path(ctx, &path).await {
+                                Ok(node) => node,
+                                Err(e) => {
+                                    warn!(
+                                        "lookup_node: re-materialize of forgotten parent {parent} at {path:?} failed: {e}"
+                                    );
+                                    return Err(e);
+                                }
+                            }
                         } else {
-                            trace!(
-                                "overlayfs:mod.rs:1034:lookup_node: parent inode {parent} not found"
+                            warn!(
+                                "lookup_node: parent inode {parent} not found and no path mapping to re-materialize"
                             );
                             // Parent inode is not found, return ENOENT.
                             return Err(Error::from_raw_os_error(libc::ENOENT));
@@ -1539,7 +1544,10 @@ impl OverlayFs {
                 {
                     return Ok(v);
                 }
-                trace!("lookup_node: child {name} not found");
+                warn!(
+                    "lookup_node: child {name} not found under parent {parent} (path {:?})",
+                    pnode.path.read().await
+                );
                 Err(Error::from_raw_os_error(libc::ENOENT))
             }
         }
@@ -3238,13 +3246,29 @@ impl OverlayFs {
             }
 
             let (layer, in_upper_layer, inode) = node.first_layer_inode().await;
+
+            // A no_open-style request carries fh=0: the kernel never sent an
+            // OPEN, so no handle exists for the layers that locate files by
+            // their own open handle (passthrough). Perform a real open on the
+            // target layer and hand the resulting fh to the caller, otherwise
+            // every write lands as ENOENT inside the passthrough layer.
+            // Read-only callers keep fh=0: inode-addressed layers (dicfuse and
+            // friends) ignore it, and passthrough reads only happen on nodes
+            // that were properly opened before.
+            let (real_fh, real_layer, real_inode) = if readonly {
+                (0u64, layer.clone(), inode)
+            } else {
+                let opened = layer.open(ctx, inode, flags).await?;
+                (opened.fh, layer.clone(), inode)
+            };
+
             let handle_data = HandleData {
                 node: Arc::clone(&node),
                 real_handle: Some(RealHandle {
-                    layer,
+                    layer: real_layer,
                     in_upper_layer,
-                    inode,
-                    handle: AtomicU64::new(0),
+                    inode: real_inode,
+                    handle: AtomicU64::new(real_fh),
                 }),
                 dir_snapshot: Mutex::new(None),
             };

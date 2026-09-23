@@ -10,7 +10,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{error, info, warn};
 use tracing::trace;
 
 impl Filesystem for OverlayFs {
@@ -522,9 +522,15 @@ impl Filesystem for OverlayFs {
         let handle_data: Arc<HandleData> = self.get_data(req, Some(fh), inode, flags).await?;
 
         match handle_data.real_handle {
-            None => Err(Error::from_raw_os_error(libc::ENOENT).into()),
+            None => {
+                error!(
+                    "unionfs write: no real_handle for inode {inode} fh {fh} — cannot write"
+                );
+                Err(Error::from_raw_os_error(libc::ENOENT).into())
+            }
             Some(ref hd) => {
-                hd.layer
+                let result = hd
+                    .layer
                     .write(
                         req,
                         hd.inode,
@@ -534,7 +540,15 @@ impl Filesystem for OverlayFs {
                         write_flags,
                         flags,
                     )
-                    .await
+                    .await;
+                if let Err(e) = &result {
+                    error!(
+                        "unionfs write: layer write failed inode {inode} layer_inode {} fh {}: {e}",
+                        hd.inode,
+                        hd.handle.load(Ordering::Relaxed)
+                    );
+                }
+                result
             }
         }
     }
