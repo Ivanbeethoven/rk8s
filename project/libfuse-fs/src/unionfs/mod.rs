@@ -3268,12 +3268,11 @@ impl OverlayFs {
         // Read-only callers keep fh=0: inode-addressed layers (dicfuse and
         // friends) ignore it, and passthrough reads only happen on nodes
         // that were properly opened before.
-        let (real_fh, real_layer, real_inode) = if readonly {
-            (0u64, layer.clone(), inode)
-        } else {
-            let opened = layer.open(ctx, inode, flags).await?;
-            (opened.fh, layer.clone(), inode)
-        };
+        // Every reconstructed handle must carry a *real* fh: the upper
+        // passthrough locates files by its own open handle, and a fh=0 read
+        // or write fails with EBADF inside the passthrough pread/pwrite.
+        let opened = layer.open(ctx, inode, flags).await?;
+        let (real_fh, real_layer, real_inode) = (opened.fh, layer.clone(), inode);
 
         let handle_data = Arc::new(HandleData {
             node: Arc::clone(&node),
