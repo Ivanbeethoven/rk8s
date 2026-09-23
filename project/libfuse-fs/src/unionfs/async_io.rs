@@ -452,6 +452,7 @@ impl Filesystem for OverlayFs {
                 handle: AtomicU64::new(h.fh),
             }),
             dir_snapshot: Mutex::new(None),
+            ephemeral: false,
         };
 
         self.handles.lock().await.insert(hd, Arc::new(handle_data));
@@ -485,10 +486,16 @@ impl Filesystem for OverlayFs {
     ) -> Result<ReplyData> {
         let data = self.get_data(req, Some(fh), inode, 0).await?;
 
-        match data.real_handle {
-            None => Err(Error::from_raw_os_error(libc::ENOENT).into()),
+        let result = match data.real_handle {
+            None => {
+                error!(
+                    "unionfs read: no real_handle for inode {inode} fh {fh} — cannot read"
+                );
+                Err(Error::from_raw_os_error(libc::ENOENT).into())
+            }
             Some(ref hd) => {
-                hd.layer
+                let result = hd
+                    .layer
                     .read(
                         req,
                         hd.inode,
@@ -496,9 +503,28 @@ impl Filesystem for OverlayFs {
                         offset,
                         size,
                     )
-                    .await
+                    .await;
+                if let Err(e) = &result {
+                    error!(
+                        "unionfs read: layer read failed inode {inode} layer_inode {} fh {}: {e}",
+                        hd.inode,
+                        hd.handle.load(Ordering::Relaxed)
+                    );
+                }
+                result
+            }
+        };
+        // Ephemeral (reconstructed) handles own a layer fd the kernel will
+        // never RELEASE — drop it once the I/O completes.
+        if data.ephemeral {
+            if let Some(ref hd) = data.real_handle {
+                let _ = hd
+                    .layer
+                    .release(req, hd.inode, hd.handle.load(Ordering::Relaxed), 0, 0, true)
+                    .await;
             }
         }
+        result
     }
 
     /// write data. Write should return exactly the number of bytes requested except on error. An
@@ -521,7 +547,7 @@ impl Filesystem for OverlayFs {
     ) -> Result<ReplyWrite> {
         let handle_data: Arc<HandleData> = self.get_data(req, Some(fh), inode, flags).await?;
 
-        match handle_data.real_handle {
+        let result = match handle_data.real_handle {
             None => {
                 error!(
                     "unionfs write: no real_handle for inode {inode} fh {fh} — cannot write"
@@ -548,15 +574,20 @@ impl Filesystem for OverlayFs {
                         hd.handle.load(Ordering::Relaxed)
                     );
                 }
-                // NOTE: no release here even though this may be a reconstructed
-                // handle (kernel fh=0): the same HandleData serves later reads
-                // of the file, and in no_open style there is no kernel RELEASE
-                // to close it — the layer's fd is intentionally kept for the
-                // lifetime of the mount entry (bounded by distinct files
-                // touched; the backing File drops with the handle data).
                 result
             }
+        };
+        // Ephemeral (reconstructed) handles own a layer fd the kernel will
+        // never RELEASE — drop it once the I/O completes.
+        if handle_data.ephemeral {
+            if let Some(ref hd) = handle_data.real_handle {
+                let _ = hd
+                    .layer
+                    .release(req, hd.inode, hd.handle.load(Ordering::Relaxed), 0, 0, true)
+                    .await;
+            }
         }
+        result
     }
 
     /// Copy a range of data from one file to another. This can improve performance because it
@@ -841,6 +872,7 @@ impl Filesystem for OverlayFs {
                     handle: AtomicU64::new(reply.fh),
                 }),
                 dir_snapshot: Mutex::new(None),
+                ephemeral: false,
             }),
         );
 
