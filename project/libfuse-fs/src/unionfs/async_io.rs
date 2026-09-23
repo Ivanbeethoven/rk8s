@@ -572,7 +572,7 @@ impl Filesystem for OverlayFs {
                 }
                 result
             }
-        }
+        };
         // Ephemeral (reconstructed) handles own a layer fd the kernel will
         // never RELEASE — drop it once the I/O completes.
         if handle_data.ephemeral {
