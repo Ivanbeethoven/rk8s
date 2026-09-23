@@ -3219,15 +3219,14 @@ impl OverlayFs {
         flags: u32,
     ) -> Result<Arc<HandleData>> {
         let no_open = self.no_open.load(Ordering::Relaxed);
-        if !no_open {
-            if let Some(h) = handle
+        if !no_open
+            && let Some(h) = handle
                 && let Some(v) = self.handles.lock().await.get(&h)
                 && v.node.inode == inode
             {
                 // trace!("get_data: found handle");
                 return Ok(Arc::clone(v));
             }
-        }
 
         let readonly: bool = flags
             & (libc::O_APPEND | libc::O_CREAT | libc::O_TRUNC | libc::O_RDWR | libc::O_WRONLY)
@@ -3280,7 +3279,7 @@ impl OverlayFs {
             ephemeral: true,
         });
 
-        return Ok(handle_data);
+        Ok(handle_data)
     }
 
     // extend or init the inodes number to one overlay if the current number is done.

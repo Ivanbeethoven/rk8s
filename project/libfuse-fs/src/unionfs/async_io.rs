@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tracing::trace;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 impl Filesystem for OverlayFs {
     /// initialize filesystem. Called before any other filesystem method.
@@ -514,14 +514,13 @@ impl Filesystem for OverlayFs {
         };
         // Ephemeral (reconstructed) handles own a layer fd the kernel will
         // never RELEASE — drop it once the I/O completes.
-        if data.ephemeral {
-            if let Some(ref hd) = data.real_handle {
+        if data.ephemeral
+            && let Some(ref hd) = data.real_handle {
                 let _ = hd
                     .layer
                     .release(req, hd.inode, hd.handle.load(Ordering::Relaxed), 0, 0, true)
                     .await;
             }
-        }
         result
     }
 
@@ -575,14 +574,13 @@ impl Filesystem for OverlayFs {
         };
         // Ephemeral (reconstructed) handles own a layer fd the kernel will
         // never RELEASE — drop it once the I/O completes.
-        if handle_data.ephemeral {
-            if let Some(ref hd) = handle_data.real_handle {
+        if handle_data.ephemeral
+            && let Some(ref hd) = handle_data.real_handle {
                 let _ = hd
                     .layer
                     .release(req, hd.inode, hd.handle.load(Ordering::Relaxed), 0, 0, true)
                     .await;
             }
-        }
         result
     }
 
