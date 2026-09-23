@@ -549,8 +549,11 @@ pub struct fuse_attr_out {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Debug)]
-#[allow(dead_code, non_camel_case_types)]
+pub const FUSE_GETXTIMES_OUT_SIZE: usize = mem::size_of::<fuse_getxtimes_out>();
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Serialize)]
+#[allow(non_camel_case_types)]
 pub struct fuse_getxtimes_out {
     pub bkuptime: u64,
     pub crtime: u64,
@@ -603,8 +606,11 @@ pub struct fuse_rename2_in {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Debug)]
-#[allow(dead_code, non_camel_case_types)]
+pub const FUSE_EXCHANGE_IN_SIZE: usize = mem::size_of::<fuse_exchange_in>();
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Deserialize)]
+#[allow(non_camel_case_types)]
 pub struct fuse_exchange_in {
     pub olddir: u64,
     pub newdir: u64,

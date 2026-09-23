@@ -56,12 +56,7 @@ use futures_channel::{
     mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
-use futures_util::future::Either;
-#[cfg(all(
-    target_os = "macos",
-    not(feature = "tokio-runtime"),
-    feature = "async-io-runtime"
-))]
+use futures_util::future::{Either, FutureExt};
 use futures_util::select;
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
@@ -72,19 +67,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(all(
     target_os = "linux",
     not(feature = "async-io-runtime"),
-    any(feature = "tokio-runtime", feature = "io-uring-runtime"),
+    feature = "tokio-runtime",
     feature = "unprivileged"
 ))]
 use tokio::process::Command;
-#[cfg(any(
-    all(not(feature = "async-io-runtime"), feature = "tokio-runtime"),
-    feature = "io-uring-runtime"
-))]
+#[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
 use tokio::task::JoinHandle;
-#[cfg(any(
-    all(not(feature = "async-io-runtime"), feature = "tokio-runtime"),
-    feature = "io-uring-runtime"
-))]
+#[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
 use tokio::{fs::read_dir, task};
 use tracing::{debug, debug_span, error, instrument, warn};
 
@@ -94,11 +83,7 @@ use crate::helper::*;
 use crate::notify::Notify;
 use crate::raw::abi::*;
 use crate::raw::buffer_pool::AlignedBuffer;
-#[cfg(any(
-    feature = "async-io-runtime",
-    feature = "tokio-runtime",
-    feature = "io-uring-runtime"
-))]
+#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
 use crate::raw::connection::FuseConnection;
 use crate::raw::filesystem::Filesystem;
 use crate::raw::reply::ReplyXAttr;
@@ -108,6 +93,111 @@ use crate::{MountOptions, SetAttr};
 
 #[cfg(target_os = "macos")]
 const MACFUSE_INIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn is_ignorable_reply_error(err: &IoError) -> bool {
+    match err.raw_os_error() {
+        Some(errno) if errno == libc::ENOENT => true,
+        #[cfg(target_os = "macos")]
+        Some(errno) if errno == libc::EINVAL => true,
+        _ => false,
+    }
+}
+
+fn negotiate_readdirplus(kernel_flags: u32, force: bool) -> (u32, bool) {
+    let supports_readdirplus = kernel_flags & FUSE_DO_READDIRPLUS > 0;
+    let supports_auto = kernel_flags & FUSE_READDIRPLUS_AUTO > 0;
+    let force_active = force && supports_readdirplus;
+    let mut reply_flags = 0;
+
+    if supports_readdirplus {
+        reply_flags |= FUSE_DO_READDIRPLUS;
+    }
+
+    if supports_auto && !force_active {
+        reply_flags |= FUSE_READDIRPLUS_AUTO;
+    }
+
+    // macOS-only INIT probe (PR-9.2). Empirically, macFUSE 4.x advertises
+    // `kernel_flags=0xef800008` on INIT — bits 13 (FUSE_DO_READDIRPLUS)
+    // and 14 (FUSE_READDIRPLUS_AUTO) are both clear. The Linux-only gate
+    // on `MountOptions::force_readdir_plus(true)` therefore matches the
+    // kernel reality; we keep the negotiation function platform-neutral
+    // for forward-compat (a future macFUSE may add the bits) and leave a
+    // `debug!` line so the negotiated state is recoverable from a normal
+    // `RUST_LOG=debug` run.
+    #[cfg(target_os = "macos")]
+    tracing::debug!(
+        target: "rfuse3::init_probe",
+        "readdirplus negotiation: kernel_flags=0x{kernel_flags:08x} \
+         supports_readdirplus={supports_readdirplus} \
+         supports_auto={supports_auto} \
+         force_requested={force} force_active={force_active} \
+         reply_flags=0x{reply_flags:08x}"
+    );
+
+    (reply_flags, force_active)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_ignorable_reply_error, negotiate_readdirplus};
+    use crate::raw::abi::{FUSE_DO_READDIRPLUS, FUSE_READDIRPLUS_AUTO};
+    use std::io::Error as IoError;
+
+    #[test]
+    fn enoent_reply_errors_are_ignorable() {
+        let err = IoError::from_raw_os_error(libc::ENOENT);
+
+        assert!(is_ignorable_reply_error(&err));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_einval_reply_errors_are_ignorable() {
+        let err = IoError::from_raw_os_error(libc::EINVAL);
+
+        assert!(is_ignorable_reply_error(&err));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_einval_reply_errors_are_not_ignorable() {
+        let err = IoError::from_raw_os_error(libc::EINVAL);
+
+        assert!(!is_ignorable_reply_error(&err));
+    }
+
+    #[test]
+    fn force_readdirplus_does_not_advertise_unsupported_capability() {
+        let (reply_flags, force_active) = negotiate_readdirplus(0, true);
+
+        assert_eq!(reply_flags & FUSE_DO_READDIRPLUS, 0);
+        assert!(!force_active);
+    }
+
+    #[test]
+    fn force_readdirplus_activates_when_kernel_supports_it() {
+        let (reply_flags, force_active) = negotiate_readdirplus(FUSE_DO_READDIRPLUS, true);
+
+        assert_ne!(reply_flags & FUSE_DO_READDIRPLUS, 0);
+        assert!(force_active);
+    }
+
+    #[test]
+    fn readdirplus_auto_is_disabled_only_when_force_is_active() {
+        let (reply_flags, force_active) =
+            negotiate_readdirplus(FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO, true);
+
+        assert!(force_active);
+        assert_eq!(reply_flags & FUSE_READDIRPLUS_AUTO, 0);
+
+        let (reply_flags, force_active) =
+            negotiate_readdirplus(FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO, false);
+
+        assert!(!force_active);
+        assert_ne!(reply_flags & FUSE_READDIRPLUS_AUTO, 0);
+    }
+}
 
 #[cfg(target_os = "macos")]
 async fn wait_for_mount_init_ready(ready_rx: oneshot::Receiver<IoResult<()>>) -> IoResult<()> {
@@ -181,19 +271,12 @@ impl Drop for MountHandle {
                 return;
             }
 
-            #[cfg(all(
-                not(feature = "tokio-runtime"),
-                not(feature = "io-uring-runtime"),
-                feature = "async-io-runtime"
-            ))]
+            #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
             {
                 task::spawn(inner.inner_unmount()).detach();
             }
 
-            #[cfg(any(
-                all(not(feature = "async-io-runtime"), feature = "tokio-runtime"),
-                feature = "io-uring-runtime"
-            ))]
+            #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
             {
                 task::spawn(inner.inner_unmount());
             }
@@ -212,8 +295,13 @@ struct MountHandleInner {
 
 impl MountHandleInner {
     async fn inner_unmount(self) -> IoResult<()> {
+        self.destroy_notify.notify();
+
         #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
         {
+            // wait destroy done
+            self.task.await?;
+
             // TODO: freebsd mount is unprivileged, then unmount is unprivileged too?
             #[cfg(target_os = "freebsd")]
             {
@@ -221,8 +309,6 @@ impl MountHandleInner {
                     mount::unmount(&self.mount_path, MntFlags::MNT_SYNCHRONOUS)
                 })
                 .await?;
-                self.destroy_notify.notify();
-                self.task.await?;
             }
 
             #[cfg(target_os = "macos")]
@@ -231,8 +317,6 @@ impl MountHandleInner {
                     mount::unmount(&self.mount_path, MntFlags::MNT_SYNCHRONOUS)
                 })
                 .await?;
-                self.destroy_notify.notify();
-                self.task.await?;
             }
 
             #[cfg(target_os = "linux")]
@@ -251,19 +335,18 @@ impl MountHandleInner {
                         ));
                     }
 
-                    self.destroy_notify.notify();
-                    self.task.await?;
                     return Ok(());
                 }
 
                 task::spawn_blocking(move || mount::umount(&self.mount_path)).await?;
-                self.destroy_notify.notify();
-                self.task.await?;
             }
         }
 
         #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
         {
+            // wait destroy done
+            self.task.await.unwrap()?;
+
             // TODO: freebsd mount is unprivileged, then unmount is unprivileged too?
             #[cfg(target_os = "freebsd")]
             {
@@ -272,8 +355,6 @@ impl MountHandleInner {
                 })
                 .await
                 .unwrap()?;
-                self.destroy_notify.notify();
-                self.task.await.unwrap()?;
             }
             #[cfg(target_os = "macos")]
             {
@@ -282,8 +363,6 @@ impl MountHandleInner {
                 })
                 .await
                 .unwrap()?;
-                self.destroy_notify.notify();
-                self.task.await.unwrap()?;
             }
 
             #[cfg(target_os = "linux")]
@@ -298,16 +377,12 @@ impl MountHandleInner {
                         return Err(IoError::other("call fusermount3 -u to unmount failed"));
                     }
 
-                    self.destroy_notify.notify();
-                    self.task.await.unwrap()?;
                     return Ok(());
                 }
 
                 task::spawn_blocking(move || mount::umount(&self.mount_path))
                     .await
                     .unwrap()?;
-                self.destroy_notify.notify();
-                self.task.await.unwrap()?;
             }
         }
 
@@ -318,16 +393,12 @@ impl MountHandleInner {
 impl Future for MountHandle {
     type Output = IoResult<()>;
 
-    #[cfg(all(
-        not(feature = "tokio-runtime"),
-        not(feature = "io-uring-runtime"),
-        feature = "async-io-runtime"
-    ))]
+    #[cfg(feature = "async-io-runtime")]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.inner.as_mut().expect("inner should be Some()").task).poll(cx)
     }
 
-    #[cfg(any(feature = "tokio-runtime", feature = "io-uring-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // The unwrap is necessary in order to provide the same API for both runtimes, and actually
         // unwrap should not panic, when MountHandle is canceled by unmount method, user has no
@@ -337,11 +408,7 @@ impl Future for MountHandle {
             .map(Result::unwrap)
     }
 }
-#[cfg(any(
-    feature = "async-io-runtime",
-    feature = "tokio-runtime",
-    feature = "io-uring-runtime"
-))]
+#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
 /// FUSE filesystem session with inode-based operations.
 ///
 /// # Concurrency Model
@@ -374,8 +441,8 @@ impl Future for MountHandle {
 pub struct Session<FS: Filesystem + Send + Sync + 'static> {
     fuse_connection: Option<Arc<FuseConnection>>,
     filesystem: Option<Arc<FS>>,
-    response_senders: Vec<UnboundedSender<FuseData>>,
-    response_receivers: Vec<Option<UnboundedReceiver<FuseData>>>,
+    response_sender: UnboundedSender<FuseData>,
+    response_receiver: Option<UnboundedReceiver<FuseData>>,
     mount_options: MountOptions,
     // ---- Concurrency configuration ----
     /// Number of worker tasks to execute FUSE requests. 0 or 1 keeps legacy inline spawn behavior.
@@ -387,15 +454,12 @@ pub struct Session<FS: Filesystem + Send + Sync + 'static> {
     _per_inode_serial: bool,
     /// Internal worker pool (created lazily when worker_count > 1).
     workers: Option<Workers<FS>>,
+    force_readdir_plus_active: bool,
     inflight: Arc<AtomicUsize>,
     inflight_notify: Arc<async_notify::Notify>,
 }
 
-#[cfg(any(
-    feature = "async-io-runtime",
-    feature = "tokio-runtime",
-    feature = "io-uring-runtime"
-))]
+#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
 impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     /// new a fuse filesystem session.
     pub fn new(mount_options: MountOptions) -> Self {
@@ -404,14 +468,15 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         Self {
             fuse_connection: None,
             filesystem: None,
-            response_senders: vec![sender],
-            response_receivers: vec![Some(receiver)],
+            response_sender: sender,
+            response_receiver: Some(receiver),
             mount_options,
             // default to legacy behaviour (no explicit pool)
             worker_count: 0,
             max_background: DEFAULT_MAX_BACKGROUND as usize,
             _per_inode_serial: false,
             workers: None,
+            force_readdir_plus_active: false,
             inflight: Arc::new(AtomicUsize::new(0)),
             inflight_notify: Arc::new(async_notify::Notify::new()),
         }
@@ -446,17 +511,13 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         self
     }
 
-    fn response_sender(&self) -> &UnboundedSender<FuseData> {
-        &self.response_senders[0]
-    }
-
     fn ensure_workers(&mut self, fs: Arc<FS>) {
         if self.worker_count > 1 && self.workers.is_none() {
             let ctx = Arc::new(DispatchCtx {
                 fs,
-                resp: self.response_senders.clone(),
+                resp: self.response_sender.clone(),
                 direct_io: self.mount_options.direct_io,
-                force_readdir_plus: self.mount_options.force_readdir_plus,
+                force_readdir_plus: self.force_readdir_plus_active,
                 _inflight: self.inflight.clone(),
                 _inflight_notify: self.inflight_notify.clone(),
             });
@@ -474,15 +535,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     ///
     /// [`notify`]: Notify
     fn get_notify(&self) -> Notify {
-        Notify::new(self.response_senders[0].clone())
+        Notify::new(self.response_sender.clone())
     }
 }
 
-#[cfg(any(
-    feature = "async-io-runtime",
-    feature = "tokio-runtime",
-    feature = "io-uring-runtime"
-))]
+#[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
 impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     async fn mount_empty_check(&self, mount_path: &Path) -> IoResult<()> {
         use std::io::ErrorKind;
@@ -702,63 +759,34 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         ready_sender: Option<oneshot::Sender<IoResult<()>>>,
     ) -> IoResult<()> {
         let fuse_write_connection = self.fuse_connection.as_ref().unwrap().clone();
-        let reply_count = if self.worker_count > 1 {
-            self.worker_count
-        } else {
-            1
-        };
 
-        if reply_count > self.response_senders.len() {
-            for _ in self.response_senders.len()..reply_count {
-                let (tx, rx) = unbounded();
-                self.response_senders.push(tx);
-                self.response_receivers.push(Some(rx));
+        let receiver = self.response_receiver.take().unwrap();
+
+        let dispatch_task = self.dispatch(ready_sender).fuse();
+        let mut dispatch_task = pin!(dispatch_task);
+
+        #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+        let reply_task =
+            task::spawn(async move { Self::reply_fuse(fuse_write_connection, receiver).await })
+                .fuse();
+        #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+        let reply_task = task::spawn(Self::reply_fuse(fuse_write_connection, receiver))
+            .map(Result::unwrap)
+            .fuse();
+
+        let mut reply_task = pin!(reply_task);
+
+        select! {
+            reply_result = reply_task => {
+                reply_result?;
+            }
+
+            dispatch_result = dispatch_task => {
+                dispatch_result?;
             }
         }
 
-        let rx_vec: Vec<UnboundedReceiver<FuseData>> = self
-            .response_receivers
-            .iter_mut()
-            .map(|r| r.take().unwrap())
-            .collect();
-
-        // Spawn reply tasks independently — they live for the lifetime of the
-        // runtime and stop naturally when their channels close. We intentionally
-        // do NOT use select_all here: if any reply task exits early (e.g. due to
-        // a transient /dev/fuse write error), the entire mount would be torn down,
-        // potentially losing replies for in-flight FUSE requests and causing the
-        // kernel to hang in wait_sb_inodes.
-        for (i, rx) in rx_vec.into_iter().enumerate() {
-            // Each reply task gets its own cloned connection to avoid deadlock:
-            // with io_uring, sharing the dispatch connection's ring thread between
-            // reads and writes causes the ring to block in submit_and_wait while
-            // write requests queue up unsent.
-            let conn = Arc::new(fuse_write_connection.try_clone()?);
-
-            #[cfg(all(
-                not(feature = "tokio-runtime"),
-                not(feature = "io-uring-runtime"),
-                feature = "async-io-runtime"
-            ))]
-            task::spawn(async move {
-                if let Err(e) = Self::reply_fuse(conn, rx).await {
-                    tracing::error!("reply fuse task {i} exited: {e}");
-                }
-            })
-            .detach();
-
-            #[cfg(any(
-                all(not(feature = "async-io-runtime"), feature = "tokio-runtime"),
-                feature = "io-uring-runtime"
-            ))]
-            task::spawn(async move {
-                if let Err(e) = Self::reply_fuse(conn, rx).await {
-                    tracing::error!("reply fuse task {i} exited: {e}");
-                }
-            });
-        }
-
-        self.dispatch(ready_sender).await
+        Ok(())
     }
 
     async fn reply_fuse(
@@ -766,9 +794,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         mut response_receiver: UnboundedReceiver<FuseData>,
     ) -> IoResult<()> {
         while let Some(response) = response_receiver.next().await {
-            let (mut data, mut extend_data) = match response {
-                Either::Left(data) => (Bytes::from(data), None),
-                Either::Right((data, extend_data)) => (Bytes::from(data), Some(extend_data)),
+            let (mut data, extend_data) = match response {
+                Either::Left(data) => (data, None),
+                Either::Right((data, extend_data)) => (data, Some(extend_data)),
             };
             let extend_len = extend_data.as_ref().map(|v| v.len()).unwrap_or(0);
             if data.len() >= FUSE_OUT_HEADER_SIZE {
@@ -776,9 +804,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 let header_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
                 if header_len != actual_len {
                     let len_bytes = (actual_len as u32).to_le_bytes();
-                    let mut v = data.to_vec();
-                    v[0..4].copy_from_slice(&len_bytes);
-                    data = Bytes::from(v);
+                    data[0..4].copy_from_slice(&len_bytes);
                     warn!(
                         header_len,
                         actual_len, "adjusted fuse reply length to match payload"
@@ -796,45 +822,29 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 None
             };
 
-            // Retry loop: keep writing this reply until it succeeds, the kernel
-            // forgets the request (NotFound), or the channel is closed.
-            let mut retry_delay_us: u64 = 100; // start at 100μs
-            loop {
-                let ((ret_data, ret_ext), result) =
-                    fuse_connection.write_vectored(data, extend_data).await;
-                match result {
-                    Ok(_) => break,
-                    Err(err) => {
-                        data = ret_data;
-                        extend_data = ret_ext;
-                        use std::io::ErrorKind;
-                        if err.kind() == ErrorKind::NotFound {
-                            warn!(
-                                "may reply interrupted fuse request, ignore this error {}",
-                                err
-                            );
-                            break;
-                        }
-                        if let Some((len, err_code, unique)) = reply_header {
-                            warn!(
-                                error = %err,
-                                reply_len = len,
-                                reply_error = err_code,
-                                unique,
-                                "reply fuse write error, retrying"
-                            );
-                        } else {
-                            warn!("reply fuse write error, retrying: {}", err);
-                        }
-                        #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
-                        tokio::time::sleep(std::time::Duration::from_micros(retry_delay_us)).await;
-                        #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
-                        async_io::Timer::after(std::time::Duration::from_micros(retry_delay_us))
-                            .await;
-                        // Exponential backoff capped at 10ms
-                        retry_delay_us = (retry_delay_us * 2).min(10_000);
-                    }
+            if let Err(err) = fuse_connection.write_vectored(data, extend_data).await.1 {
+                if is_ignorable_reply_error(&err) {
+                    warn!(
+                        "may reply interrupted fuse request, ignore this error {}",
+                        err
+                    );
+
+                    continue;
                 }
+
+                if let Some((len, err_code, unique)) = reply_header {
+                    error!(
+                        error = %err,
+                        reply_len = len,
+                        reply_error = err_code,
+                        unique,
+                        "reply fuse failed"
+                    );
+                } else {
+                    error!("reply fuse failed {}", err);
+                }
+
+                return Err(err);
             }
         }
 
@@ -880,7 +890,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Err(err) => {
                 debug!("receive unknown opcode {}", err.0);
 
-                reply_error_in_place(libc::ENOSYS.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::ENOSYS.into(), request, &self.response_sender).await;
 
                 return Err(IoError::other(format!("receive unknown opcode {}", err.0)));
             }
@@ -1018,7 +1028,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let buffer_size = (max_write + FUSE_WRITE_IN_SIZE).max(FUSE_MIN_READ_BUFFER_SIZE);
         debug!(buffer_size, "buffer size calculated");
 
-        // Create buffers for main loop (reused each iteration in legacy mode)
+        // Create buffers for main loop (reused each iteration)
         let mut header_buffer = vec![0; FUSE_IN_HEADER_SIZE];
         let mut data_buffer = AlignedBuffer::try_new(buffer_size).map_err(IoError::other)?;
 
@@ -1066,8 +1076,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 Err(err) => {
                     debug!("receive unknown opcode {}", err.0);
 
-                    reply_error_in_place(libc::ENOSYS.into(), request, self.response_sender())
-                        .await;
+                    reply_error_in_place(libc::ENOSYS.into(), request, &self.response_sender).await;
 
                     continue;
                 }
@@ -1080,46 +1089,10 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             let data_size = in_header.len as usize - FUSE_IN_HEADER_SIZE;
             let data_ref = &data_buffer[..data_size];
 
-            if self.workers.is_some() {
-                match opcode {
-                    fuse_opcode::FUSE_INIT => {
-                        warn!("duplicated fuse init request");
-                        self.handle_init(request, data_ref, &fuse_connection, &fs)
-                            .await?;
-                        continue;
-                    }
-                    fuse_opcode::FUSE_DESTROY => {
-                        debug!("receive fuse destroy");
-                        fs.destroy(request).await;
-                        debug!("fuse destroyed");
-                        return Ok(());
-                    }
-                    fuse_opcode::FUSE_FORGET => {
-                        self.handle_forget(request, in_header, data_ref, &fs).await;
-                        continue;
-                    }
-                    fuse_opcode::FUSE_INTERRUPT => {
-                        self.handle_interrupt(request, data_ref, &fs).await;
-                        continue;
-                    }
-                    fuse_opcode::FUSE_NOTIFY_REPLY => {
-                        self.handle_notify_reply(request, in_header, data_ref, &fs)
-                            .await;
-                        continue;
-                    }
-                    fuse_opcode::FUSE_BATCH_FORGET => {
-                        self.handle_batch_forget(request, in_header, data_ref, &fs)
-                            .await;
-                        continue;
-                    }
-                    _ => {}
-                }
-
-                let workers = self.workers.as_ref().expect("workers checked above");
+            if let Some(workers) = &self.workers {
                 let unique = request.unique;
                 let opcode_raw = in_header.opcode;
-                // Copy request payload into Bytes for worker.
-                // We must copy because data_buffer is reused for the next read.
+                // Keep the shared read buffer for reuse; copy only request payload
                 let body_bytes = Bytes::copy_from_slice(data_ref);
 
                 let lite = InHeaderLite {
@@ -1138,13 +1111,15 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         self.inflight_notify.clone(),
                     ))
                 };
-                workers.submit(WorkItem {
-                    unique,
-                    opcode: opcode_raw,
-                    in_header: lite,
-                    data: body_bytes,
-                    _inflight_guard: inflight_guard,
-                });
+                workers
+                    .submit(WorkItem {
+                        unique,
+                        opcode: opcode_raw,
+                        in_header: lite,
+                        data: body_bytes,
+                        _inflight_guard: inflight_guard,
+                    })
+                    .await;
             } else {
                 // Will concurrency in a single-threaded context cause disorder in the sequence of operations on a single file?
                 match opcode {
@@ -1324,9 +1299,25 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         self.handle_bmap(request, in_header, data_ref, &fs).await;
                     }
 
-                    fuse_opcode::FUSE_IOCTL => {
-                        self.handle_ioctl(request, in_header, data_ref, &fs).await;
-                    }
+                    /*fuse_opcode::FUSE_IOCTL => {
+                        let mut resp_sender = self.response_sender.clone();
+
+                        let ioctl_in = match get_bincode_config().deserialize::<fuse_ioctl_in>(data) {
+                            Err(err) => {
+                                error!("deserialize fuse_ioctl_in failed {}", err);
+
+                                 reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
+
+                                continue;
+                            }
+
+                            Ok(ioctl_in) => ioctl_in,
+                        };
+
+                        let ioctl_data = (&data[FUSE_IOCTL_IN_SIZE..]).to_vec();
+
+                        let fs = fs.clone();
+                    }*/
                     fuse_opcode::FUSE_POLL => {
                         self.handle_poll(request, in_header, data_ref, &fs).await;
                     }
@@ -1403,7 +1394,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     .expect("won't happened");
 
                 if let Err(err) = fuse_connection
-                    .write_vectored(Bytes::from(init_out_header_data), None)
+                    .write_vectored::<_, Vec<u8>>(init_out_header_data, None)
                     .await
                     .1
                 {
@@ -1502,19 +1493,24 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             reply_flags |= FUSE_AUTO_INVAL_DATA;
         }
 
-        if init_in.flags & FUSE_DO_READDIRPLUS > 0 || self.mount_options.force_readdir_plus {
+        let (readdirplus_flags, force_readdir_plus_active) =
+            negotiate_readdirplus(init_in.flags, self.mount_options.force_readdir_plus);
+        if readdirplus_flags & FUSE_DO_READDIRPLUS > 0 {
             debug!("enable FUSE_DO_READDIRPLUS");
-
-            reply_flags |= FUSE_DO_READDIRPLUS;
         }
 
-        if init_in.flags & FUSE_READDIRPLUS_AUTO > 0 && !self.mount_options.force_readdir_plus {
+        if readdirplus_flags & FUSE_READDIRPLUS_AUTO > 0 {
             debug!("enable FUSE_READDIRPLUS_AUTO");
-
-            reply_flags |= FUSE_READDIRPLUS_AUTO;
         }
 
-        if init_in.flags & FUSE_ASYNC_DIO > 0 && self.mount_options.async_dio {
+        if self.mount_options.force_readdir_plus && !force_readdir_plus_active {
+            warn!("force_readdir_plus requested but kernel did not advertise FUSE_DO_READDIRPLUS");
+        }
+
+        reply_flags |= readdirplus_flags;
+        self.force_readdir_plus_active = force_readdir_plus_active;
+
+        if init_in.flags & FUSE_ASYNC_DIO > 0 {
             debug!("enable FUSE_ASYNC_DIO");
 
             reply_flags |= FUSE_ASYNC_DIO;
@@ -1617,7 +1613,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     .expect("won't happened");
 
                 if let Err(err) = fuse_connection
-                    .write_vectored(Bytes::from(init_out_header_data), None)
+                    .write_vectored::<_, Vec<u8>>(init_out_header_data, None)
                     .await
                     .1
                 {
@@ -1640,30 +1636,18 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             init_reply.max_write
         };
 
-        let max_background = u16::try_from(self.max_background)
-            .unwrap_or(u16::MAX)
-            .max(1);
-        // Use max_background as the congestion threshold so the kernel never
-        // throttles writeback.  With the default 3/4 ratio the kernel stops
-        // sending FUSE_WRITE requests when 75% of background slots are in use,
-        // which can deadlock mmap-heavy workloads (e.g. generic/013 fsstress)
-        // if reply processing is slower than the kernel's dirty-page rate.
-        let congestion_threshold = max_background;
-
         let init_out = fuse_init_out {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_KERNEL_MINOR_VERSION,
             max_readahead,
             flags: reply_flags,
-            max_background,
-            congestion_threshold,
+            max_background: DEFAULT_MAX_BACKGROUND,
+            congestion_threshold: DEFAULT_CONGESTION_THRESHOLD,
             max_write: max_write.get(),
             time_gran: DEFAULT_TIME_GRAN,
             max_pages: DEFAULT_MAX_PAGES,
             map_alignment: DEFAULT_MAP_ALIGNMENT,
-            flags2: 0x1,  // FUSE_HAS_MAX_READ — tells kernel max_read is valid
-            max_read: 4 * 1024 * 1024,
-            unused: [0; 6],
+            unused: [0; 8],
         };
 
         debug!("fuse init out {:?}", init_out);
@@ -1684,7 +1668,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             .expect("won't happened");
 
         if let Err(err) = fuse_connection
-            .write_vectored(Bytes::from(data), None)
+            .write_vectored::<_, Vec<u8>>(data, None)
             .await
             .1
         {
@@ -1710,7 +1694,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             None => {
                 error!("lookup body has no null, request unique {}", request.unique);
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -1718,7 +1702,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Some(index) => OsString::from_vec(data[..index].to_vec()),
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_lookup"), async move {
@@ -1819,7 +1803,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -1827,7 +1811,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(getattr_in) => getattr_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_getattr"), async move {
@@ -1904,7 +1888,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -1912,7 +1896,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(setattr_in) => setattr_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_setattr"), async move {
@@ -1970,7 +1954,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
     #[instrument(skip(self, fs))]
     async fn handle_readlink(&mut self, request: Request, in_header: fuse_in_header, fs: &Arc<FS>) {
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_readlink"), async move {
@@ -2027,7 +2011,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             None => {
                 error!("symlink has no null, request unique {}", request.unique);
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2044,7 +2028,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2052,7 +2036,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Some(index) => OsString::from_vec(data[..index].to_vec()),
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_symlink"), async move {
@@ -2118,7 +2102,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2135,7 +2119,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2143,7 +2127,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Some(index) => OsString::from_vec(data[..index].to_vec()),
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_mknod"), async move {
@@ -2205,7 +2189,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2222,7 +2206,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2230,7 +2214,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Some(index) => OsString::from_vec(data[..index].to_vec()),
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_mkdir"), async move {
@@ -2292,7 +2276,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2300,7 +2284,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Some(index) => OsString::from_vec(data[..index].to_vec()),
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_unlink"), async move {
@@ -2344,7 +2328,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2352,7 +2336,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Some(index) => OsString::from_vec(data[..index].to_vec()),
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_rmdir"), async move {
@@ -2396,7 +2380,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2413,7 +2397,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2430,7 +2414,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2438,7 +2422,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Some(index) => OsString::from_vec(data[..index].to_vec()),
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_rename"), async move {
@@ -2491,7 +2475,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2508,7 +2492,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2516,7 +2500,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Some(index) => OsString::from_vec(data[..index].to_vec()),
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_link"), async move {
@@ -2572,7 +2556,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2580,7 +2564,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(open_in) => open_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
         let direct_io = self.mount_options.direct_io;
 
@@ -2637,7 +2621,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2645,7 +2629,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(read_in) => read_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_read"), async move {
@@ -2710,7 +2694,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2723,14 +2707,14 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         if write_in.size as usize != data.len() {
             error!("fuse_write_in body len is invalid");
 
-            reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+            reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
             return;
         }
 
         let data = data.to_vec();
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_write"), async move {
@@ -2802,7 +2786,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
     #[instrument(skip(self, fs))]
     async fn handle_statfs(&mut self, request: Request, in_header: fuse_in_header, fs: &Arc<FS>) {
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_statfs"), async move {
@@ -2857,7 +2841,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2865,7 +2849,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(release_in) => release_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_release"), async move {
@@ -2926,7 +2910,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -2934,7 +2918,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(fsync_in) => fsync_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_fsync"), async move {
@@ -2983,7 +2967,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3000,7 +2984,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3013,20 +2997,16 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         // setxattr "size" field specifies size of only "Value" part of data
         if setxattr_in.size as usize != data.len() {
             error!(
-                "fuse_setxattr_in value field data length is not right, request unique {} setxattr_in.size={} data.len={}",
-                request.unique,
-                setxattr_in.size,
-                data.len()
-            );
+                "fuse_setxattr_in value field data length is not right, request unique {} setxattr_in.size={} data.len={}", request.unique, setxattr_in.size, data.len());
 
-            reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+            reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
             return;
         }
 
         let data = data.to_vec();
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_setxattr"), async move {
@@ -3081,7 +3061,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3095,7 +3075,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             None => {
                 error!("fuse_getxattr_in body has no null {}", request.unique);
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3103,7 +3083,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Some(index) => OsString::from_vec(data[..index].to_vec()),
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_getxattr"), async move {
@@ -3197,7 +3177,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3205,7 +3185,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(listxattr_in) => listxattr_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_listxattr"), async move {
@@ -3287,7 +3267,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3295,7 +3275,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Some(index) => OsString::from_vec(data[..index].to_vec()),
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_removexattr"), async move {
@@ -3340,7 +3320,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3348,7 +3328,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(flush_in) => flush_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_flush"), async move {
@@ -3395,7 +3375,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3403,7 +3383,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(open_in) => open_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_opendir"), async move {
@@ -3451,8 +3431,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         data: &[u8],
         fs: &Arc<FS>,
     ) {
-        if self.mount_options.force_readdir_plus {
-            reply_error_in_place(libc::ENOSYS.into(), request, self.response_sender()).await;
+        if self.force_readdir_plus_active {
+            reply_error_in_place(libc::ENOSYS.into(), request, &self.response_sender).await;
 
             return;
         }
@@ -3464,7 +3444,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3472,7 +3452,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(read_in) => read_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_readdir"), async move {
@@ -3575,7 +3555,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3583,7 +3563,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(release_in) => release_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_releasedir"), async move {
@@ -3630,7 +3610,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3638,7 +3618,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(fsync_in) => fsync_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_fsyncdir"), async move {
@@ -3688,7 +3668,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3696,7 +3676,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(getlk_in) => getlk_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_getlk"), async move {
@@ -3771,7 +3751,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     opcode, err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3779,7 +3759,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(setlk_in) => setlk_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_setlk"), async move {
@@ -3836,7 +3816,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3844,7 +3824,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(access_in) => access_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_access"), async move {
@@ -3891,7 +3871,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3908,7 +3888,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3916,7 +3896,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Some(index) => OsString::from_vec(data[..index].to_vec()),
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
         let direct_io = self.mount_options.direct_io;
 
@@ -3980,7 +3960,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -3988,7 +3968,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(interrupt_in) => interrupt_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_interrupt"), async move {
@@ -4032,7 +4012,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -4040,7 +4020,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(bmap_in) => bmap_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_bmap"), async move {
@@ -4084,100 +4064,6 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     }
 
     #[instrument(skip(self, data, fs))]
-    async fn handle_ioctl(
-        &mut self,
-        request: Request,
-        in_header: fuse_in_header,
-        data: &[u8],
-        fs: &Arc<FS>,
-    ) {
-        let ioctl_in = match get_bincode_config().deserialize::<fuse_ioctl_in>(data) {
-            Err(err) => {
-                error!(
-                    "deserialize fuse_ioctl_in failed {}, request unique {}",
-                    err, request.unique
-                );
-
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
-
-                return;
-            }
-
-            Ok(ioctl_in) => ioctl_in,
-        };
-
-        let payload_end = FUSE_IOCTL_IN_SIZE.saturating_add(ioctl_in.in_size as usize);
-        if data.len() < payload_end {
-            reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
-            return;
-        }
-        let ioctl_data = data[FUSE_IOCTL_IN_SIZE..payload_end].to_vec();
-
-        let mut resp_sender = self.response_sender().clone();
-        let fs = fs.clone();
-
-        spawn(debug_span!("fuse_ioctl"), async move {
-            debug!(
-                "ioctl unique {} inode {} fh {} flags {} cmd {} arg {} in_size {} out_size {}",
-                request.unique,
-                in_header.nodeid,
-                ioctl_in.fh,
-                ioctl_in.flags,
-                ioctl_in.cmd,
-                ioctl_in.arg,
-                ioctl_in.in_size,
-                ioctl_in.out_size
-            );
-
-            let reply_ioctl = match fs
-                .ioctl(
-                    request,
-                    in_header.nodeid,
-                    ioctl_in.fh,
-                    ioctl_in.flags,
-                    ioctl_in.cmd,
-                    ioctl_in.arg,
-                    &ioctl_data,
-                    ioctl_in.out_size,
-                )
-                .await
-            {
-                Err(err) => {
-                    reply_error_in_place(err, request, resp_sender).await;
-                    return;
-                }
-
-                Ok(reply_ioctl) => reply_ioctl,
-            };
-
-            let ioctl_out = fuse_ioctl_out {
-                result: reply_ioctl.result,
-                flags: reply_ioctl.flags,
-                in_iovs: reply_ioctl.in_iovs,
-                out_iovs: reply_ioctl.out_iovs,
-            };
-
-            let out_len = FUSE_OUT_HEADER_SIZE + FUSE_IOCTL_OUT_SIZE + reply_ioctl.data.len();
-            let out_header = fuse_out_header {
-                len: out_len as u32,
-                error: 0,
-                unique: request.unique,
-            };
-
-            let mut payload = Vec::with_capacity(out_len);
-            get_bincode_config()
-                .serialize_into(&mut payload, &out_header)
-                .expect("won't happened");
-            get_bincode_config()
-                .serialize_into(&mut payload, &ioctl_out)
-                .expect("won't happened");
-            payload.extend_from_slice(&reply_ioctl.data);
-
-            let _ = resp_sender.send(Either::Left(payload)).await;
-        });
-    }
-
-    #[instrument(skip(self, data, fs))]
     async fn handle_poll(
         &mut self,
         request: Request,
@@ -4192,7 +4078,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -4200,7 +4086,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(poll_in) => poll_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         let notify = self.get_notify();
@@ -4267,7 +4153,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         mut data: &[u8],
         fs: &Arc<FS>,
     ) {
-        let resp_sender = self.response_sender().clone();
+        let resp_sender = self.response_sender.clone();
 
         let notify_retrieve_in =
             match get_bincode_config().deserialize::<fuse_notify_retrieve_in>(data) {
@@ -4345,10 +4231,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         while data.len() >= FUSE_FORGET_ONE_SIZE {
             match get_bincode_config().deserialize::<fuse_forget_one>(data) {
                 Err(err) => {
-                    error!(
-                        "deserialize fuse_batch_forget_in body fuse_forget_one failed {}, request unique {}",
-                        err, request.unique
-                    );
+                    error!("deserialize fuse_batch_forget_in body fuse_forget_one failed {}, request unique {}", err, request.unique);
 
                     // no need to reply
                     return;
@@ -4400,7 +4283,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -4408,7 +4291,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(fallocate_in) => fallocate_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_fallocate"), async move {
@@ -4462,7 +4345,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -4470,7 +4353,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Ok(readdirplus_in) => readdirplus_in,
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_readdirplus"), async move {
@@ -4592,7 +4475,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -4609,7 +4492,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -4626,7 +4509,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -4634,7 +4517,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             Some(index) => OsString::from_vec(data[..index].to_vec()),
         };
 
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
         let fs = fs.clone();
 
         spawn(debug_span!("fuse_rename2"), async move {
@@ -4686,7 +4569,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         data: &[u8],
         fs: &Arc<FS>,
     ) {
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
 
         let lseek_in = match get_bincode_config().deserialize::<fuse_lseek_in>(data) {
             Err(err) => {
@@ -4695,7 +4578,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     err, request.unique
                 );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
                 return;
             }
@@ -4759,24 +4642,23 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         data: &[u8],
         fs: &Arc<FS>,
     ) {
-        let mut resp_sender = self.response_sender().clone();
+        let mut resp_sender = self.response_sender.clone();
 
-        let copy_file_range_in = match get_bincode_config()
-            .deserialize::<fuse_copy_file_range_in>(data)
-        {
-            Err(err) => {
-                error!(
-                    "deserialize fuse_copy_file_range_in failed {}, request unique {}",
-                    err, request.unique
-                );
+        let copy_file_range_in =
+            match get_bincode_config().deserialize::<fuse_copy_file_range_in>(data) {
+                Err(err) => {
+                    error!(
+                        "deserialize fuse_copy_file_range_in failed {}, request unique {}",
+                        err, request.unique
+                    );
 
-                reply_error_in_place(libc::EINVAL.into(), request, self.response_sender()).await;
+                    reply_error_in_place(libc::EINVAL.into(), request, &self.response_sender).await;
 
-                return;
-            }
+                    return;
+                }
 
-            Ok(copy_file_range_in) => copy_file_range_in,
-        };
+                Ok(copy_file_range_in) => copy_file_range_in,
+            };
 
         let fs = fs.clone();
 

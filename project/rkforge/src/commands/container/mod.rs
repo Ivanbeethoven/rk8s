@@ -221,6 +221,8 @@ impl ContainerRunner {
                 image: "".to_string(),
                 ports: vec![],
                 args: vec![],
+                tty: false,
+                gpus: None,
                 resources: None,
                 liveness_probe: None,
                 readiness_probe: None,
@@ -230,7 +232,6 @@ impl ContainerRunner {
                 volume_mounts: None,
                 command: None,
                 working_dir: None,
-                tty: false,
             },
             config: None,
             container_id: container_id.to_string(),
@@ -399,8 +400,12 @@ impl ContainerRunner {
         process.set_capabilities(Some(capabilities));
         process.set_terminal(Some(false));
         process.set_args(Some(config.args.clone()));
-        // TODO: env
-        // process.set_env(Some(config.envs));
+        let envs: Vec<String> = config
+            .envs
+            .iter()
+            .map(|kv| format!("{}={}", kv.key, kv.value))
+            .collect();
+        process.set_env(Some(envs));
 
         spec.set_process(Some(process));
 
@@ -629,7 +634,7 @@ pub fn remove_container(root_path: &Path, state: &State) -> Result<()> {
     };
     let pid = state
         .pid
-        .ok_or(anyhow!("failed to get pid of container {}", &state.id))?;
+        .ok_or(anyhow!("failed to get pid of container {}", state.id))?;
     // delete the network
     remove_container_network(Pid::from_raw(pid), &state.id)?;
     delete(delete_args, root_path.to_path_buf())?;
@@ -847,6 +852,8 @@ mod test {
             image: bundle_path,
             ports: vec![],
             args: vec!["/bin/echo".to_string(), "hi".to_string()],
+            tty: false,
+            gpus: None,
             resources: None,
             liveness_probe: None,
             readiness_probe: None,
@@ -856,7 +863,6 @@ mod test {
             volume_mounts: None,
             command: None,
             working_dir: None,
-            tty: false,
         };
         let runner = ContainerRunner::from_spec(spec.clone(), None).unwrap();
         assert_eq!(runner.container_id, "demo1");
@@ -881,6 +887,8 @@ mod test {
                 image: bundle_path,
                 ports: vec![],
                 args: vec![],
+                tty: false,
+                gpus: None,
                 resources: None,
                 liveness_probe: None,
                 readiness_probe: None,
@@ -890,7 +898,6 @@ mod test {
                 volume_mounts: None,
                 command: None,
                 working_dir: None,
-                tty: false,
             },
             None,
         )

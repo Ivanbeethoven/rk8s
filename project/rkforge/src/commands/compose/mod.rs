@@ -255,6 +255,8 @@ impl ComposeManager {
                     image: srv.image.clone(),
                     ports: container_ports,
                     args: srv.command.clone(),
+                    tty: false,
+                    gpus: None,
                     resources: None,
                     liveness_probe: None,
                     readiness_probe: None,
@@ -264,7 +266,6 @@ impl ComposeManager {
                     volume_mounts: None,
                     command: None,
                     working_dir: None,
-                    tty: false,
                 };
 
                 // handle the services volume name
@@ -431,7 +432,7 @@ impl ComposeManager {
                 } else {
                     format!(
                         "{}_{}",
-                        &compose_spec
+                        compose_spec
                             .name
                             .clone()
                             .unwrap_or(String::from("compose_default")),

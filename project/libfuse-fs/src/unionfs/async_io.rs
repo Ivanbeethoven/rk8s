@@ -1,8 +1,8 @@
 use super::utils;
-use super::{CachePolicy, HandleData, Inode, OverlayFs, RealHandle};
+use super::{CachePolicy, HandleData, Inode, OverlayFs, RealHandle, is_recoverable_lookup_miss};
 use crate::util::open_options::OpenOptions;
-use rfuse3::raw::prelude::*;
-use rfuse3::*;
+use asyncfuse::raw::prelude::*;
+use asyncfuse::*;
 use std::ffi::OsStr;
 use std::io::Error;
 use std::io::ErrorKind;
@@ -10,7 +10,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{error, info, warn};
 use tracing::trace;
 
 impl Filesystem for OverlayFs {
@@ -19,14 +19,11 @@ impl Filesystem for OverlayFs {
         if self.config.do_import {
             self.import().await?;
         }
-        #[cfg(target_os = "linux")]
-        {
-            for layer in self.lower_layers.iter() {
-                layer.init(_req).await?;
-            }
-            if let Some(upper) = &self.upper_layer {
-                upper.init(_req).await?;
-            }
+        for layer in self.lower_layers.iter() {
+            layer.init(_req).await?;
+        }
+        if let Some(upper) = &self.upper_layer {
+            upper.init(_req).await?;
         }
         if !self.config.do_import || self.config.writeback {
             self.writeback.store(true, Ordering::Relaxed);
@@ -84,7 +81,7 @@ impl Filesystem for OverlayFs {
         req: Request,
         inode: Inode,
         fh: Option<u64>,
-        flags: u32,
+        _flags: u32,
     ) -> Result<ReplyAttr> {
         if !self.no_open.load(Ordering::Relaxed)
             && let Some(h) = fh
@@ -103,8 +100,10 @@ impl Filesystem for OverlayFs {
         }
 
         let node: Arc<super::OverlayInode> = self.lookup_node(req, inode, "").await?;
-        let (layer, _, lower_inode) = node.first_layer_inode().await;
-        let mut re = layer.getattr(req, lower_inode, None, flags).await?;
+        if !node.whiteout.load(Ordering::Relaxed) && node.in_upper_layer().await {
+            let _ = self.materialize_upper_inode_for_node(req, &node).await?;
+        }
+        let mut re = self.stat_node_with_upper_fallback(req, &node).await?;
         re.attr.ino = inode;
         Ok(re)
     }
@@ -139,7 +138,7 @@ impl Filesystem for OverlayFs {
                             req,
                             rhd.inode,
                             Some(rhd.handle.load(Ordering::Relaxed)),
-                            set_attr,
+                            set_attr.clone(),
                         )
                         .await?;
                     rep.attr.ino = inode;
@@ -150,13 +149,34 @@ impl Filesystem for OverlayFs {
 
         let mut node = self.lookup_node(req, inode, "").await?;
 
-        if !node.in_upper_layer().await {
+        if node.in_upper_layer().await {
+            let _ = self.materialize_upper_inode_for_node(req, &node).await?;
+        } else if self
+            .materialize_upper_inode_for_node(req, &node)
+            .await?
+            .is_none()
+        {
             node = self.copy_node_up(req, node.clone()).await?
         }
 
         let (layer, _, real_inode) = node.first_layer_inode().await;
-        // layer.setattr(req, real_inode, None, set_attr).await
-        let mut rep = layer.setattr(req, real_inode, None, set_attr).await?;
+        let mut rep = match layer.setattr(req, real_inode, None, set_attr.clone()).await {
+            Ok(rep) => rep,
+            Err(err) => {
+                let ioerror: Error = err.into();
+                if is_recoverable_lookup_miss(&ioerror)
+                    && self
+                        .materialize_upper_inode_for_node(req, &node)
+                        .await?
+                        .is_some()
+                {
+                    let (layer, _, real_inode) = node.first_layer_inode().await;
+                    layer.setattr(req, real_inode, None, set_attr).await?
+                } else {
+                    return Err(ioerror.into());
+                }
+            }
+        };
         rep.attr.ino = inode;
         Ok(rep)
     }
@@ -215,11 +235,30 @@ impl Filesystem for OverlayFs {
             return Err(Error::from_raw_os_error(libc::ENOENT).into());
         }
 
-        self.do_mknod(req, &pnode, sname.as_str(), mode, rdev, 0)
-            .await?;
-        self.do_lookup(req, parent, sname.as_str())
+        if let Err(err) = self
+            .do_mknod(req, &pnode, sname.as_str(), mode, rdev, 0)
             .await
-            .map_err(|e| e.into())
+        {
+            tracing::error!(
+                "unionfs mknod failed in do_mknod: parent={} name={:?}: {}",
+                parent,
+                name,
+                err
+            );
+            return Err(err.into());
+        }
+        match self.do_lookup(req, parent, sname.as_str()).await {
+            Ok(entry) => Ok(entry),
+            Err(err) => {
+                tracing::error!(
+                    "unionfs mknod failed in post-mknod lookup: parent={} name={:?}: {}",
+                    parent,
+                    name,
+                    err
+                );
+                Err(err.into())
+            }
+        }
     }
 
     /// create a directory.
@@ -291,7 +330,9 @@ impl Filesystem for OverlayFs {
         if newpnode.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT).into());
         }
-        let new_name = new_name.to_str().unwrap();
+        let new_name = new_name
+            .to_str()
+            .ok_or_else(|| Error::from_raw_os_error(libc::EINVAL))?;
         // trace!(
         //     "LINK: inode: {}, new_parent: {}, trying to do_link: src_inode: {}, newpnode: {}",
         //     inode, new_parent, node.inode, newpnode.inode
@@ -354,9 +395,51 @@ impl Filesystem for OverlayFs {
             // copy up to upper layer
             self.copy_node_up(req, node.clone()).await?;
         }
+        if node.in_upper_layer().await {
+            let _ = self.materialize_upper_inode_for_node(req, &node).await?;
+        }
 
         // assign a handle in overlayfs and open it
-        let (_l, h) = node.open(req, flags as u32, 0).await?;
+        let (_l, h) = match node.open(req, flags as u32, 0).await {
+            Ok(opened) => opened,
+            Err(err) if is_recoverable_lookup_miss(&err) => {
+                if self
+                    .materialize_upper_inode_for_node(req, &node)
+                    .await?
+                    .is_some()
+                {
+                    match node.open(req, flags as u32, 0).await {
+                        Ok(opened) => opened,
+                        Err(retry_err) => {
+                            tracing::error!(
+                                "unionfs open failed after rematerialize: inode={} flags={}: {}",
+                                inode,
+                                flags,
+                                retry_err
+                            );
+                            return Err(retry_err.into());
+                        }
+                    }
+                } else {
+                    tracing::error!(
+                        "unionfs open failed on stale/missing inode without upper fallback: inode={} flags={}: {}",
+                        inode,
+                        flags,
+                        err
+                    );
+                    return Err(err.into());
+                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    "unionfs open failed: inode={} flags={}: {}",
+                    inode,
+                    flags,
+                    err
+                );
+                return Err(err.into());
+            }
+        };
 
         let hd = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let (layer, in_upper_layer, inode) = node.first_layer_inode().await;
@@ -369,6 +452,7 @@ impl Filesystem for OverlayFs {
                 handle: AtomicU64::new(h.fh),
             }),
             dir_snapshot: Mutex::new(None),
+            ephemeral: false,
         };
 
         self.handles.lock().await.insert(hd, Arc::new(handle_data));
@@ -402,10 +486,16 @@ impl Filesystem for OverlayFs {
     ) -> Result<ReplyData> {
         let data = self.get_data(req, Some(fh), inode, 0).await?;
 
-        match data.real_handle {
-            None => Err(Error::from_raw_os_error(libc::ENOENT).into()),
+        let result = match data.real_handle {
+            None => {
+                error!(
+                    "unionfs read: no real_handle for inode {inode} fh {fh} — cannot read"
+                );
+                Err(Error::from_raw_os_error(libc::ENOENT).into())
+            }
             Some(ref hd) => {
-                hd.layer
+                let result = hd
+                    .layer
                     .read(
                         req,
                         hd.inode,
@@ -413,9 +503,28 @@ impl Filesystem for OverlayFs {
                         offset,
                         size,
                     )
-                    .await
+                    .await;
+                if let Err(e) = &result {
+                    error!(
+                        "unionfs read: layer read failed inode {inode} layer_inode {} fh {}: {e}",
+                        hd.inode,
+                        hd.handle.load(Ordering::Relaxed)
+                    );
+                }
+                result
+            }
+        };
+        // Ephemeral (reconstructed) handles own a layer fd the kernel will
+        // never RELEASE — drop it once the I/O completes.
+        if data.ephemeral {
+            if let Some(ref hd) = data.real_handle {
+                let _ = hd
+                    .layer
+                    .release(req, hd.inode, hd.handle.load(Ordering::Relaxed), 0, 0, true)
+                    .await;
             }
         }
+        result
     }
 
     /// write data. Write should return exactly the number of bytes requested except on error. An
@@ -438,10 +547,16 @@ impl Filesystem for OverlayFs {
     ) -> Result<ReplyWrite> {
         let handle_data: Arc<HandleData> = self.get_data(req, Some(fh), inode, flags).await?;
 
-        match handle_data.real_handle {
-            None => Err(Error::from_raw_os_error(libc::ENOENT).into()),
+        let result = match handle_data.real_handle {
+            None => {
+                error!(
+                    "unionfs write: no real_handle for inode {inode} fh {fh} — cannot write"
+                );
+                Err(Error::from_raw_os_error(libc::ENOENT).into())
+            }
             Some(ref hd) => {
-                hd.layer
+                let result = hd
+                    .layer
                     .write(
                         req,
                         hd.inode,
@@ -451,9 +566,28 @@ impl Filesystem for OverlayFs {
                         write_flags,
                         flags,
                     )
-                    .await
+                    .await;
+                if let Err(e) = &result {
+                    error!(
+                        "unionfs write: layer write failed inode {inode} layer_inode {} fh {}: {e}",
+                        hd.inode,
+                        hd.handle.load(Ordering::Relaxed)
+                    );
+                }
+                result
+            }
+        };
+        // Ephemeral (reconstructed) handles own a layer fd the kernel will
+        // never RELEASE — drop it once the I/O completes.
+        if handle_data.ephemeral {
+            if let Some(ref hd) = handle_data.real_handle {
+                let _ = hd
+                    .layer
+                    .release(req, hd.inode, hd.handle.load(Ordering::Relaxed), 0, 0, true)
+                    .await;
             }
         }
+        result
     }
 
     /// Copy a range of data from one file to another. This can improve performance because it
@@ -738,6 +872,7 @@ impl Filesystem for OverlayFs {
                     handle: AtomicU64::new(reply.fh),
                 }),
                 dir_snapshot: Mutex::new(None),
+                ephemeral: false,
             }),
         );
 
@@ -948,8 +1083,24 @@ impl Filesystem for OverlayFs {
             return Err(Error::from_raw_os_error(libc::ENOENT).into());
         }
 
-        let (layer, real_inode) = self.find_real_inode(inode).await?;
-        layer.access(req, real_inode, mask).await
+        let (layer, _, real_inode) = node.first_layer_inode().await;
+        match layer.access(req, real_inode, mask).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let ioerror: Error = err.into();
+                if is_recoverable_lookup_miss(&ioerror)
+                    && self
+                        .materialize_upper_inode_for_node(req, &node)
+                        .await?
+                        .is_some()
+                {
+                    let (layer, _, real_inode) = node.first_layer_inode().await;
+                    layer.access(req, real_inode, mask).await
+                } else {
+                    Err(ioerror.into())
+                }
+            }
+        }
     }
 
     /// create and open a file. If the file does not exist, first create it with the specified
@@ -999,12 +1150,44 @@ impl Filesystem for OverlayFs {
             }
         }
 
-        let final_handle = self
+        let name_str = name
+            .to_str()
+            .ok_or_else(|| Error::from_raw_os_error(libc::EINVAL))?;
+        let final_handle = match self
             .do_create(req, &pnode, name, mode, flags.try_into().unwrap())
-            .await?;
-        let entry = self.do_lookup(req, parent, name.to_str().unwrap()).await?;
-        let fh = final_handle
-            .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "Handle not found"))?;
+            .await
+        {
+            Ok(handle) => handle,
+            Err(err) => {
+                tracing::error!(
+                    "unionfs create failed in do_create: parent={} name={:?}: {}",
+                    parent,
+                    name,
+                    err
+                );
+                return Err(err.into());
+            }
+        };
+        let entry = match self.do_lookup(req, parent, name_str).await {
+            Ok(entry) => entry,
+            Err(err) => {
+                tracing::error!(
+                    "unionfs create failed in post-create lookup: parent={} name={:?}: {}",
+                    parent,
+                    name,
+                    err
+                );
+                return Err(err.into());
+            }
+        };
+        let fh = final_handle.ok_or_else(|| {
+            tracing::error!(
+                "unionfs create did not return a handle: parent={} name={:?}",
+                parent,
+                name
+            );
+            std::io::Error::new(ErrorKind::NotFound, "Handle not found")
+        })?;
 
         let mut opts = OpenOptions::empty();
         match self.config.cache_policy {
@@ -1179,7 +1362,7 @@ impl Filesystem for OverlayFs {
 mod tests {
     use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
-    use rfuse3::{MountOptions, raw::Session};
+    use asyncfuse::{MountOptions, raw::Session};
     use tokio::signal;
     use tracing_subscriber::EnvFilter;
 
@@ -1188,7 +1371,7 @@ mod tests {
         passthrough::{PassthroughArgs, new_passthroughfs_layer},
         unionfs::{OverlayFs, config::Config},
     };
-    use rfuse3::raw::logfs::LoggingFileSystem;
+    use asyncfuse::raw::logfs::LoggingFileSystem;
 
     #[tokio::test]
     #[ignore]
@@ -1242,9 +1425,11 @@ mod tests {
 
         let mut mount_options = MountOptions::default();
         // .allow_other(true)
-        mount_options.force_readdir_plus(true).uid(uid).gid(gid);
+        #[cfg(target_os = "linux")]
+        mount_options.force_readdir_plus(true);
+        mount_options.uid(uid).gid(gid);
 
-        let mut mount_handle: rfuse3::raw::MountHandle = if !not_unprivileged {
+        let mut mount_handle: asyncfuse::raw::MountHandle = if !not_unprivileged {
             Session::new(mount_options)
                 .mount_with_unprivileged(logfs, mount_path)
                 .await

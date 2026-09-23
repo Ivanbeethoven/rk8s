@@ -5,8 +5,8 @@ use crate::overlayfs::HandleData;
 use crate::overlayfs::RealHandle;
 use crate::overlayfs::{AtomicU64, CachePolicy};
 use crate::util::open_options::OpenOptions;
-use rfuse3::raw::prelude::*;
-use rfuse3::*;
+use asyncfuse::raw::prelude::*;
+use asyncfuse::*;
 use std::ffi::OsStr;
 use std::io::Error;
 use std::io::ErrorKind;
@@ -23,14 +23,11 @@ impl Filesystem for OverlayFs {
         if self.config.do_import {
             self.import().await?;
         }
-        #[cfg(target_os = "linux")]
-        {
-            for layer in self.lower_layers.iter() {
-                layer.init(_req).await?;
-            }
-            if let Some(upper) = &self.upper_layer {
-                upper.init(_req).await?;
-            }
+        for layer in self.lower_layers.iter() {
+            layer.init(_req).await?;
+        }
+        if let Some(upper) = &self.upper_layer {
+            upper.init(_req).await?;
         }
         if !self.config.do_import || self.config.writeback {
             self.writeback.store(true, Ordering::Relaxed);
@@ -295,7 +292,9 @@ impl Filesystem for OverlayFs {
         if newpnode.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT).into());
         }
-        let new_name = new_name.to_str().unwrap();
+        let new_name = new_name
+            .to_str()
+            .ok_or_else(|| Error::from_raw_os_error(libc::EINVAL))?;
         // trace!(
         //     "LINK: inode: {}, new_parent: {}, trying to do_link: src_inode: {}, newpnode: {}",
         //     inode, new_parent, node.inode, newpnode.inode
@@ -1004,10 +1003,13 @@ impl Filesystem for OverlayFs {
             }
         }
 
+        let name_str = name
+            .to_str()
+            .ok_or_else(|| Error::from_raw_os_error(libc::EINVAL))?;
         let final_handle = self
             .do_create(req, &pnode, name, mode, flags.try_into().unwrap())
             .await?;
-        let entry = self.do_lookup(req, parent, name.to_str().unwrap()).await?;
+        let entry = self.do_lookup(req, parent, name_str).await?;
         let fh = final_handle
             .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "Handle not found"))?;
 
@@ -1183,7 +1185,7 @@ impl Filesystem for OverlayFs {
 mod tests {
     use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
-    use rfuse3::{MountOptions, raw::Session};
+    use asyncfuse::{MountOptions, raw::Session};
     use tokio::signal;
     use tracing_subscriber::EnvFilter;
 
@@ -1191,7 +1193,7 @@ mod tests {
         overlayfs::{OverlayFs, config::Config},
         passthrough::{PassthroughArgs, new_passthroughfs_layer},
     };
-    use rfuse3::raw::logfs::LoggingFileSystem;
+    use asyncfuse::raw::logfs::LoggingFileSystem;
 
     #[tokio::test]
     #[ignore]
@@ -1245,9 +1247,11 @@ mod tests {
 
         let mut mount_options = MountOptions::default();
         // .allow_other(true)
-        mount_options.force_readdir_plus(true).uid(uid).gid(gid);
+        #[cfg(target_os = "linux")]
+        mount_options.force_readdir_plus(true);
+        mount_options.uid(uid).gid(gid);
 
-        let mut mount_handle: rfuse3::raw::MountHandle = if !not_unprivileged {
+        let mut mount_handle: asyncfuse::raw::MountHandle = if !not_unprivileged {
             Session::new(mount_options)
                 .mount_with_unprivileged(logfs, mount_path)
                 .await
