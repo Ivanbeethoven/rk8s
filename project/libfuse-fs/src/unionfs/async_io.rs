@@ -545,7 +545,7 @@ impl Filesystem for OverlayFs {
     ) -> Result<ReplyWrite> {
         let handle_data: Arc<HandleData> = self.get_data(req, Some(fh), inode, flags).await?;
 
-        match handle_data.real_handle {
+        let result = match handle_data.real_handle {
             None => {
                 error!("unionfs write: no real_handle for inode {inode} fh {fh} — cannot write");
                 Err(Error::from_raw_os_error(libc::ENOENT).into())
@@ -571,6 +571,16 @@ impl Filesystem for OverlayFs {
                     );
                 }
                 result
+            }
+        }
+        // Ephemeral (reconstructed) handles own a layer fd the kernel will
+        // never RELEASE — drop it once the I/O completes.
+        if handle_data.ephemeral {
+            if let Some(ref hd) = handle_data.real_handle {
+                let _ = hd
+                    .layer
+                    .release(req, hd.inode, hd.handle.load(Ordering::Relaxed), 0, 0, true)
+                    .await;
             }
         }
         result
