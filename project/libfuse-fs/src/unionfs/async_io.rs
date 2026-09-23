@@ -10,8 +10,8 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
 use tracing::trace;
+use tracing::{error, info, warn};
 
 impl Filesystem for OverlayFs {
     /// initialize filesystem. Called before any other filesystem method.
@@ -488,9 +488,7 @@ impl Filesystem for OverlayFs {
 
         let result = match data.real_handle {
             None => {
-                error!(
-                    "unionfs read: no real_handle for inode {inode} fh {fh} — cannot read"
-                );
+                error!("unionfs read: no real_handle for inode {inode} fh {fh} — cannot read");
                 Err(Error::from_raw_os_error(libc::ENOENT).into())
             }
             Some(ref hd) => {
@@ -549,9 +547,7 @@ impl Filesystem for OverlayFs {
 
         match handle_data.real_handle {
             None => {
-                error!(
-                    "unionfs write: no real_handle for inode {inode} fh {fh} — cannot write"
-                );
+                error!("unionfs write: no real_handle for inode {inode} fh {fh} — cannot write");
                 Err(Error::from_raw_os_error(libc::ENOENT).into())
             }
             Some(ref hd) => {
