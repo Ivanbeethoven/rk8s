@@ -3221,61 +3221,65 @@ impl OverlayFs {
                 // trace!("get_data: found handle");
                 return Ok(Arc::clone(v));
             }
-        } else {
-            let readonly: bool = flags
-                & (libc::O_APPEND | libc::O_CREAT | libc::O_TRUNC | libc::O_RDWR | libc::O_WRONLY)
-                    as u32
-                == 0;
-
-            // lookup node
-            let node = self.lookup_node(ctx, inode, "").await?;
-
-            // whiteout node
-            if node.whiteout.load(Ordering::Relaxed) {
-                return Err(Error::from_raw_os_error(libc::ENOENT));
-            }
-
-            if !readonly {
-                // Check if upper layer exists, return EROFS is not exists.
-                self.upper_layer
-                    .as_ref()
-                    .cloned()
-                    .ok_or_else(|| Error::from_raw_os_error(libc::EROFS))?;
-                // copy up to upper layer
-                self.copy_node_up(ctx, Arc::clone(&node)).await?;
-            }
-
-            let (layer, in_upper_layer, inode) = node.first_layer_inode().await;
-
-            // A no_open-style request carries fh=0: the kernel never sent an
-            // OPEN, so no handle exists for the layers that locate files by
-            // their own open handle (passthrough). Perform a real open on the
-            // target layer and hand the resulting fh to the caller, otherwise
-            // every write lands as ENOENT inside the passthrough layer.
-            // Read-only callers keep fh=0: inode-addressed layers (dicfuse and
-            // friends) ignore it, and passthrough reads only happen on nodes
-            // that were properly opened before.
-            let (real_fh, real_layer, real_inode) = if readonly {
-                (0u64, layer.clone(), inode)
-            } else {
-                let opened = layer.open(ctx, inode, flags).await?;
-                (opened.fh, layer.clone(), inode)
-            };
-
-            let handle_data = HandleData {
-                node: Arc::clone(&node),
-                real_handle: Some(RealHandle {
-                    layer: real_layer,
-                    in_upper_layer,
-                    inode: real_inode,
-                    handle: AtomicU64::new(real_fh),
-                }),
-                dir_snapshot: Mutex::new(None),
-            };
-            return Ok(Arc::new(handle_data));
+            // Handle miss with an open-supporting mount: the kernel issued an
+            // I/O for a file whose OPEN we never saw (no_open-style write after
+            // an attr-cache-only path, a stale fh after FORGET, ...). Fall
+            // through to the reconstruction below instead of failing with
+            // ENOENT — it re-resolves the node, copies it up for writes, and
+            // opens the target layer for a real fh.
         }
 
-        Err(Error::from_raw_os_error(libc::ENOENT))
+        let readonly: bool = flags
+            & (libc::O_APPEND | libc::O_CREAT | libc::O_TRUNC | libc::O_RDWR | libc::O_WRONLY)
+                as u32
+            == 0;
+
+        // lookup node
+        let node = self.lookup_node(ctx, inode, "").await?;
+
+        // whiteout node
+        if node.whiteout.load(Ordering::Relaxed) {
+            return Err(Error::from_raw_os_error(libc::ENOENT));
+        }
+
+        if !readonly {
+            // Check if upper layer exists, return EROFS is not exists.
+            self.upper_layer
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| Error::from_raw_os_error(libc::EROFS))?;
+            // copy up to upper layer
+            self.copy_node_up(ctx, Arc::clone(&node)).await?;
+        }
+
+        let (layer, in_upper_layer, inode) = node.first_layer_inode().await;
+
+        // A no_open-style request carries fh=0: the kernel never sent an
+        // OPEN, so no handle exists for the layers that locate files by
+        // their own open handle (passthrough). Perform a real open on the
+        // target layer and hand the resulting fh to the caller, otherwise
+        // every write lands as ENOENT inside the passthrough layer.
+        // Read-only callers keep fh=0: inode-addressed layers (dicfuse and
+        // friends) ignore it, and passthrough reads only happen on nodes
+        // that were properly opened before.
+        let (real_fh, real_layer, real_inode) = if readonly {
+            (0u64, layer.clone(), inode)
+        } else {
+            let opened = layer.open(ctx, inode, flags).await?;
+            (opened.fh, layer.clone(), inode)
+        };
+
+        let handle_data = HandleData {
+            node: Arc::clone(&node),
+            real_handle: Some(RealHandle {
+                layer: real_layer,
+                in_upper_layer,
+                inode: real_inode,
+                handle: AtomicU64::new(real_fh),
+            }),
+            dir_snapshot: Mutex::new(None),
+        };
+        return Ok(Arc::new(handle_data));
     }
 
     // extend or init the inodes number to one overlay if the current number is done.
