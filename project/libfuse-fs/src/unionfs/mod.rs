@@ -3269,7 +3269,7 @@ impl OverlayFs {
             (opened.fh, layer.clone(), inode)
         };
 
-        let handle_data = HandleData {
+        let handle_data = Arc::new(HandleData {
             node: Arc::clone(&node),
             real_handle: Some(RealHandle {
                 layer: real_layer,
@@ -3278,8 +3278,33 @@ impl OverlayFs {
                 handle: AtomicU64::new(real_fh),
             }),
             dir_snapshot: Mutex::new(None),
-        };
-        return Ok(Arc::new(handle_data));
+        });
+
+        // Register the reconstructed handle under the fh the kernel is using
+        // (0 for no_open-style requests): the FLUSH/RELEASE that close this
+        // file arrive with that fh, and they must find the handle to forward
+        // to the layer that owns the open fd — otherwise close fails ENOENT
+        // and the layer's fd leaks. A previous entry on the same slot is
+        // released first (it belongs to a file that was already rewritten).
+        let fh_slot = handle.unwrap_or(0);
+        {
+            let mut handles = self.handles.lock().await;
+            if let Some(old) = handles.get(&fh_slot)
+                && let Some(ref rh) = old.real_handle
+            {
+                let _ = rh.layer.release(
+                    ctx,
+                    rh.inode,
+                    rh.handle.load(Ordering::Relaxed),
+                    0,
+                    0,
+                    true,
+                );
+            }
+            handles.insert(fh_slot, Arc::clone(&handle_data));
+        }
+
+        return Ok(handle_data);
     }
 
     // extend or init the inodes number to one overlay if the current number is done.
